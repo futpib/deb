@@ -1,0 +1,11 @@
+[package]
+name = "dual-engine-browser"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["cef-renderer"]
+resolver = "3"
+
+[dependencies]
+qtbridge = "0.2.0"
