@@ -10,10 +10,25 @@ ApplicationWindow {
     minimumWidth: 900
     minimumHeight: 560
     visible: true
-    title: "CEF / Gecko engine smoke test"
+    title: "Dual-engine browser · native X11 surfaces"
 
     Backend {
         id: backend
+    }
+
+    function syncNativeGeometry() {
+        const chromiumPosition = chromiumPane.surface.mapToGlobal(Qt.point(0, 0))
+        const firefoxPosition = firefoxPane.surface.mapToGlobal(Qt.point(0, 0))
+        backend.sync_geometry(
+            Math.round(chromiumPosition.x),
+            Math.round(chromiumPosition.y),
+            Math.round(chromiumPane.surface.width),
+            Math.round(chromiumPane.surface.height),
+            Math.round(firefoxPosition.x),
+            Math.round(firefoxPosition.y),
+            Math.round(firefoxPane.surface.width),
+            Math.round(firefoxPane.surface.height)
+        )
     }
 
     header: ToolBar {
@@ -30,15 +45,15 @@ ApplicationWindow {
                 selectByMouse: true
                 onAccepted: {
                     backend.url = text
-                    backend.render()
+                    backend.navigate()
                 }
             }
 
             Button {
-                text: "Render both"
+                text: "Navigate both"
                 onClicked: {
                     backend.url = address.text
-                    backend.render()
+                    backend.navigate()
                 }
             }
         }
@@ -49,21 +64,17 @@ ApplicationWindow {
         orientation: Qt.Horizontal
 
         EnginePane {
+            id: chromiumPane
             SplitView.fillWidth: true
             title: "CEF / Chromium"
             status: backend.chromiumStatus
-            imageSource: backend.chromiumImage === ""
-                ? ""
-                : `${backend.chromiumImage}?generation=${backend.renderGeneration}`
         }
 
         EnginePane {
+            id: firefoxPane
             SplitView.fillWidth: true
-            title: "Firefox / Gecko adapter bootstrap"
+            title: "Firefox / Gecko · stock X11 reparent"
             status: backend.firefoxStatus
-            imageSource: backend.firefoxImage === ""
-                ? ""
-                : `${backend.firefoxImage}?generation=${backend.renderGeneration}`
         }
     }
 
@@ -71,7 +82,7 @@ ApplicationWindow {
         id: enginePane
         required property string title
         required property string status
-        required property url imageSource
+        property alias surface: nativeSurface
 
         padding: 8
 
@@ -79,48 +90,37 @@ ApplicationWindow {
             anchors.fill: parent
             spacing: 6
 
-            RowLayout {
+            Label {
                 Layout.fillWidth: true
-
-                Label {
-                    text: enginePane.title
-                    font.bold: true
-                    font.pixelSize: 16
-                }
-
-                Item {
-                    Layout.fillWidth: true
-                }
-
-                Label {
-                    text: enginePane.status
-                    opacity: 0.75
-                }
+                text: `${enginePane.title}  —  ${enginePane.status}`
+                font.bold: true
+                font.pixelSize: 15
+                elide: Text.ElideRight
             }
 
             Rectangle {
+                id: nativeSurface
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                color: "white"
+                color: "#202124"
                 border.color: palette.mid
 
-                BusyIndicator {
+                Label {
                     anchors.centerIn: parent
-                    running: enginePane.status.startsWith("Rendering")
-                    visible: running
-                }
-
-                Image {
-                    anchors.fill: parent
-                    anchors.margins: 1
-                    source: enginePane.imageSource
-                    fillMode: Image.PreserveAspectFit
-                    asynchronous: true
-                    cache: false
+                    text: "Mounting native browser window…"
+                    color: "white"
+                    opacity: 0.7
                 }
             }
         }
     }
 
-    Component.onCompleted: backend.render()
+    Timer {
+        interval: 100
+        running: root.visible
+        repeat: true
+        onTriggered: root.syncNativeGeometry()
+    }
+
+    onClosing: backend.stop()
 }

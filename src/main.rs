@@ -1,29 +1,27 @@
-use qtbridge::{QApp, QObjectHolder, invoke_method, qobject};
-use std::{
-    path::{Path, PathBuf},
-    process::{Command, Output},
-};
+mod native;
+
+use native::{ControllerCommand, Layout, NativeRect};
+use qtbridge::{QApp, QObjectHolder, qobject};
+use std::sync::mpsc::Sender;
 
 const DEFAULT_URL: &str = "https://www.google.com/";
 
 struct Backend {
     url: String,
-    chromium_image: String,
-    firefox_image: String,
     chromium_status: String,
     firefox_status: String,
-    render_generation: u64,
+    controller: Option<Sender<ControllerCommand>>,
+    last_layout: Option<Layout>,
 }
 
 impl Default for Backend {
     fn default() -> Self {
         Self {
             url: std::env::var("DUAL_ENGINE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned()),
-            chromium_image: String::new(),
-            firefox_image: String::new(),
-            chromium_status: "Waiting".to_owned(),
-            firefox_status: "Waiting".to_owned(),
-            render_generation: 0,
+            chromium_status: "Waiting for native surface…".to_owned(),
+            firefox_status: "Waiting for native surface…".to_owned(),
+            controller: None,
+            last_layout: None,
         }
     }
 }
@@ -31,16 +29,6 @@ impl Default for Backend {
 #[qobject]
 impl Backend {
     qproperty!("url", Member = url, Write = set_url, Notify = url_changed);
-    qproperty!(
-        "chromiumImage",
-        Member = chromium_image,
-        Notify = chromium_image_changed
-    );
-    qproperty!(
-        "firefoxImage",
-        Member = firefox_image,
-        Notify = firefox_image_changed
-    );
     qproperty!(
         "chromiumStatus",
         Member = chromium_status,
@@ -50,11 +38,6 @@ impl Backend {
         "firefoxStatus",
         Member = firefox_status,
         Notify = firefox_status_changed
-    );
-    qproperty!(
-        "renderGeneration",
-        Member = render_generation,
-        Notify = render_generation_changed
     );
 
     fn set_url(&mut self, url: String) {
@@ -66,72 +49,86 @@ impl Backend {
     fn url_changed(&mut self);
 
     #[qsignal]
-    fn chromium_image_changed(&mut self);
-
-    #[qsignal]
-    fn firefox_image_changed(&mut self);
-
-    #[qsignal]
     fn chromium_status_changed(&mut self);
 
     #[qsignal]
     fn firefox_status_changed(&mut self);
 
-    #[qsignal]
-    fn render_generation_changed(&mut self);
-
     #[qslot]
-    fn render(&mut self) {
+    fn navigate(&mut self) {
         let url = normalize_url(&self.url);
         self.set_url(url.clone());
-        self.chromium_status = "Rendering with CEF / Chromium…".to_owned();
-        self.chromium_status_changed();
-        self.firefox_status = "Rendering with Firefox / Gecko…".to_owned();
-        self.firefox_status_changed();
-
-        let output_dir = std::env::temp_dir().join("dual-engine-browser");
-        if let Err(error) = std::fs::create_dir_all(&output_dir) {
-            self.chromium_status = format!("Could not create output directory: {error}");
-            self.firefox_status = self.chromium_status.clone();
+        if let Some(controller) = self.controller.clone() {
+            self.chromium_status = "Navigating CEF / Chromium…".to_owned();
+            self.firefox_status = "Restarting Firefox / Gecko…".to_owned();
             self.chromium_status_changed();
             self.firefox_status_changed();
+            if controller.send(ControllerCommand::Navigate(url)).is_err() {
+                self.chromium_status = "Native controller stopped".to_owned();
+                self.firefox_status = self.chromium_status.clone();
+                self.chromium_status_changed();
+                self.firefox_status_changed();
+            }
+        }
+    }
+
+    #[qslot]
+    #[allow(clippy::too_many_arguments)]
+    fn sync_geometry(
+        &mut self,
+        chromium_x: i32,
+        chromium_y: i32,
+        chromium_width: i32,
+        chromium_height: i32,
+        firefox_x: i32,
+        firefox_y: i32,
+        firefox_width: i32,
+        firefox_height: i32,
+    ) {
+        let Some(chromium) =
+            NativeRect::new(chromium_x, chromium_y, chromium_width, chromium_height)
+        else {
+            return;
+        };
+        let Some(firefox) = NativeRect::new(firefox_x, firefox_y, firefox_width, firefox_height)
+        else {
+            return;
+        };
+        let layout = Layout { chromium, firefox };
+        if self.last_layout == Some(layout) {
+            return;
+        }
+        self.last_layout = Some(layout);
+
+        if let Some(controller) = &self.controller {
+            let _ = controller.send(ControllerCommand::Layout(layout));
             return;
         }
 
-        let chromium_invoker = self.get_qml_method_invoker();
-        let chromium_url = url.clone();
-        let chromium_output = output_dir.join("chromium.png");
-        std::thread::spawn(move || {
-            let (image, status) = render_chromium(&chromium_url, &chromium_output);
-            invoke_method!(chromium_invoker, "update_chromium", image, status);
-        });
-
-        let firefox_invoker = self.get_qml_method_invoker();
-        let firefox_output = output_dir.join("firefox.png");
-        std::thread::spawn(move || {
-            let (image, status) = render_firefox(&url, &firefox_output);
-            invoke_method!(firefox_invoker, "update_firefox", image, status);
-        });
-    }
-
-    #[qslot]
-    fn update_chromium(&mut self, image: String, status: String) {
-        self.chromium_image = image;
-        self.chromium_status = status;
-        self.render_generation += 1;
-        self.chromium_image_changed();
+        self.chromium_status = "Starting native CEF child…".to_owned();
+        self.firefox_status = "Starting Firefox X11 child…".to_owned();
         self.chromium_status_changed();
-        self.render_generation_changed();
+        self.firefox_status_changed();
+        self.controller = Some(native::spawn_controller(
+            self.url.clone(),
+            layout,
+            self.get_qml_method_invoker(),
+        ));
     }
 
     #[qslot]
-    fn update_firefox(&mut self, image: String, status: String) {
-        self.firefox_image = image;
-        self.firefox_status = status;
-        self.render_generation += 1;
-        self.firefox_image_changed();
+    fn update_statuses(&mut self, chromium: String, firefox: String) {
+        self.chromium_status = chromium;
+        self.firefox_status = firefox;
+        self.chromium_status_changed();
         self.firefox_status_changed();
-        self.render_generation_changed();
+    }
+
+    #[qslot]
+    fn stop(&mut self) {
+        if let Some(controller) = self.controller.take() {
+            let _ = controller.send(ControllerCommand::Stop);
+        }
     }
 }
 
@@ -144,89 +141,18 @@ fn normalize_url(value: &str) -> String {
     }
 }
 
-fn file_url(path: &Path) -> String {
-    format!("file://{}", path.display())
-}
-
-fn output_error(output: &Output) -> String {
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if stderr.is_empty() {
-        format!("process exited with {}", output.status)
-    } else {
-        stderr
-    }
-}
-
-fn cef_renderer_path() -> Result<PathBuf, String> {
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    let directory = executable
-        .parent()
-        .ok_or_else(|| "application executable has no parent directory".to_owned())?;
-    Ok(directory.join("cef-renderer"))
-}
-
-fn render_chromium(url: &str, destination: &Path) -> (String, String) {
-    let helper = match cef_renderer_path() {
-        Ok(helper) => helper,
-        Err(error) => return (String::new(), error),
-    };
-
-    let output = if std::env::var_os("DISPLAY").is_some() {
-        Command::new(&helper)
-            .arg("--url")
-            .arg(url)
-            .arg("--output")
-            .arg(destination)
-            .output()
-    } else {
-        Command::new("xvfb-run")
-            .arg("-a")
-            .arg(&helper)
-            .arg("--url")
-            .arg(url)
-            .arg("--output")
-            .arg(destination)
-            .output()
-    };
-
-    match output {
-        Ok(output) if output.status.success() && destination.exists() => (
-            file_url(destination),
-            "Rendered by CEF 150 / Chromium 150".to_owned(),
-        ),
-        Ok(output) => (
-            String::new(),
-            format!("CEF failed: {}", output_error(&output)),
-        ),
-        Err(error) => (String::new(), format!("Could not start CEF: {error}")),
-    }
-}
-
-fn render_firefox(url: &str, destination: &Path) -> (String, String) {
-    let output = Command::new("firefox")
-        .arg("--headless")
-        .arg("--no-remote")
-        .arg("--screenshot")
-        .arg(destination)
-        .arg("--window-size")
-        .arg("1200,800")
-        .arg(url)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() && destination.exists() => (
-            file_url(destination),
-            "Rendered by Firefox 153 / Gecko".to_owned(),
-        ),
-        Ok(output) => (
-            String::new(),
-            format!("Firefox failed: {}", output_error(&output)),
-        ),
-        Err(error) => (String::new(), format!("Could not start Firefox: {error}")),
-    }
-}
-
 fn main() {
+    if std::env::var_os("DISPLAY").is_some() && std::env::var_os("QT_QPA_PLATFORM").is_none() {
+        unsafe {
+            std::env::set_var("QT_QPA_PLATFORM", "xcb");
+        }
+    }
+    if std::env::var_os("QT_QUICK_BACKEND").is_none() {
+        unsafe {
+            std::env::set_var("QT_QUICK_BACKEND", "software");
+        }
+    }
+
     QApp::new()
         .register::<Backend>()
         .load_qml(include_bytes!("Main.qml"))

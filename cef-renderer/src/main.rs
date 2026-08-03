@@ -1,98 +1,110 @@
 use cef::{args::Args, *};
-use image::ColorType;
 use std::{
     error::Error,
-    path::PathBuf,
+    io::{self, BufRead},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread::sleep,
     time::{Duration, Instant},
 };
+use x11rb::{
+    connection::Connection,
+    protocol::xproto::{ConfigureWindowAux, ConnectionExt},
+};
 
 const DEFAULT_URL: &str = "https://www.google.com/";
-const WIDTH: i32 = 1200;
-const HEIGHT: i32 = 800;
+
+#[derive(Clone, Copy)]
+struct Bounds {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
 
 struct Config {
     url: String,
-    output: PathBuf,
+    parent: u64,
+    bounds: Bounds,
 }
 
 impl Config {
     fn from_args() -> Result<Self, Box<dyn Error>> {
         let mut url = DEFAULT_URL.to_owned();
-        let mut output = PathBuf::from("cef-google.png");
+        let mut parent = None;
+        let mut bounds = None;
         let mut args = std::env::args().skip(1);
 
         while let Some(argument) = args.next() {
             match argument.as_str() {
                 "--url" => url = args.next().ok_or("--url requires a value")?,
-                "--output" => {
-                    output = PathBuf::from(args.next().ok_or("--output requires a value")?)
+                "--parent" => {
+                    let value = args.next().ok_or("--parent requires a value")?;
+                    parent = Some(parse_window_id(&value)?);
+                }
+                "--bounds" => {
+                    let value = args.next().ok_or("--bounds requires a value")?;
+                    bounds = Some(parse_bounds(&value)?);
                 }
                 _ => {}
             }
         }
 
-        Ok(Self { url, output })
+        Ok(Self {
+            url,
+            parent: parent.ok_or("--parent is required")?,
+            bounds: bounds.ok_or("--bounds is required")?,
+        })
     }
 }
 
-#[derive(Clone)]
-struct Frame {
-    bgra: Vec<u8>,
-    width: u32,
-    height: u32,
-    painted_at: Instant,
-}
-
-#[derive(Clone)]
-struct ScreenshotRenderHandler {
-    frame: Arc<Mutex<Option<Frame>>>,
-}
-
-wrap_render_handler! {
-    struct ScreenshotRenderHandlerBuilder {
-        handler: ScreenshotRenderHandler,
+fn parse_window_id(value: &str) -> Result<u64, Box<dyn Error>> {
+    if let Some(hex) = value.strip_prefix("0x") {
+        Ok(u64::from_str_radix(hex, 16)?)
+    } else {
+        Ok(value.parse()?)
     }
+}
 
-    impl RenderHandler {
-        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
-            if let Some(rect) = rect {
-                rect.width = WIDTH;
-                rect.height = HEIGHT;
-            }
-        }
+fn parse_bounds(value: &str) -> Result<Bounds, Box<dyn Error>> {
+    let values = value
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<Vec<i32>, _>>()?;
+    if values.len() != 4 || values[2] <= 0 || values[3] <= 0 {
+        return Err("bounds must be x,y,width,height with a positive size".into());
+    }
+    Ok(Bounds {
+        x: values[0],
+        y: values[1],
+        width: values[2] as u32,
+        height: values[3] as u32,
+    })
+}
 
-        fn on_paint(
-            &self,
-            _browser: Option<&mut Browser>,
-            type_: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
-            buffer: *const u8,
-            width: i32,
-            height: i32,
-        ) {
-            if type_ != PaintElementType::VIEW || buffer.is_null() || width <= 0 || height <= 0 {
-                return;
-            }
+enum ControlCommand {
+    Navigate(String),
+    Resize(Bounds),
+    Quit,
+}
 
-            let byte_count = width as usize * height as usize * 4;
-            let bgra = unsafe { std::slice::from_raw_parts(buffer, byte_count) }.to_vec();
-            *self.handler.frame.lock().expect("frame mutex poisoned") = Some(Frame {
-                bgra,
-                width: width as u32,
-                height: height as u32,
-                painted_at: Instant::now(),
-            });
-        }
+fn parse_control_command(line: &str) -> Option<ControlCommand> {
+    if let Some(url) = line.strip_prefix("navigate\t") {
+        Some(ControlCommand::Navigate(url.to_owned()))
+    } else if let Some(bounds) = line.strip_prefix("bounds\t") {
+        parse_bounds(bounds).ok().map(ControlCommand::Resize)
+    } else if line == "quit" {
+        Some(ControlCommand::Quit)
+    } else {
+        None
     }
 }
 
 wrap_life_span_handler! {
-    struct ScreenshotLifeSpanHandler {
+    struct BrowserLifeSpanHandler {
         closed: Arc<AtomicBool>,
     }
 
@@ -104,9 +116,7 @@ wrap_life_span_handler! {
 }
 
 wrap_load_handler! {
-    struct ScreenshotLoadHandler {
-        loaded: Arc<AtomicBool>,
-    }
+    struct BrowserLoadHandler;
 
     impl LoadHandler {
         fn on_loading_state_change(
@@ -117,7 +127,7 @@ wrap_load_handler! {
             _can_go_forward: i32,
         ) {
             if is_loading == 0 {
-                self.loaded.store(true, Ordering::Release);
+                eprintln!("cef-renderer: page load settled");
             }
         }
 
@@ -142,17 +152,12 @@ wrap_load_handler! {
 }
 
 wrap_client! {
-    struct ScreenshotClient {
-        render_handler: RenderHandler,
+    struct BrowserClient {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
     }
 
     impl Client {
-        fn render_handler(&self) -> Option<RenderHandler> {
-            Some(self.render_handler.clone())
-        }
-
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(self.life_span_handler.clone())
         }
@@ -164,7 +169,7 @@ wrap_client! {
 }
 
 wrap_browser_process_handler! {
-    struct ScreenshotBrowserProcessHandler {
+    struct NativeBrowserProcessHandler {
         ready: Arc<AtomicBool>,
     }
 
@@ -176,7 +181,7 @@ wrap_browser_process_handler! {
 }
 
 wrap_app! {
-    struct ScreenshotApp {
+    struct BrowserApp {
         ready: Arc<AtomicBool>,
     }
 
@@ -193,45 +198,40 @@ wrap_app! {
             command_line.append_switch(Some(&"disable-session-crashed-bubble".into()));
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             command_line.append_switch(Some(&"noerrdialogs".into()));
-            command_line.append_switch_with_value(
-                Some(&"disable-features".into()),
-                Some(&"PaintHolding".into()),
-            );
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
-            Some(ScreenshotBrowserProcessHandler::new(self.ready.clone()))
+            Some(NativeBrowserProcessHandler::new(self.ready.clone()))
         }
     }
 }
 
-fn save_frame(frame: Frame, output: &PathBuf) -> Result<(), Box<dyn Error>> {
-    let mut rgba = frame.bgra;
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-        let transparent = 255_u16 - pixel[3] as u16;
-        pixel[0] = (pixel[0] as u16 + transparent).min(255) as u8;
-        pixel[1] = (pixel[1] as u16 + transparent).min(255) as u8;
-        pixel[2] = (pixel[2] as u16 + transparent).min(255) as u8;
-        pixel[3] = 255;
+fn resize_browser(browser: &Browser, bounds: Bounds) -> Result<(), Box<dyn Error>> {
+    let host = browser.host().ok_or("CEF browser has no host")?;
+    let window = host.window_handle() as u32;
+    if window == 0 {
+        return Err("CEF browser has no native window yet".into());
     }
 
-    image::save_buffer(output, &rgba, frame.width, frame.height, ColorType::Rgba8)?;
+    let (connection, _) = x11rb::connect(None)?;
+    connection.configure_window(
+        window,
+        &ConfigureWindowAux::new()
+            .x(bounds.x)
+            .y(bounds.y)
+            .width(bounds.width)
+            .height(bounds.height),
+    )?;
+    connection.flush()?;
+    host.notify_move_or_resize_started();
     Ok(())
-}
-
-fn frame_has_content(frame: &Frame) -> bool {
-    frame
-        .bgra
-        .chunks_exact(4)
-        .any(|pixel| pixel[3] > 16 && (pixel[0] < 245 || pixel[1] < 245 || pixel[2] < 245))
 }
 
 fn run() -> Result<i32, Box<dyn Error>> {
     let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
     let cef_args = Args::new();
     let context_ready = Arc::new(AtomicBool::new(false));
-    let mut app = ScreenshotApp::new(context_ready.clone());
+    let mut app = BrowserApp::new(context_ready.clone());
     let process_code = execute_process(
         Some(cef_args.as_main_args()),
         Some(&mut app),
@@ -251,7 +251,6 @@ fn run() -> Result<i32, Box<dyn Error>> {
     let settings = Settings {
         no_sandbox: 1,
         external_message_pump: 1,
-        windowless_rendering_enabled: 1,
         root_cache_path: CefString::from(cache_path.to_string_lossy().as_ref()),
         resources_dir_path: CefString::from(runtime_path.to_string_lossy().as_ref()),
         locales_dir_path: CefString::from(runtime_path.join("locales").to_string_lossy().as_ref()),
@@ -280,21 +279,18 @@ fn run() -> Result<i32, Box<dyn Error>> {
         return Err("CEF context initialization timed out".into());
     }
 
-    let frame = Arc::new(Mutex::new(None));
     let closed = Arc::new(AtomicBool::new(false));
-    let loaded = Arc::new(AtomicBool::new(false));
-    let render_handler = ScreenshotRenderHandlerBuilder::new(ScreenshotRenderHandler {
-        frame: frame.clone(),
-    });
-    let life_span_handler = ScreenshotLifeSpanHandler::new(closed.clone());
-    let load_handler = ScreenshotLoadHandler::new(loaded.clone());
-    let mut client = ScreenshotClient::new(render_handler, life_span_handler, load_handler);
-    let window_info = WindowInfo {
-        windowless_rendering_enabled: 1,
-        ..Default::default()
+    let life_span_handler = BrowserLifeSpanHandler::new(closed.clone());
+    let load_handler = BrowserLoadHandler::new();
+    let mut client = BrowserClient::new(life_span_handler, load_handler);
+    let cef_bounds = Rect {
+        x: config.bounds.x,
+        y: config.bounds.y,
+        width: config.bounds.width as i32,
+        height: config.bounds.height as i32,
     };
+    let window_info = WindowInfo::default().set_as_child(config.parent as _, &cef_bounds);
     let browser_settings = BrowserSettings {
-        windowless_frame_rate: 30,
         background_color: 0xffff_ffff,
         ..Default::default()
     };
@@ -307,38 +303,48 @@ fn run() -> Result<i32, Box<dyn Error>> {
         None,
     )
     .ok_or("CEF did not create a browser")?;
+    eprintln!("cef-renderer: native browser ready");
 
-    let started_at = Instant::now();
-    let deadline = started_at + Duration::from_secs(30);
-    let frame = loop {
-        do_message_loop_work();
-
-        if (loaded.load(Ordering::Acquire) && started_at.elapsed() >= Duration::from_secs(3))
-            || started_at.elapsed() >= Duration::from_secs(8)
-        {
-            let candidate = frame.lock().expect("frame mutex poisoned").clone();
-            if let Some(candidate) = candidate
-                && candidate.painted_at.elapsed() >= Duration::from_millis(500)
-                && frame_has_content(&candidate)
-            {
-                break candidate;
+    let (command_sender, command_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            if let Some(command) = parse_control_command(&line) {
+                let quit = matches!(command, ControlCommand::Quit);
+                if command_sender.send(command).is_err() || quit {
+                    return;
+                }
             }
         }
+        let _ = command_sender.send(ControlCommand::Quit);
+    });
 
-        if Instant::now() >= deadline {
-            return Err("CEF did not paint a settled frame within 30 seconds".into());
-        }
-        sleep(Duration::from_millis(10));
-    };
-
-    save_frame(frame, &config.output)?;
-
-    if let Some(host) = browser.host() {
-        host.close_browser(1);
-    }
-    let close_deadline = Instant::now() + Duration::from_secs(3);
-    while !closed.load(Ordering::Acquire) && Instant::now() < close_deadline {
+    let mut closing = false;
+    while !closed.load(Ordering::Acquire) {
         do_message_loop_work();
+        while let Ok(command) = command_receiver.try_recv() {
+            match command {
+                ControlCommand::Navigate(url) => {
+                    if let Some(frame) = browser.main_frame() {
+                        frame.load_url(Some(&CefString::from(url.as_str())));
+                    }
+                }
+                ControlCommand::Resize(bounds) => {
+                    if let Err(error) = resize_browser(&browser, bounds) {
+                        eprintln!("cef-renderer: resize failed: {error}");
+                    }
+                }
+                ControlCommand::Quit if !closing => {
+                    closing = true;
+                    if let Some(host) = browser.host() {
+                        host.close_browser(1);
+                    }
+                }
+                ControlCommand::Quit => {}
+            }
+        }
         sleep(Duration::from_millis(10));
     }
 
@@ -355,5 +361,45 @@ fn main() {
             eprintln!("cef-renderer: {error}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Bounds, ControlCommand, parse_bounds, parse_control_command};
+
+    #[test]
+    fn parses_native_bounds() {
+        let bounds = parse_bounds("10,20,800,600").unwrap();
+        assert_eq!(
+            (bounds.x, bounds.y, bounds.width, bounds.height),
+            (10, 20, 800, 600)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_native_surface() {
+        assert!(parse_bounds("0,0,0,600").is_err());
+    }
+
+    #[test]
+    fn parses_navigation_control_message() {
+        assert!(matches!(
+            parse_control_command("navigate\thttps://example.com/a b"),
+            Some(ControlCommand::Navigate(url)) if url == "https://example.com/a b"
+        ));
+    }
+
+    #[test]
+    fn parses_resize_control_message() {
+        assert!(matches!(
+            parse_control_command("bounds\t1,2,3,4"),
+            Some(ControlCommand::Resize(Bounds {
+                x: 1,
+                y: 2,
+                width: 3,
+                height: 4
+            }))
+        ));
     }
 }

@@ -9,3 +9,4 @@ resolver = "3"
 
 [dependencies]
 qtbridge = "0.2.0"
+x11rb = "0.14.0"
