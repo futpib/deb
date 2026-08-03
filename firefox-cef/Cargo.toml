@@ -1,0 +1,12 @@
+[package]
+name = "firefox-cef"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cef-dll-sys = { version = "=150.2.1", features = ["dox"] }
+libc = "0.2.189"
+x11rb = "0.14.0"

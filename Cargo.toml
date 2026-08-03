@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["cef-renderer"]
+members = ["cef-renderer", "firefox-cef"]
 resolver = "3"
 
 [dependencies]
