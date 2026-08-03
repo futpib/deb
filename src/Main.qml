@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls.Fusion
 import QtQuick.Layouts
 import dual_engine_browser
+import dual_engine_native
 
 ApplicationWindow {
     id: root
@@ -10,18 +11,22 @@ ApplicationWindow {
     minimumWidth: 900
     minimumHeight: 560
     visible: true
-    title: "Dual-engine browser · native X11 surfaces"
+    title: "Dual-engine browser · native on-screen surfaces"
 
     Backend {
         id: backend
     }
 
+    NativeWindowFactory {
+        id: nativeWindows
+    }
+
+    property var chromiumHost: nativeWindows.createHost()
+
     function syncNativeGeometry() {
-        const chromiumPosition = chromiumPane.surface.mapToGlobal(Qt.point(0, 0))
         const firefoxPosition = firefoxPane.surface.mapToGlobal(Qt.point(0, 0))
         backend.sync_geometry(
-            Math.round(chromiumPosition.x),
-            Math.round(chromiumPosition.y),
+            nativeWindows.windowId(chromiumHost),
             Math.round(chromiumPane.surface.width),
             Math.round(chromiumPane.surface.height),
             Math.round(firefoxPosition.x),
@@ -68,13 +73,15 @@ ApplicationWindow {
             SplitView.fillWidth: true
             title: "CEF / Chromium"
             status: backend.chromiumStatus
+            hostedWindow: chromiumHost
         }
 
         EnginePane {
             id: firefoxPane
             SplitView.fillWidth: true
-            title: "Firefox / Gecko · stock X11 reparent"
+            title: "Firefox / Gecko · managed stock process"
             status: backend.firefoxStatus
+            hostedWindow: null
         }
     }
 
@@ -82,6 +89,7 @@ ApplicationWindow {
         id: enginePane
         required property string title
         required property string status
+        required property var hostedWindow
         property alias surface: nativeSurface
 
         padding: 8
@@ -111,6 +119,14 @@ ApplicationWindow {
                     color: "white"
                     opacity: 0.7
                 }
+
+                WindowContainer {
+                    anchors.fill: parent
+                    anchors.margins: 1
+                    window: enginePane.hostedWindow
+                    visible: window !== null
+                    focus: true
+                }
             }
         }
     }
@@ -122,5 +138,8 @@ ApplicationWindow {
         onTriggered: root.syncNativeGeometry()
     }
 
-    onClosing: backend.stop()
+    onClosing: {
+        backend.stop()
+        Qt.quit()
+    }
 }

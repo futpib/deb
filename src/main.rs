@@ -2,15 +2,18 @@ mod native;
 
 use native::{ControllerCommand, Layout, NativeRect};
 use qtbridge::{QApp, QObjectHolder, qobject};
-use std::sync::mpsc::Sender;
 
 const DEFAULT_URL: &str = "https://www.google.com/";
+
+unsafe extern "C" {
+    fn register_native_window_factory();
+}
 
 struct Backend {
     url: String,
     chromium_status: String,
     firefox_status: String,
-    controller: Option<Sender<ControllerCommand>>,
+    controller: Option<native::Controller>,
     last_layout: Option<Layout>,
 }
 
@@ -18,8 +21,8 @@ impl Default for Backend {
     fn default() -> Self {
         Self {
             url: std::env::var("DUAL_ENGINE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned()),
-            chromium_status: "Waiting for native surface…".to_owned(),
-            firefox_status: "Waiting for native surface…".to_owned(),
+            chromium_status: "Waiting for Qt native host…".to_owned(),
+            firefox_status: "Waiting for on-screen surface…".to_owned(),
             controller: None,
             last_layout: None,
         }
@@ -58,17 +61,22 @@ impl Backend {
     fn navigate(&mut self) {
         let url = normalize_url(&self.url);
         self.set_url(url.clone());
-        if let Some(controller) = self.controller.clone() {
-            self.chromium_status = "Navigating CEF / Chromium…".to_owned();
-            self.firefox_status = "Restarting Firefox / Gecko…".to_owned();
+        if self.controller.is_none() {
+            return;
+        }
+        self.chromium_status = "Navigating CEF / Chromium…".to_owned();
+        self.firefox_status = "Restarting Firefox / Gecko…".to_owned();
+        self.chromium_status_changed();
+        self.firefox_status_changed();
+        let send_failed = self
+            .controller
+            .as_ref()
+            .is_none_or(|controller| controller.send(ControllerCommand::Navigate(url)).is_err());
+        if send_failed {
+            self.chromium_status = "Native controller stopped".to_owned();
+            self.firefox_status = self.chromium_status.clone();
             self.chromium_status_changed();
             self.firefox_status_changed();
-            if controller.send(ControllerCommand::Navigate(url)).is_err() {
-                self.chromium_status = "Native controller stopped".to_owned();
-                self.firefox_status = self.chromium_status.clone();
-                self.chromium_status_changed();
-                self.firefox_status_changed();
-            }
         }
     }
 
@@ -76,8 +84,7 @@ impl Backend {
     #[allow(clippy::too_many_arguments)]
     fn sync_geometry(
         &mut self,
-        chromium_x: i32,
-        chromium_y: i32,
+        chromium_host_id: String,
         chromium_width: i32,
         chromium_height: i32,
         firefox_x: i32,
@@ -85,9 +92,13 @@ impl Backend {
         firefox_width: i32,
         firefox_height: i32,
     ) {
-        let Some(chromium) =
-            NativeRect::new(chromium_x, chromium_y, chromium_width, chromium_height)
-        else {
+        let Ok(chromium_host_id) = chromium_host_id.parse::<u32>() else {
+            return;
+        };
+        if chromium_host_id == 0 {
+            return;
+        }
+        let Some(chromium) = NativeRect::new(0, 0, chromium_width, chromium_height) else {
             return;
         };
         let Some(firefox) = NativeRect::new(firefox_x, firefox_y, firefox_width, firefox_height)
@@ -105,12 +116,13 @@ impl Backend {
             return;
         }
 
-        self.chromium_status = "Starting native CEF child…".to_owned();
-        self.firefox_status = "Starting Firefox X11 child…".to_owned();
+        self.chromium_status = "Starting CEF inside its Qt host…".to_owned();
+        self.firefox_status = "Starting Firefox on-screen window…".to_owned();
         self.chromium_status_changed();
         self.firefox_status_changed();
         self.controller = Some(native::spawn_controller(
             self.url.clone(),
+            chromium_host_id,
             layout,
             self.get_qml_method_invoker(),
         ));
@@ -127,7 +139,7 @@ impl Backend {
     #[qslot]
     fn stop(&mut self) {
         if let Some(controller) = self.controller.take() {
-            let _ = controller.send(ControllerCommand::Stop);
+            controller.stop();
         }
     }
 }
@@ -147,10 +159,8 @@ fn main() {
             std::env::set_var("QT_QPA_PLATFORM", "xcb");
         }
     }
-    if std::env::var_os("QT_QUICK_BACKEND").is_none() {
-        unsafe {
-            std::env::set_var("QT_QUICK_BACKEND", "software");
-        }
+    unsafe {
+        register_native_window_factory();
     }
 
     QApp::new()

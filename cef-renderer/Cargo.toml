@@ -5,5 +5,4 @@ edition = "2024"
 
 [dependencies]
 cef = { version = "=150.2.1", default-features = false }
-x11rb = "0.14.0"
 

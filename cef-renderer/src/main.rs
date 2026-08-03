@@ -10,10 +10,6 @@ use std::{
     thread::sleep,
     time::{Duration, Instant},
 };
-use x11rb::{
-    connection::Connection,
-    protocol::xproto::{ConfigureWindowAux, ConnectionExt},
-};
 
 const DEFAULT_URL: &str = "https://www.google.com/";
 
@@ -88,6 +84,7 @@ fn parse_bounds(value: &str) -> Result<Bounds, Box<dyn Error>> {
 enum ControlCommand {
     Navigate(String),
     Resize(Bounds),
+    Focus,
     Quit,
 }
 
@@ -96,6 +93,8 @@ fn parse_control_command(line: &str) -> Option<ControlCommand> {
         Some(ControlCommand::Navigate(url.to_owned()))
     } else if let Some(bounds) = line.strip_prefix("bounds\t") {
         parse_bounds(bounds).ok().map(ControlCommand::Resize)
+    } else if line == "focus" {
+        Some(ControlCommand::Focus)
     } else if line == "quit" {
         Some(ControlCommand::Quit)
     } else {
@@ -116,7 +115,9 @@ wrap_life_span_handler! {
 }
 
 wrap_load_handler! {
-    struct BrowserLoadHandler;
+    struct BrowserLoadHandler {
+        settled: Arc<AtomicBool>,
+    }
 
     impl LoadHandler {
         fn on_loading_state_change(
@@ -127,6 +128,7 @@ wrap_load_handler! {
             _can_go_forward: i32,
         ) {
             if is_loading == 0 {
+                self.settled.store(true, Ordering::Release);
                 eprintln!("cef-renderer: page load settled");
             }
         }
@@ -206,23 +208,11 @@ wrap_app! {
     }
 }
 
-fn resize_browser(browser: &Browser, bounds: Bounds) -> Result<(), Box<dyn Error>> {
+fn resize_browser(browser: &Browser, _bounds: Bounds) -> Result<(), Box<dyn Error>> {
     let host = browser.host().ok_or("CEF browser has no host")?;
-    let window = host.window_handle() as u32;
-    if window == 0 {
+    if host.window_handle() == 0 {
         return Err("CEF browser has no native window yet".into());
     }
-
-    let (connection, _) = x11rb::connect(None)?;
-    connection.configure_window(
-        window,
-        &ConfigureWindowAux::new()
-            .x(bounds.x)
-            .y(bounds.y)
-            .width(bounds.width)
-            .height(bounds.height),
-    )?;
-    connection.flush()?;
     host.notify_move_or_resize_started();
     Ok(())
 }
@@ -281,7 +271,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
 
     let closed = Arc::new(AtomicBool::new(false));
     let life_span_handler = BrowserLifeSpanHandler::new(closed.clone());
-    let load_handler = BrowserLoadHandler::new();
+    let load_settled = Arc::new(AtomicBool::new(false));
+    let load_handler = BrowserLoadHandler::new(load_settled.clone());
     let mut client = BrowserClient::new(life_span_handler, load_handler);
     let cef_bounds = Rect {
         x: config.bounds.x,
@@ -303,6 +294,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
         None,
     )
     .ok_or("CEF did not create a browser")?;
+    if let Some(host) = browser.host() {
+        host.set_focus(1);
+    }
     eprintln!("cef-renderer: native browser ready");
 
     let (command_sender, command_receiver) = mpsc::channel();
@@ -322,18 +316,34 @@ fn run() -> Result<i32, Box<dyn Error>> {
     });
 
     let mut closing = false;
+    let mut current_bounds = config.bounds;
     while !closed.load(Ordering::Acquire) {
         do_message_loop_work();
+        if load_settled.swap(false, Ordering::AcqRel)
+            && let Err(error) = resize_browser(&browser, current_bounds)
+        {
+            eprintln!("cef-renderer: post-load repaint failed: {error}");
+        }
         while let Ok(command) = command_receiver.try_recv() {
             match command {
                 ControlCommand::Navigate(url) => {
                     if let Some(frame) = browser.main_frame() {
                         frame.load_url(Some(&CefString::from(url.as_str())));
                     }
+                    if let Some(host) = browser.host() {
+                        host.set_focus(1);
+                    }
                 }
                 ControlCommand::Resize(bounds) => {
+                    current_bounds = bounds;
                     if let Err(error) = resize_browser(&browser, bounds) {
                         eprintln!("cef-renderer: resize failed: {error}");
+                    }
+                }
+                ControlCommand::Focus => {
+                    if let Some(host) = browser.host() {
+                        host.set_focus(1);
+                        host.notify_move_or_resize_started();
                     }
                 }
                 ControlCommand::Quit if !closing => {
@@ -400,6 +410,14 @@ mod tests {
                 width: 3,
                 height: 4
             }))
+        ));
+    }
+
+    #[test]
+    fn parses_focus_control_message() {
+        assert!(matches!(
+            parse_control_command("focus"),
+            Some(ControlCommand::Focus)
         ));
     }
 }

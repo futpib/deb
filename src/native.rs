@@ -6,15 +6,21 @@ use std::{
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::mpsc::{self, RecvTimeoutError, Sender},
-    thread::sleep,
+    thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
 use x11rb::{
     connection::Connection,
-    protocol::xproto::{
-        Atom, AtomEnum, ConfigureWindowAux, ConnectionExt, MapState, StackMode, Window,
+    protocol::{
+        Event,
+        xproto::{
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
+            ConfigureWindowAux, ConnectionExt, EventMask, InputFocus, MapState, PropMode,
+            StackMode, Window,
+        },
     },
     rust_connection::RustConnection,
+    wrapper::ConnectionExt as _,
 };
 
 type NativeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -54,9 +60,31 @@ pub enum ControllerCommand {
     Stop,
 }
 
+pub struct Controller {
+    sender: Sender<ControllerCommand>,
+    thread: JoinHandle<()>,
+}
+
+impl Controller {
+    pub fn send(
+        &self,
+        command: ControllerCommand,
+    ) -> Result<(), mpsc::SendError<ControllerCommand>> {
+        self.sender.send(command)
+    }
+
+    pub fn stop(self) {
+        let _ = self.sender.send(ControllerCommand::Stop);
+        let _ = self.thread.join();
+    }
+}
+
 struct Atoms {
     net_client_list: Atom,
+    net_frame_extents: Atom,
     net_wm_pid: Atom,
+    net_wm_state: Atom,
+    net_wm_state_above: Atom,
     wm_class: Atom,
 }
 
@@ -64,7 +92,10 @@ impl Atoms {
     fn new(connection: &RustConnection) -> NativeResult<Self> {
         Ok(Self {
             net_client_list: intern(connection, b"_NET_CLIENT_LIST")?,
+            net_frame_extents: intern(connection, b"_NET_FRAME_EXTENTS")?,
             net_wm_pid: intern(connection, b"_NET_WM_PID")?,
+            net_wm_state: intern(connection, b"_NET_WM_STATE")?,
+            net_wm_state_above: intern(connection, b"_NET_WM_STATE_ABOVE")?,
             wm_class: intern(connection, b"WM_CLASS")?,
         })
     }
@@ -88,9 +119,32 @@ impl CefInstance {
         self.send(&format!("navigate\t{url}"))
     }
 
+    fn focus(&mut self, connection: &RustConnection, bounds: NativeRect) -> NativeResult<()> {
+        connection.set_input_focus(InputFocus::PARENT, self.window, x11rb::CURRENT_TIME)?;
+        configure_native_window(connection, self.window, bounds)?;
+        self.send("focus")
+    }
+
     fn resize(&mut self, connection: &RustConnection, bounds: NativeRect) -> NativeResult<()> {
         configure_native_window(connection, self.window, bounds)?;
         self.send(&format!("bounds\t{}", bounds.argument()))
+    }
+
+    fn ensure_visible(&self, connection: &RustConnection) -> NativeResult<()> {
+        if connection
+            .get_window_attributes(self.window)?
+            .reply()?
+            .map_state
+            == MapState::UNMAPPED
+        {
+            connection.map_window(self.window)?;
+        }
+        connection.configure_window(
+            self.window,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
+        connection.flush()?;
+        Ok(())
     }
 
     fn stop(mut self) {
@@ -106,11 +160,21 @@ struct FirefoxInstance {
 }
 
 impl FirefoxInstance {
-    fn resize(&self, connection: &RustConnection, bounds: NativeRect) -> NativeResult<()> {
-        configure_native_window(connection, self.window, bounds)
+    fn resize(
+        &self,
+        connection: &RustConnection,
+        atoms: &Atoms,
+        bounds: NativeRect,
+    ) -> NativeResult<()> {
+        configure_firefox_window(connection, atoms, self.window, bounds)
     }
 
-    fn ensure_mapped(&self, connection: &RustConnection) -> NativeResult<()> {
+    fn ensure_visible(
+        &self,
+        connection: &RustConnection,
+        atoms: &Atoms,
+        root: Window,
+    ) -> NativeResult<()> {
         if connection
             .get_window_attributes(self.window)?
             .reply()?
@@ -118,25 +182,26 @@ impl FirefoxInstance {
             == MapState::UNMAPPED
         {
             connection.map_window(self.window)?;
-            connection.flush()?;
         }
-        Ok(())
+        request_above(connection, atoms, root, self.window)
     }
 
     fn stop(mut self) {
-        stop_child(&mut self.child);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.profile);
     }
 }
 
 pub fn spawn_controller(
     url: String,
+    cef_parent: Window,
     layout: Layout,
     invoker: QmlMethodInvoker,
-) -> Sender<ControllerCommand> {
+) -> Controller {
     let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        if let Err(error) = run_controller(url, layout, &invoker, receiver) {
+    let thread = std::thread::spawn(move || {
+        if let Err(error) = run_controller(url, cef_parent, layout, &invoker, receiver) {
             update_statuses(
                 &invoker,
                 format!("Native controller failed: {error}"),
@@ -144,11 +209,12 @@ pub fn spawn_controller(
             );
         }
     });
-    sender
+    Controller { sender, thread }
 }
 
 fn run_controller(
     initial_url: String,
+    cef_parent: Window,
     initial_layout: Layout,
     invoker: &QmlMethodInvoker,
     receiver: mpsc::Receiver<ControllerCommand>,
@@ -156,22 +222,21 @@ fn run_controller(
     let (connection, screen_number) = x11rb::connect(None)?;
     let root = connection.setup().roots[screen_number].root;
     let atoms = Atoms::new(&connection)?;
-    let host = wait_for_pid_window(
+    let qt_window = wait_for_pid_window(
         &connection,
         &atoms,
         root,
         std::process::id(),
         Duration::from_secs(10),
     )?;
-    let mut layout = layout_relative_to_host(&connection, root, host, initial_layout)?;
-
-    let mut chromium_status = "Starting native CEF child…".to_owned();
-    let mut firefox_status = "Starting Firefox X11 child…".to_owned();
+    let mut layout = initial_layout;
+    let mut chromium_status = "Starting CEF inside its Qt host…".to_owned();
+    let mut firefox_status = "Starting Firefox on-screen window…".to_owned();
     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
 
-    let mut cef = match spawn_cef(&connection, host, layout.chromium, &initial_url) {
+    let mut cef = match spawn_cef(&connection, cef_parent, layout.chromium, &initial_url) {
         Ok(instance) => {
-            chromium_status = "Live · CEF 150 / Chromium 150".to_owned();
+            chromium_status = "Live · CEF 150 / Chromium 150 · native Qt host".to_owned();
             Some(instance)
         }
         Err(error) => {
@@ -186,33 +251,33 @@ fn run_controller(
         &connection,
         &atoms,
         root,
-        host,
+        qt_window,
         layout.firefox,
         &initial_url,
         firefox_generation,
     ) {
         Ok(instance) => {
-            firefox_status = "Live · Firefox 153 / Gecko · X11 child".to_owned();
+            firefox_status = "Live · Firefox 153 / Gecko · managed X11 window".to_owned();
             Some(instance)
         }
         Err(error) => {
-            firefox_status = format!("Firefox child failed: {error}");
+            firefox_status = format!("Firefox window failed: {error}");
             None
         }
     };
     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
 
     loop {
-        match receiver.recv_timeout(Duration::from_millis(250)) {
+        match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(ControllerCommand::Layout(next_layout)) => {
-                layout = layout_relative_to_host(&connection, root, host, next_layout)?;
+                layout = next_layout;
                 if let Some(cef) = &mut cef
                     && let Err(error) = cef.resize(&connection, layout.chromium)
                 {
                     chromium_status = format!("CEF resize failed: {error}");
                 }
                 if let Some(firefox) = &firefox
-                    && let Err(error) = firefox.resize(&connection, layout.firefox)
+                    && let Err(error) = firefox.resize(&connection, &atoms, layout.firefox)
                 {
                     firefox_status = format!("Firefox resize failed: {error}");
                 }
@@ -221,11 +286,13 @@ fn run_controller(
             Ok(ControllerCommand::Navigate(url)) => {
                 if let Some(cef) = &mut cef {
                     match cef.navigate(&url) {
-                        Ok(()) => chromium_status = "Live · CEF 150 / Chromium 150".to_owned(),
+                        Ok(()) => {
+                            chromium_status =
+                                "Live · CEF 150 / Chromium 150 · native Qt host".to_owned()
+                        }
                         Err(error) => chromium_status = format!("CEF navigation failed: {error}"),
                     }
                 }
-
                 if let Some(instance) = firefox.take() {
                     instance.stop();
                 }
@@ -236,17 +303,18 @@ fn run_controller(
                     &connection,
                     &atoms,
                     root,
-                    host,
+                    qt_window,
                     layout.firefox,
                     &url,
                     firefox_generation,
                 ) {
                     Ok(instance) => {
-                        firefox_status = "Live · Firefox 153 / Gecko · X11 child".to_owned();
+                        firefox_status =
+                            "Live · Firefox 153 / Gecko · managed X11 window".to_owned();
                         Some(instance)
                     }
                     Err(error) => {
-                        firefox_status = format!("Firefox child failed: {error}");
+                        firefox_status = format!("Firefox window failed: {error}");
                         None
                     }
                 };
@@ -254,12 +322,29 @@ fn run_controller(
             }
             Ok(ControllerCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {
-                if let Some(firefox) = &firefox
-                    && let Err(error) = firefox.ensure_mapped(&connection)
+                if let Some(cef) = &cef
+                    && let Err(error) = cef.ensure_visible(&connection)
                 {
-                    firefox_status = format!("Firefox remap failed: {error}");
+                    chromium_status = format!("CEF visibility failed: {error}");
                     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
                 }
+                if let Some(firefox) = &firefox
+                    && let Err(error) = firefox.ensure_visible(&connection, &atoms, root)
+                {
+                    firefox_status = format!("Firefox visibility failed: {error}");
+                    update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
+                }
+            }
+        }
+
+        while let Some(event) = connection.poll_for_event()? {
+            if let Event::ButtonPress(event) = event
+                && let Some(cef) = &mut cef
+                && event.event == cef.window
+                && let Err(error) = cef.focus(&connection, layout.chromium)
+            {
+                chromium_status = format!("CEF focus failed: {error}");
+                update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
             }
         }
     }
@@ -275,11 +360,11 @@ fn run_controller(
 
 fn spawn_cef(
     connection: &RustConnection,
-    host: Window,
+    parent: Window,
     bounds: NativeRect,
     url: &str,
 ) -> NativeResult<CefInstance> {
-    let previous_children = direct_children(connection, host)?;
+    let previous_children = direct_children(connection, parent)?;
     let executable = std::env::current_exe()?;
     let helper = executable
         .parent()
@@ -287,7 +372,7 @@ fn spawn_cef(
         .join("cef-renderer");
     let mut child = Command::new(helper)
         .arg("--parent")
-        .arg(host.to_string())
+        .arg(parent.to_string())
         .arg("--bounds")
         .arg(bounds.argument())
         .arg("--url")
@@ -301,10 +386,14 @@ fn spawn_cef(
         .ok_or("CEF control pipe is unavailable")?;
     let window = wait_for_new_child(
         connection,
-        host,
+        parent,
         &previous_children,
         &mut child,
         Duration::from_secs(10),
+    )?;
+    connection.change_window_attributes(
+        window,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS),
     )?;
     configure_native_window(connection, window, bounds)?;
     Ok(CefInstance {
@@ -319,7 +408,7 @@ fn spawn_firefox(
     connection: &RustConnection,
     atoms: &Atoms,
     root: Window,
-    host: Window,
+    qt_window: Window,
     bounds: NativeRect,
     url: &str,
     generation: u64,
@@ -359,13 +448,15 @@ fn spawn_firefox(
         &mut child,
         Duration::from_secs(20),
     )?;
-
-    sleep(Duration::from_secs(1));
-    connection.unmap_window(window)?;
-    connection.reparent_window(window, host, bounds.x as i16, bounds.y as i16)?;
-    configure_native_window(connection, window, bounds)?;
-    connection.map_window(window)?;
-    connection.flush()?;
+    connection.change_property32(
+        PropMode::REPLACE,
+        window,
+        AtomEnum::WM_TRANSIENT_FOR,
+        AtomEnum::WINDOW,
+        &[qt_window],
+    )?;
+    configure_firefox_window(connection, atoms, window, bounds)?;
+    request_above(connection, atoms, root, window)?;
     Ok(FirefoxInstance {
         child,
         window,
@@ -392,32 +483,61 @@ fn configure_native_window(
     Ok(())
 }
 
-fn layout_relative_to_host(
+fn configure_firefox_window(
     connection: &RustConnection,
-    root: Window,
-    host: Window,
-    layout: Layout,
-) -> NativeResult<Layout> {
-    Ok(Layout {
-        chromium: rect_relative_to_host(connection, root, host, layout.chromium)?,
-        firefox: rect_relative_to_host(connection, root, host, layout.firefox)?,
-    })
+    atoms: &Atoms,
+    window: Window,
+    bounds: NativeRect,
+) -> NativeResult<()> {
+    let extents = connection
+        .get_property(
+            false,
+            window,
+            atoms.net_frame_extents,
+            AtomEnum::CARDINAL,
+            0,
+            4,
+        )?
+        .reply()?
+        .value32()
+        .map(|values| values.collect::<Vec<_>>())
+        .unwrap_or_default();
+    let left = extents.first().copied().unwrap_or(0);
+    let right = extents.get(1).copied().unwrap_or(0);
+    let top = extents.get(2).copied().unwrap_or(0);
+    let bottom = extents.get(3).copied().unwrap_or(0);
+    configure_native_window(
+        connection,
+        window,
+        NativeRect {
+            x: bounds.x + left as i32,
+            y: bounds.y + top as i32,
+            width: bounds.width.saturating_sub(left + right).max(2),
+            height: bounds.height.saturating_sub(top + bottom).max(2),
+        },
+    )
 }
 
-fn rect_relative_to_host(
+fn request_above(
     connection: &RustConnection,
+    atoms: &Atoms,
     root: Window,
-    host: Window,
-    rect: NativeRect,
-) -> NativeResult<NativeRect> {
-    let translated = connection
-        .translate_coordinates(root, host, rect.x as i16, rect.y as i16)?
-        .reply()?;
-    Ok(NativeRect {
-        x: i32::from(translated.dst_x),
-        y: i32::from(translated.dst_y),
-        ..rect
-    })
+    window: Window,
+) -> NativeResult<()> {
+    let event = ClientMessageEvent::new(
+        32,
+        window,
+        atoms.net_wm_state,
+        ClientMessageData::from([1, atoms.net_wm_state_above, 0, 1, 0]),
+    );
+    connection.send_event(
+        false,
+        root,
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+        event,
+    )?;
+    connection.flush()?;
+    Ok(())
 }
 
 fn wait_for_pid_window(

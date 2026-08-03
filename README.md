@@ -1,26 +1,27 @@
 # Dual-engine browser prototype
 
-This is the first vertical slice of a Linux browser shell that can host Chromium and Gecko tabs. The shell and backend boundary use the official Qt Bridge for Rust from the start.
+This is a Linux/X11 vertical slice of a Qt Quick browser shell with two live, on-screen engine surfaces. The shell and backend boundary use the official Qt Bridge for Rust from the start.
 
-The current milestone renders the same URL into two side-by-side Qt Quick panes:
+- Chromium runs in a persistent CEF 150 helper. CEF creates a native child window inside a Qt-owned `QWindow`, which QML presents with `WindowContainer`.
+- Gecko runs in a stock Firefox 153 process. Its native X11 window is positioned and stacked over the matching Qt pane.
+- The shared URL bar navigates both engines. CEF navigates in place; this prototype restarts the isolated Firefox process with the new URL.
 
-- Chromium is a real CEF 150 off-screen browser using `cef-rs` and `CefRenderHandler::OnPaint`.
-- Gecko is a real Firefox 153 headless render launched behind the provisional engine-process boundary.
-
-Both panes are snapshots. They prove that Qt Bridge, QML, Rust orchestration, CEF subprocesses, and both rendering engines work together, but they are not interactive web views yet. In particular, the Firefox helper is not yet a drop-in `libcef.so`; that requires a maintained Gecko embedding runtime plus the CEF ABI adapter discussed below.
+The Firefox side is deliberately not described as a Gecko-backed CEF implementation. Stock Firefox's compositor stops painting page content when its window is reparented into another process, so this milestone keeps it as a managed top-level window. A real `firefox-cef` would need a maintained Gecko embedding runtime and a separate CEF ABI adapter.
 
 ## Requirements
 
 - Rust 1.87 or newer
-- Qt 6.10 or newer with Qt Base and Qt Declarative
+- A C++ compiler and `pkg-config`
+- Qt 6.10 or newer with Qt Base and Qt Declarative development files
 - CEF 150.0.14
 - Firefox
-- Xvfb for headless CEF tests
+- An X11 display, or XWayland for experimentation
+- Xvfb and a small window manager such as Openbox for isolated UI tests
 
 On Arch Linux:
 
 ```sh
-paru -S cef firefox qt6-base qt6-declarative xorg-server-xvfb
+paru -S --needed base-devel cef firefox openbox pkgconf qt6-base qt6-declarative xorg-server-xvfb
 ./scripts/setup-arch-cef.sh
 ```
 
@@ -33,28 +34,34 @@ cargo build --workspace
 cargo run -p dual-engine-browser
 ```
 
-The application initially renders `https://www.google.com/`. Enter another URL and select **Render both** to compare the engines.
+The application starts both engines at `https://www.google.com/`. Enter another URL and select **Navigate both** to compare them. The application selects Qt's `xcb` platform when `DISPLAY` is available because the native-window integration is X11-specific.
 
-### Verification note
+## Current limitations
 
-On the development host, the complete two-pane path was verified with a `data:` URL and Firefox independently rendered Google over HTTPS. CEF 150 did not produce a settled Google frame within its 30-second limit. The matching system Chromium 150 binary also stalls on external HTTPS there, so the prototype reports the CEF timeout instead of treating a blank frame as success. This host-specific Chromium networking issue remains to be resolved before Google can be claimed as verified in both panes.
+- The Firefox pane is a coordinated top-level window, not a true child. It can briefly outlive the shell's stacking during window-manager transitions, and clipping is limited to ordinary rectangular pane geometry.
+- Keyboard focus and IME forwarding into the cross-process CEF child are not complete. Navigation through the Qt URL bar works; native CEF repaint, resize, and mouse activation are wired.
+- Firefox navigation currently creates a fresh temporary profile and process, so browser history and login state do not persist between navigations.
+- This is not yet a `libcef.so`-compatible Gecko adapter. The stock Firefox process is an integration stand-in while that much larger runtime and ABI project remains separate.
 
-For a display-independent smoke test:
+## Verification note
+
+The complete on-screen path was exercised under Xvfb/Openbox: the Qt-owned CEF child rendered and resized live `data:` content, while the managed Firefox window rendered Google over HTTPS. On this development host, CEF 150's network service and the matching system Chromium 150 both stall on external URLs, so Google could not be truthfully marked as verified in the CEF pane here. The default remains Google so the same build can exercise it on a normal desktop/network environment.
+
+Useful local checks are:
 
 ```sh
-DUAL_ENGINE_URL='data:text/html,Hello%20Engines' QT_QPA_PLATFORM=offscreen timeout 12s target/debug/dual-engine-browser
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Rendered snapshots are written to `/tmp/dual-engine-browser/`.
+## Toward a Firefox CEF backend
 
-## Architecture after this milestone
+The next Gecko-specific milestone is independent of this window-management prototype:
 
-The snapshot API is deliberately an engine-process boundary rather than UI code tied to either engine. The next rendering milestone is:
+1. Maintain an embeddable Gecko runtime rather than driving stock Firefox UI.
+2. Expose browser, frame, host, client, load-handler, request-context, and off-screen-rendering primitives through a stable C/C++ boundary.
+3. Implement the matching subset of the CEF exported ABI and preserve CEF's process/callback semantics.
+4. Add shared profile/request-context handling, input, IME, accessibility, popup, and lifecycle behavior before expanding compatibility.
 
-1. Replace PNG completion messages with shared-memory BGRA frame streams.
-2. Add pointer, keyboard, focus, resize, and IME messages in the opposite direction.
-3. Present those streams through a custom Qt Quick scene-graph item.
-4. Replace the stock Firefox screenshot command with an in-tree patched Gecko runtime.
-5. Put a CEF C/C++ ABI facade in front of that Gecko runtime, initially implementing the browser, frame, host, client, render-handler, load-handler, and request-context paths used by this shell.
-
-That turns the current `Firefox / Gecko adapter bootstrap` pane into the first controlled consumer of the Gecko-backed CEF implementation without claiming arbitrary CEF application compatibility prematurely.
+That produces an honest Gecko-backed CEF subset for this shell without claiming arbitrary third-party CEF application compatibility.
