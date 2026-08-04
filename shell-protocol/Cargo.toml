@@ -1,0 +1,12 @@
+[package]
+name = "shell-protocol"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+nix = { version = "0.31.3", features = ["socket", "uio", "fs"] }
+prost = "0.14.4"
+thiserror = "2.0.19"
+
+[build-dependencies]
+prost-build = "0.14.4"

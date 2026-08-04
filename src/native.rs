@@ -1,10 +1,15 @@
 use qtbridge::{QmlMethodInvoker, invoke_method};
+use shell_protocol::{
+    MAX_PACKET_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, ReceivedPacket, Transport,
+    configure_child_command,
+    wire::{self, Capability, Engine},
+};
 use std::{
+    collections::{HashMap, HashSet},
     error::Error,
-    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::mpsc::{self, RecvTimeoutError, Sender},
+    process::{Child, Command},
+    sync::mpsc::{self, RecvTimeoutError, Sender, TryRecvError},
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
@@ -40,8 +45,14 @@ impl NativeRect {
         })
     }
 
-    fn argument(self) -> String {
-        format!("{},{},{},{}", self.x, self.y, self.width, self.height)
+    fn viewport(self) -> wire::Viewport {
+        wire::Viewport {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            scale_factor: 1.0,
+        }
     }
 }
 
@@ -76,7 +87,7 @@ impl Controller {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CefBackend {
     Chromium,
     Firefox,
@@ -109,25 +120,52 @@ impl CefBackend {
             Self::Firefox => "Firefox CEF adapter",
         }
     }
+
+    fn engine(self) -> Engine {
+        match self {
+            Self::Chromium => Engine::Chromium,
+            Self::Firefox => Engine::Gecko,
+        }
+    }
 }
 
 struct CefInstance {
     child: Child,
-    input: ChildStdin,
+    transport: Transport,
+    incoming: mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
     window: Window,
     native_child: bool,
+    browser_id: u64,
+    next_request_id: u64,
+    pending_requests: HashMap<u64, &'static str>,
+    last_event_sequence: u64,
+    protocol_closed: bool,
 }
 
 impl CefInstance {
-    fn send(&mut self, command: &str) -> NativeResult<()> {
-        self.input.write_all(command.as_bytes())?;
-        self.input.write_all(b"\n")?;
-        self.input.flush()?;
+    fn send_request(
+        &mut self,
+        operation: wire::request::Operation,
+        description: &'static str,
+    ) -> NativeResult<()> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or("shell protocol request ID overflow")?;
+        self.transport
+            .send(&request_packet(request_id, self.browser_id, operation))?;
+        self.pending_requests.insert(request_id, description);
         Ok(())
     }
 
     fn navigate(&mut self, url: &str) -> NativeResult<()> {
-        self.send(&format!("navigate\t{url}"))
+        self.send_request(
+            wire::request::Operation::Navigate(wire::Navigate {
+                url: url.to_owned(),
+            }),
+            "navigation",
+        )
     }
 
     fn focus(&mut self, connection: &RustConnection, bounds: NativeRect) -> NativeResult<()> {
@@ -135,14 +173,22 @@ impl CefInstance {
             connection.set_input_focus(InputFocus::PARENT, self.window, x11rb::CURRENT_TIME)?;
             configure_native_window(connection, self.window, bounds)?;
         }
-        self.send("focus")
+        self.send_request(
+            wire::request::Operation::SetFocus(wire::SetFocus { focused: true }),
+            "focus",
+        )
     }
 
     fn resize(&mut self, connection: &RustConnection, bounds: NativeRect) -> NativeResult<()> {
         if self.native_child {
             configure_native_window(connection, self.window, bounds)?;
         }
-        self.send(&format!("bounds\t{}", bounds.argument()))
+        self.send_request(
+            wire::request::Operation::Resize(wire::Resize {
+                viewport: Some(bounds.viewport()),
+            }),
+            "resize",
+        )
     }
 
     fn ensure_visible(&self, connection: &RustConnection) -> NativeResult<()> {
@@ -162,10 +208,117 @@ impl CefInstance {
         Ok(())
     }
 
+    fn drain_notices(&mut self) -> Vec<ProtocolNotice> {
+        let mut notices = Vec::new();
+        if self.protocol_closed {
+            return notices;
+        }
+        loop {
+            match self.incoming.try_recv() {
+                Ok(Ok(received)) => {
+                    if let Some(notice) = self.handle_packet(received) {
+                        notices.push(notice);
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.protocol_closed = true;
+                    notices.push(ProtocolNotice::ProtocolFailed(error.to_string()));
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.protocol_closed = true;
+                    notices.push(ProtocolNotice::ProtocolFailed(
+                        "protocol reader stopped".to_owned(),
+                    ));
+                    break;
+                }
+            }
+        }
+        notices
+    }
+
+    fn handle_packet(&mut self, received: ReceivedPacket) -> Option<ProtocolNotice> {
+        if !received.files.is_empty() {
+            return Some(ProtocolNotice::ProtocolFailed(
+                "unexpected attached files".to_owned(),
+            ));
+        }
+        match received.packet.body {
+            Some(wire::packet::Body::Response(response)) => {
+                let Some(description) = self.pending_requests.remove(&received.packet.request_id)
+                else {
+                    return Some(ProtocolNotice::ProtocolFailed(format!(
+                        "unsolicited response for request {}",
+                        received.packet.request_id
+                    )));
+                };
+                match response.result {
+                    Some(wire::response::Result::Success(_)) => None,
+                    Some(wire::response::Result::Error(error)) => {
+                        Some(ProtocolNotice::CommandFailed(format!(
+                            "{description} rejected [{}]: {}",
+                            error.code, error.message
+                        )))
+                    }
+                    None => Some(ProtocolNotice::ProtocolFailed(format!(
+                        "{description} response has no result"
+                    ))),
+                }
+            }
+            Some(wire::packet::Body::Event(event)) => {
+                if event.browser_id != self.browser_id {
+                    return Some(ProtocolNotice::ProtocolFailed(format!(
+                        "event targets browser {}, expected {}",
+                        event.browser_id, self.browser_id
+                    )));
+                }
+                if event.sequence <= self.last_event_sequence {
+                    return Some(ProtocolNotice::ProtocolFailed(format!(
+                        "event sequence {} followed {}",
+                        event.sequence, self.last_event_sequence
+                    )));
+                }
+                self.last_event_sequence = event.sequence;
+                match event.value {
+                    Some(wire::event::Value::LoadFailed(failure)) => {
+                        Some(ProtocolNotice::LoadFailed(format!(
+                            "{} ({})",
+                            failure.error_text, failure.error_code
+                        )))
+                    }
+                    Some(wire::event::Value::BrowserClosed(_)) => Some(ProtocolNotice::Closed),
+                    Some(wire::event::Value::BrowserCrashed(crash)) => {
+                        Some(ProtocolNotice::Crashed(crash.reason))
+                    }
+                    Some(_) => None,
+                    None => None,
+                }
+            }
+            Some(_) => Some(ProtocolNotice::ProtocolFailed(
+                "unexpected runtime packet type".to_owned(),
+            )),
+            None => Some(ProtocolNotice::ProtocolFailed(
+                "runtime packet has no body".to_owned(),
+            )),
+        }
+    }
+
     fn stop(mut self) {
-        let _ = self.send("quit");
+        let _ = self.send_request(
+            wire::request::Operation::Close(wire::Close { force: true }),
+            "close",
+        );
         stop_child(&mut self.child);
     }
+}
+
+enum ProtocolNotice {
+    CommandFailed(String),
+    LoadFailed(String),
+    Closed,
+    Crashed(String),
+    ProtocolFailed(String),
 }
 
 pub fn spawn_controller(
@@ -245,6 +398,19 @@ fn run_controller(
     };
     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
 
+    if let Ok(smoke_url) = std::env::var("DUAL_ENGINE_SMOKE_NAVIGATE_URL") {
+        if let Some(instance) = &mut chromium {
+            instance.navigate(&smoke_url).map_err(|error| {
+                format!("Chromium CEF smoke navigation could not be sent: {error}")
+            })?;
+        }
+        if let Some(instance) = &mut firefox {
+            instance.navigate(&smoke_url).map_err(|error| {
+                format!("Firefox CEF smoke navigation could not be sent: {error}")
+            })?;
+        }
+    }
+
     loop {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(ControllerCommand::Layout(next_layout)) => {
@@ -320,6 +486,19 @@ fn run_controller(
                 update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
             }
         }
+
+        if let Some(instance) = &mut chromium
+            && let Some(status) = notice_status("Chromium CEF", instance.drain_notices())
+        {
+            chromium_status = status;
+            update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
+        }
+        if let Some(instance) = &mut firefox
+            && let Some(status) = notice_status("Firefox CEF adapter", instance.drain_notices())
+        {
+            firefox_status = status;
+            update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
+        }
     }
 
     if let Some(instance) = chromium {
@@ -366,30 +545,26 @@ fn spawn_cef(
         command.env("GDK_BACKEND", "x11");
         command.env("MOZ_ENABLE_WAYLAND", "0");
     }
-    let mut child = command
-        .arg("--parent")
-        .arg(parent.to_string())
-        .arg("--bounds")
-        .arg(bounds.argument())
-        .arg("--url")
-        .arg(url)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let input = child
-        .stdin
-        .take()
-        .ok_or("CEF control pipe is unavailable")?;
-    let output = child
-        .stdout
-        .take()
-        .ok_or("CEF readiness pipe is unavailable")?;
+    let (transport, child_transport) = Transport::pair()?;
+    configure_child_command(&mut command, &child_transport);
+    let mut child = command.spawn()?;
+    drop(child_transport);
+    let (incoming, _reader) = spawn_protocol_reader(transport.try_clone()?);
     let readiness_timeout = match backend {
         CefBackend::Chromium => Duration::from_secs(30),
         CefBackend::Firefox => Duration::from_secs(90),
     };
-    let window = match wait_for_cef_ready(output, &mut child, readiness_timeout) {
-        Ok(window) => window,
+    let (window, last_event_sequence) = match initialize_helper(
+        &transport,
+        &incoming,
+        &mut child,
+        readiness_timeout,
+        backend,
+        parent,
+        bounds,
+        url,
+    ) {
+        Ok(ready) => ready,
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
@@ -409,37 +584,171 @@ fn spawn_cef(
     configure_native_window(connection, window, bounds)?;
     Ok(CefInstance {
         child,
-        input,
+        transport,
+        incoming,
         window,
         native_child,
+        browser_id: 1,
+        next_request_id: 3,
+        pending_requests: HashMap::new(),
+        last_event_sequence,
+        protocol_closed: false,
     })
 }
 
-fn wait_for_cef_ready(
-    output: ChildStdout,
+fn spawn_protocol_reader(
+    transport: Transport,
+) -> (
+    mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
+    JoinHandle<()>,
+) {
+    let (sender, receiver) = mpsc::channel();
+    let thread = std::thread::spawn(move || {
+        loop {
+            let received = transport.receive();
+            let failed = received.is_err();
+            if sender.send(received).is_err() || failed {
+                break;
+            }
+        }
+    });
+    (receiver, thread)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_helper(
+    transport: &Transport,
+    incoming: &mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
     child: &mut Child,
     timeout: Duration,
-) -> NativeResult<Window> {
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let result = BufReader::new(output).read_line(&mut line).map(|_| line);
-        let _ = sender.send(result);
-    });
+    backend: CefBackend,
+    parent: Window,
+    bounds: NativeRect,
+    url: &str,
+) -> NativeResult<(Window, u64)> {
+    transport.send(&wire::Packet {
+        request_id: 1,
+        attached_files: Vec::new(),
+        body: Some(wire::packet::Body::Hello(wire::Hello {
+            minimum_major: PROTOCOL_MAJOR,
+            maximum_major: PROTOCOL_MAJOR,
+            maximum_packet_bytes: MAX_PACKET_BYTES as u32,
+            requested_capabilities: required_capabilities(),
+        })),
+    })?;
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok(Ok(line)) => {
-                let value = line
-                    .trim()
-                    .strip_prefix("ready\t")
-                    .ok_or_else(|| format!("invalid helper readiness message: {line:?}"))?;
-                let raw = value.parse::<u64>()?;
-                return Ok(u32::try_from(raw)?);
+    let hello = receive_startup_packet(incoming, child, deadline)?;
+    if !hello.files.is_empty() {
+        return Err("HelloReply unexpectedly carried files".into());
+    }
+    if hello.packet.request_id != 1 {
+        return Err(format!(
+            "HelloReply used request ID {}, expected 1",
+            hello.packet.request_id
+        )
+        .into());
+    }
+    let reply = match hello.packet.body {
+        Some(wire::packet::Body::HelloReply(reply)) => reply,
+        Some(wire::packet::Body::Response(response)) => {
+            return Err(format_response_error("protocol negotiation", response).into());
+        }
+        _ => return Err("helper did not answer Hello with HelloReply".into()),
+    };
+    validate_hello_reply(&reply, backend)?;
+
+    transport.send(&request_packet(
+        2,
+        1,
+        wire::request::Operation::CreateBrowser(wire::CreateBrowser {
+            initial_url: url.to_owned(),
+            surface: Some(wire::SurfaceTarget {
+                target: Some(wire::surface_target::Target::X11(wire::X11Target {
+                    parent_window: u64::from(parent),
+                    viewport: Some(bounds.viewport()),
+                })),
+            }),
+        }),
+    ))?;
+
+    let mut create_succeeded = false;
+    let mut window = None;
+    let mut last_event_sequence = 0;
+    while !create_succeeded || window.is_none() {
+        let received = receive_startup_packet(incoming, child, deadline)?;
+        if !received.files.is_empty() {
+            return Err("browser startup packet unexpectedly carried files".into());
+        }
+        match received.packet.body {
+            Some(wire::packet::Body::Response(response)) => {
+                if received.packet.request_id != 2 {
+                    return Err(format!(
+                        "startup response used request ID {}, expected 2",
+                        received.packet.request_id
+                    )
+                    .into());
+                }
+                match response.result {
+                    Some(wire::response::Result::Success(_)) => create_succeeded = true,
+                    _ => return Err(format_response_error("browser creation", response).into()),
+                }
             }
+            Some(wire::packet::Body::Event(event)) => {
+                if event.browser_id != 1 {
+                    return Err(format!(
+                        "startup event targets browser {}, expected 1",
+                        event.browser_id
+                    )
+                    .into());
+                }
+                if event.sequence <= last_event_sequence {
+                    return Err(format!(
+                        "startup event sequence {} followed {}",
+                        event.sequence, last_event_sequence
+                    )
+                    .into());
+                }
+                last_event_sequence = event.sequence;
+                match event.value {
+                    Some(wire::event::Value::SurfaceReady(ready)) => {
+                        let raw_window = match ready.presentation {
+                            Some(wire::surface_ready::Presentation::X11(surface)) => surface.window,
+                            _ => return Err("helper did not return an X11 surface".into()),
+                        };
+                        window = Some(u32::try_from(raw_window)?);
+                    }
+                    Some(wire::event::Value::BrowserCrashed(crash)) => {
+                        return Err(
+                            format!("browser crashed during startup: {}", crash.reason).into()
+                        );
+                    }
+                    Some(wire::event::Value::BrowserClosed(_)) => {
+                        return Err("browser closed during startup".into());
+                    }
+                    Some(_) => {}
+                    None => {}
+                }
+            }
+            _ => return Err("unexpected packet during browser startup".into()),
+        }
+    }
+    Ok((
+        window.expect("surface readiness was checked"),
+        last_event_sequence,
+    ))
+}
+
+fn receive_startup_packet(
+    incoming: &mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
+    child: &mut Child,
+    deadline: Instant,
+) -> NativeResult<ReceivedPacket> {
+    while Instant::now() < deadline {
+        match incoming.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(received)) => return Ok(received),
             Ok(Err(error)) => return Err(error.into()),
             Err(RecvTimeoutError::Disconnected) => {
-                return Err("CEF readiness pipe closed".into());
+                return Err("CEF protocol reader stopped".into());
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -448,6 +757,88 @@ fn wait_for_cef_ready(
         }
     }
     Err("CEF helper readiness timed out".into())
+}
+
+fn validate_hello_reply(reply: &wire::HelloReply, backend: CefBackend) -> NativeResult<()> {
+    if reply.major != PROTOCOL_MAJOR {
+        return Err(format!(
+            "helper selected protocol {}.{}, shell requires {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}",
+            reply.major, reply.minor
+        )
+        .into());
+    }
+    let engine = Engine::try_from(reply.engine).unwrap_or(Engine::Unspecified);
+    if engine != backend.engine() {
+        return Err(format!("{} identified itself as {engine:?}", backend.name()).into());
+    }
+    if reply.cef_api_version == 0 || reply.maximum_packet_bytes == 0 {
+        return Err("helper returned invalid CEF or packet-size metadata".into());
+    }
+    let advertised = reply.capabilities.iter().copied().collect::<HashSet<_>>();
+    let missing = required_capabilities()
+        .into_iter()
+        .filter(|capability| !advertised.contains(capability))
+        .filter_map(|capability| Capability::try_from(capability).ok())
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!("helper is missing required capabilities: {missing:?}").into());
+    }
+    Ok(())
+}
+
+fn required_capabilities() -> Vec<i32> {
+    [
+        Capability::BrowserLifecycle,
+        Capability::Navigation,
+        Capability::Resize,
+        Capability::Focus,
+        Capability::LoadingEvents,
+        Capability::NativeX11Surface,
+        Capability::FileDescriptorPassing,
+    ]
+    .into_iter()
+    .map(|capability| capability as i32)
+    .collect()
+}
+
+fn request_packet(
+    request_id: u64,
+    browser_id: u64,
+    operation: wire::request::Operation,
+) -> wire::Packet {
+    wire::Packet {
+        request_id,
+        attached_files: Vec::new(),
+        body: Some(wire::packet::Body::Request(wire::Request {
+            browser_id,
+            operation: Some(operation),
+        })),
+    }
+}
+
+fn format_response_error(context: &str, response: wire::Response) -> String {
+    match response.result {
+        Some(wire::response::Result::Error(error)) => {
+            format!("{context} failed [{}]: {}", error.code, error.message)
+        }
+        Some(wire::response::Result::Success(_)) => {
+            format!("{context} returned an unexpected success")
+        }
+        None => format!("{context} response has no result"),
+    }
+}
+
+fn notice_status(prefix: &str, notices: Vec<ProtocolNotice>) -> Option<String> {
+    notices
+        .into_iter()
+        .map(|notice| match notice {
+            ProtocolNotice::CommandFailed(error) => format!("{prefix} command failed: {error}"),
+            ProtocolNotice::LoadFailed(error) => format!("{prefix} load failed: {error}"),
+            ProtocolNotice::Closed => format!("{prefix} closed"),
+            ProtocolNotice::Crashed(reason) => format!("{prefix} crashed: {reason}"),
+            ProtocolNotice::ProtocolFailed(error) => format!("{prefix} protocol failed: {error}"),
+        })
+        .next_back()
 }
 
 fn configure_native_window(
@@ -488,7 +879,8 @@ fn stop_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeRect;
+    use super::{CefBackend, NativeRect, validate_hello_reply};
+    use shell_protocol::{MAX_PACKET_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, wire};
 
     #[test]
     fn rejects_zero_sized_surfaces() {
@@ -497,8 +889,54 @@ mod tests {
     }
 
     #[test]
-    fn formats_cef_bounds() {
+    fn converts_bounds_to_a_viewport() {
         let bounds = NativeRect::new(10, 20, 800, 600).unwrap();
-        assert_eq!(bounds.argument(), "10,20,800,600");
+        assert_eq!(
+            bounds.viewport(),
+            wire::Viewport {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+                scale_factor: 1.0,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_a_helper_with_the_wrong_engine() {
+        let reply = wire::HelloReply {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+            engine: wire::Engine::Gecko as i32,
+            engine_version: "test".to_owned(),
+            cef_api_version: 1,
+            maximum_packet_bytes: MAX_PACKET_BYTES as u32,
+            capabilities: super::required_capabilities(),
+        };
+        let error = validate_hello_reply(&reply, CefBackend::Chromium)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("identified itself as Gecko"));
+    }
+
+    #[test]
+    fn rejects_a_helper_missing_a_required_capability() {
+        let mut capabilities = super::required_capabilities();
+        capabilities
+            .retain(|capability| *capability != wire::Capability::FileDescriptorPassing as i32);
+        let reply = wire::HelloReply {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+            engine: wire::Engine::Chromium as i32,
+            engine_version: "test".to_owned(),
+            cef_api_version: 1,
+            maximum_packet_bytes: MAX_PACKET_BYTES as u32,
+            capabilities,
+        };
+        let error = validate_hello_reply(&reply, CefBackend::Chromium)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("FileDescriptorPassing"));
     }
 }

@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["cef-renderer", "firefox-cef"]
+members = ["cef-renderer", "firefox-cef", "shell-protocol"]
 resolver = "3"
 
 [dependencies]
 qtbridge = "0.2.0"
+shell-protocol = { version = "0.1.0", path = "shell-protocol" }
 x11rb = "0.14.0"
 
 [build-dependencies]

@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 cef = { version = "=150.2.1", default-features = false }
+shell-protocol = { version = "0.1.0", path = "../shell-protocol" }
 

@@ -28,6 +28,8 @@ Chromium cef-renderer process             │  Firefox cef-renderer process
 
 Both helpers have the same `DT_NEEDED: libcef.so` dependency and execute the same CEF calls. Loader isolation selects the implementation. The Chromium helper enables CEF's multi-threaded loop; the Gecko helper runs the CEF loop and XRE on its process main thread. Standard Chromium and Gecko content isolation remains in place behind those browser processes.
 
+The shell and each helper communicate over a private inherited `AF_UNIX/SOCK_SEQPACKET` socket. Messages use the versioned protobuf schema in `shell-protocol/proto/shell.proto`; stdout and stderr are not protocol channels. Startup negotiates the protocol version, engine identity, CEF API version, packet limit, and capabilities before the shell requests a browser. Runtime operations use correlated request/response packets, while surface, loading, and lifecycle changes are ordered events. See [the shell protocol design](docs/shell-protocol.md).
+
 Linux Firefox links its allocator glue into the launcher rather than shipping it as a reusable shared object. The staging script therefore links `libmozglue-cef.so` from the pinned build's exact launcher object list and preloads it before the adapter loads `libxul.so`. Gecko startup and child startup use Mozilla's `Bootstrap` interface, including the required null-terminated argument vectors.
 
 ## Requirements
@@ -37,12 +39,12 @@ Linux Firefox links its allocator glue into the launcher rather than shipping it
 - Qt 6 Base and Qt 6 Declarative development files
 - CEF matching `cef = 150.2.1`
 - Firefox build prerequisites and enough space for a full Firefox object tree
-- `pkg-config`, a C/C++ toolchain, Python, Node.js, and the Firefox-provided build toolchains
+- `pkg-config`, protobuf, a C/C++ toolchain, Python, Node.js, and the Firefox-provided build toolchains
 
 On Arch Linux, the core host packages can be installed with:
 
 ```sh
-paru -S --needed base-devel cef pkgconf qt6-base qt6-declarative
+paru -S --needed base-devel cef pkgconf protobuf qt6-base qt6-declarative
 ```
 
 If Firefox's build reports another missing prerequisite, run `./mach bootstrap` in the pinned `firefox` submodule and select the desktop Firefox build environment.
@@ -92,6 +94,7 @@ The Qt shell has no Firefox-specific navigation API. Extending Gecko support mea
 - The Gecko adapter supports one browser surface per helper process. Multiple profiles/accounts and CEF request-context isolation are not implemented.
 - Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, custom schemes, CEF cookie/request-context APIs, and request interception are outside the current CEF slice.
 - Native Wayland child-surface embedding is not implemented; the application selects Qt's XCB platform when `DISPLAY` is available.
+- The protocol reserves Wayland, dma-buf, and off-screen surface descriptors, but only native X11 surfaces are negotiated today.
 - Each launch uses temporary Chromium and Firefox profile directories.
 
 ## Verification
@@ -114,3 +117,11 @@ cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 shellcheck scripts/build-firefox-cef.sh scripts/setup-arch-cef.sh
 ```
+
+To exercise a real runtime `Navigate` request after both engines report `SurfaceReady`, launch the staged application with an explicit smoke URL:
+
+```sh
+DUAL_ENGINE_SMOKE_NAVIGATE_URL=https://example.com cargo run -p dual-engine-browser
+```
+
+This hook is opt-in and does not change normal startup. A successful smoke run renders the requested page in both native children through the same shell-protocol request path used by **Navigate both**.
