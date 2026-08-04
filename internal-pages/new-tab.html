@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+    <title>New tab · deb</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, system-ui, sans-serif;
+        background: #090b10;
+        color: #f5f6f8;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 25% 20%, #3536a055, transparent 34rem),
+          radial-gradient(circle at 85% 80%, #0b9e8350, transparent 30rem),
+          #090b10;
+      }
+
+      main {
+        width: min(32rem, calc(100vw - 3rem));
+      }
+
+      .mark {
+        width: 4rem;
+        height: 4rem;
+        display: grid;
+        place-items: center;
+        border: 1px solid #ffffff26;
+        border-radius: 1.25rem;
+        background: linear-gradient(145deg, #7075ff, #16b89a);
+        box-shadow: 0 1.5rem 4rem #0008;
+        font-size: 2rem;
+        font-weight: 750;
+        letter-spacing: -0.12em;
+      }
+
+      h1 {
+        margin: 1.5rem 0 0;
+        font-size: clamp(3rem, 9vw, 5.5rem);
+        line-height: 0.9;
+        letter-spacing: -0.075em;
+      }
+
+      p {
+        margin: 1.25rem 0 0;
+        color: #a9aebb;
+        font-size: 1rem;
+        line-height: 1.6;
+      }
+
+      .runtime {
+        width: fit-content;
+        margin-top: 2rem;
+        padding: 0.55rem 0.8rem;
+        border: 1px solid #ffffff1f;
+        border-radius: 999px;
+        background: #ffffff0d;
+        color: #d8dbe3;
+        font: 600 0.72rem ui-monospace, monospace;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="mark" aria-hidden="true">d</div>
+      <h1>deb</h1>
+      <p>A shared internal page, delivered by the active engine at <strong>deb://new-tab/</strong>.</p>
+      <div class="runtime" id="runtime">detecting engine</div>
+    </main>
+    <script>
+      const engine = /\b(?:Chrome|Chromium)\//.test(navigator.userAgent)
+        ? "Chromium"
+        : "Gecko";
+      const pageIdentity = `${location.protocol}//${location.host}`;
+      document.querySelector("#runtime").textContent = `${engine} · ${pageIdentity}`;
+    </script>
+  </body>
+</html>

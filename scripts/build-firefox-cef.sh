@@ -36,6 +36,8 @@ fi
 popd >/dev/null
 
 cp -a "$overlay_directory/." "$build_source/"
+cp "$project_root/internal-pages/new-tab.html" \
+  "$build_source/browser/components/firefoxcef/content/deb-new-tab.html"
 
 pushd "$build_source" >/dev/null
 env MOZCONFIG="$project_root/firefox.mozconfig" ./mach build

@@ -19,5 +19,5 @@ QString NativeWindowFactory::windowId(QWindow *window) const {
 
 extern "C" void register_native_window_factory() {
     qmlRegisterType<NativeWindowFactory>(
-        "dual_engine_native", 1, 0, "NativeWindowFactory");
+        "deb_native", 1, 0, "NativeWindowFactory");
 }

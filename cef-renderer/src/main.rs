@@ -14,6 +14,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+const DEB_SCHEME: &str = "deb";
+const DEB_NEW_TAB_HOST: &str = "new-tab";
+const DEB_NEW_TAB_PAGE: &[u8] = include_bytes!("../../internal-pages/new-tab.html");
+
+fn is_deb_internal_url(url: &str) -> bool {
+    let Some(remainder) = url.strip_prefix("deb://new-tab") else {
+        return false;
+    };
+    let path = remainder.split(['?', '#']).next().unwrap_or_default();
+    path.is_empty() || path == "/"
+}
+
 #[derive(Clone, Copy)]
 struct Bounds {
     x: i32,
@@ -308,6 +320,103 @@ wrap_browser_process_handler! {
     }
 }
 
+wrap_resource_handler! {
+    struct DebResourceHandler {
+        body: &'static [u8],
+        cursor: Arc<Mutex<usize>>,
+    }
+
+    impl ResourceHandler {
+        fn open(
+            &self,
+            _request: Option<&mut Request>,
+            handle_request: Option<&mut i32>,
+            _callback: Option<&mut Callback>,
+        ) -> i32 {
+            if let Some(handle_request) = handle_request {
+                *handle_request = 1;
+            }
+            1
+        }
+
+        fn response_headers(
+            &self,
+            response: Option<&mut Response>,
+            response_length: Option<&mut i64>,
+            _redirect_url: Option<&mut CefString>,
+        ) {
+            if let Some(response) = response {
+                response.set_status(200);
+                response.set_status_text(Some(&"OK".into()));
+                response.set_mime_type(Some(&"text/html".into()));
+                response.set_charset(Some(&"utf-8".into()));
+                response.set_header_by_name(
+                    Some(&"Cache-Control".into()),
+                    Some(&"no-store".into()),
+                    1,
+                );
+            }
+            if let Some(response_length) = response_length {
+                *response_length = self.body.len() as i64;
+            }
+        }
+
+        fn read(
+            &self,
+            data_out: *mut u8,
+            bytes_to_read: i32,
+            bytes_read: Option<&mut i32>,
+            _callback: Option<&mut ResourceReadCallback>,
+        ) -> i32 {
+            let Some(bytes_read) = bytes_read else {
+                return 0;
+            };
+            *bytes_read = 0;
+            if data_out.is_null() || bytes_to_read <= 0 {
+                return 0;
+            }
+
+            let mut cursor = self
+                .cursor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let remaining = self.body.len().saturating_sub(*cursor);
+            let length = remaining.min(bytes_to_read as usize);
+            if length == 0 {
+                return 0;
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.body.as_ptr().add(*cursor), data_out, length);
+            }
+            *cursor += length;
+            *bytes_read = length as i32;
+            1
+        }
+    }
+}
+
+wrap_scheme_handler_factory! {
+    struct DebSchemeHandlerFactory;
+
+    impl SchemeHandlerFactory {
+        fn create(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            scheme_name: Option<&CefString>,
+            request: Option<&mut Request>,
+        ) -> Option<ResourceHandler> {
+            if scheme_name.map(CefString::to_string).as_deref() != Some(DEB_SCHEME) {
+                return None;
+            }
+            let request_url = CefString::from(&request?.url()).to_string();
+            is_deb_internal_url(&request_url).then(|| {
+                DebResourceHandler::new(DEB_NEW_TAB_PAGE, Arc::new(Mutex::new(0)))
+            })
+        }
+    }
+}
+
 wrap_app! {
     struct BrowserApp {
         ready: Arc<AtomicBool>,
@@ -332,6 +441,19 @@ wrap_app! {
                 Some(&"password-store".into()),
                 Some(&"basic".into()),
             );
+        }
+
+        fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
+            let Some(registrar) = registrar else {
+                return;
+            };
+            let options = SchemeOptions::STANDARD.get_raw()
+                | SchemeOptions::LOCAL.get_raw()
+                | SchemeOptions::SECURE.get_raw()
+                | SchemeOptions::DISPLAY_ISOLATED.get_raw();
+            if registrar.add_custom_scheme(Some(&DEB_SCHEME.into()), options as i32) != 1 {
+                eprintln!("cef-renderer: could not register the {DEB_SCHEME} scheme");
+            }
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
@@ -520,7 +642,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 
     let config = Config::from_args()?;
     let transport = unsafe { Transport::from_raw_fd(config.control_fd)? };
-    let single_threaded = std::env::var_os("DUAL_ENGINE_CEF_SINGLE_THREADED").is_some();
+    let single_threaded = std::env::var_os("DEB_CEF_SINGLE_THREADED").is_some();
     let engine = if single_threaded {
         Engine::Gecko
     } else {
@@ -534,10 +656,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
         .parent()
         .ok_or("CEF executable has no parent directory")?
         .to_path_buf();
-    let cache_path =
-        std::env::temp_dir().join(format!("dual-engine-browser-cef-{}", std::process::id()));
+    let cache_path = std::env::temp_dir().join(format!("deb-cef-{}", std::process::id()));
     std::fs::create_dir_all(&cache_path)?;
-    let remote_debugging_port = std::env::var("DUAL_ENGINE_CEF_DEBUG_PORT")
+    let remote_debugging_port = std::env::var("DEB_CEF_DEBUG_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_default();
@@ -580,6 +701,22 @@ fn run() -> Result<i32, Box<dyn Error>> {
         );
         shutdown();
         return Err("CEF context initialization timed out".into());
+    }
+
+    let mut scheme_factory = DebSchemeHandlerFactory::new();
+    if register_scheme_handler_factory(
+        Some(&DEB_SCHEME.into()),
+        Some(&DEB_NEW_TAB_HOST.into()),
+        Some(&mut scheme_factory),
+    ) != 1
+    {
+        emitter.error(
+            browser_config.request_id,
+            "SCHEME_REGISTRATION_FAILED",
+            "CEF rejected the deb:// scheme handler",
+        );
+        shutdown();
+        return Err("CEF rejected the deb:// scheme handler".into());
     }
 
     let browser_slot = Arc::new((Mutex::new(None), Condvar::new()));
@@ -741,7 +878,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlCommand, bounds_from_viewport, control_command};
+    use super::{ControlCommand, bounds_from_viewport, control_command, is_deb_internal_url};
     use shell_protocol::wire;
 
     #[test]
@@ -817,5 +954,14 @@ mod tests {
             }),
             Ok(ControlCommand::Focus(true))
         ));
+    }
+
+    #[test]
+    fn recognizes_only_the_new_tab_internal_page() {
+        assert!(is_deb_internal_url("deb://new-tab/"));
+        assert!(is_deb_internal_url("deb://new-tab?source=startup"));
+        assert!(!is_deb_internal_url("deb://settings/"));
+        assert!(!is_deb_internal_url("https://new-tab/"));
+        assert!(!is_deb_internal_url("deb://new-tab/not-found"));
     }
 }

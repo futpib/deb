@@ -353,6 +353,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "deb"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "pkg-config",
+ "qtbridge",
+ "shell-protocol",
+ "x11rb",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -417,17 +428,6 @@ dependencies = [
  "tar",
  "thiserror 2.0.19",
  "ureq",
-]
-
-[[package]]
-name = "dual-engine-browser"
-version = "0.1.0"
-dependencies = [
- "cc",
- "pkg-config",
- "qtbridge",
- "shell-protocol",
- "x11rb",
 ]
 
 [[package]]

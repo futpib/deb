@@ -1,6 +1,6 @@
-# Dual-engine browser prototype
+# deb
 
-This Linux/X11 desktop prototype puts Chromium and Gecko in one Qt Quick window. The Rust/Qt shell uses Qt Bridges, and both panes are native child windows controlled through the same CEF-facing `cef-renderer` executable.
+`deb` is a Linux/X11 desktop browser shell that puts Chromium and Gecko in one Qt Quick window. The Rust/Qt shell uses Qt Bridges, and both panes are native child windows controlled through the same CEF-facing `cef-renderer` executable.
 
 | Pane | `cef-renderer` resolves `libcef.so` to | Engine |
 | --- | --- | --- |
@@ -69,10 +69,16 @@ The first Firefox build is large. Later runs reuse `target/firefox-source` and `
 Run the application:
 
 ```sh
-cargo run -p dual-engine-browser
+cargo run -p deb
 ```
 
-It opens `https://www.google.com/` in both panes. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to both implementations.
+It opens `deb://new-tab/` in both panes. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to both implementations.
+
+## Internal pages
+
+`deb://` is the build-private internal-page origin shared by both engines. Chromium registers it as a standard, local, secure, display-isolated CEF scheme and serves requests through a `CefSchemeHandlerFactory`. Gecko registers an `nsIProtocolHandler` with equivalent local and trustworthy flags. Both implementations currently expose `deb://new-tab/` and serve the exact same source file, `internal-pages/new-tab.html`; unknown `deb://` routes fail closed.
+
+The page is packaged into the staged Firefox chrome archive during `scripts/build-firefox-cef.sh`, but its channel retains the `deb://new-tab/` original URI and a `deb://` content principal. It does not receive Firefox chrome privileges. The CEF-facing Firefox adapter accepts the corresponding scheme-factory registration used by the shared helper, while Gecko performs delivery through its native protocol handler.
 
 ## CEF compatibility boundary
 
@@ -86,13 +92,14 @@ The implemented slice covers:
 - reference-counted browser, browser-host, main-frame, and task objects
 - life-span, loading-state, and load-error callbacks
 - navigation, reload, focus, resize, native-window lookup, and close
+- registration of the build-owned `deb://new-tab/` internal page
 
 The Qt shell has no Firefox-specific navigation API. Extending Gecko support means implementing another coherent CEF behavior slice in `firefox-cef` and its Firefox bridge.
 
 ## Current limitations
 
 - The Gecko adapter supports one browser surface per helper process. Multiple profiles/accounts and CEF request-context isolation are not implemented.
-- Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, custom schemes, CEF cookie/request-context APIs, and request interception are outside the current CEF slice.
+- Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, arbitrary application-defined custom schemes, CEF cookie/request-context APIs, and request interception are outside the current CEF slice.
 - X11 native child windows are the sole presentation backend.
 - Each launch uses temporary Chromium and Firefox profile directories.
 
@@ -120,7 +127,7 @@ shellcheck scripts/build-firefox-cef.sh scripts/setup-arch-cef.sh
 To exercise a real runtime `Navigate` request after both engines report `SurfaceReady`, launch the staged application with an explicit smoke URL:
 
 ```sh
-DUAL_ENGINE_SMOKE_NAVIGATE_URL=https://example.com cargo run -p dual-engine-browser
+DEB_SMOKE_NAVIGATE_URL=https://example.com cargo run -p deb
 ```
 
 This hook is opt-in and does not change normal startup. A successful smoke run renders the requested page in both native children through the same shell-protocol request path used by **Navigate both**.

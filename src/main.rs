@@ -3,7 +3,7 @@ mod native;
 use native::{ControllerCommand, Layout, NativeRect};
 use qtbridge::{QApp, QObjectHolder, qobject};
 
-const DEFAULT_URL: &str = "https://www.google.com/";
+const DEFAULT_URL: &str = "deb://new-tab/";
 
 unsafe extern "C" {
     fn register_native_window_factory();
@@ -20,7 +20,7 @@ struct Backend {
 impl Default for Backend {
     fn default() -> Self {
         Self {
-            url: std::env::var("DUAL_ENGINE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned()),
+            url: std::env::var("DEB_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned()),
             chromium_status: "Waiting for Qt native host…".to_owned(),
             firefox_status: "Waiting for Qt native host…".to_owned(),
             controller: None,

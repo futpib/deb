@@ -12,7 +12,7 @@ use prost::Message;
 use thiserror::Error;
 
 pub mod wire {
-    include!(concat!(env!("OUT_DIR"), "/dual_engine.shell.rs"));
+    include!(concat!(env!("OUT_DIR"), "/deb.shell.rs"));
 }
 
 pub const MAX_PACKET_BYTES: usize = 256 * 1024;

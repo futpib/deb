@@ -3,7 +3,7 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 const bridge = Cc[
-  "@dual-engine-browser.local/firefox-cef-bridge;1"
+  "@deb.local/firefox-cef-bridge;1"
 ].getService(Ci.nsIFirefoxCefBridge);
 
 const progressListener = {

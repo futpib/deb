@@ -4,11 +4,12 @@ mod strings;
 
 use cef_dll_sys::{
     _cef_app_t, _cef_browser_host_t, _cef_browser_settings_t, _cef_browser_t, _cef_client_t,
-    _cef_dictionary_value_t, _cef_frame_t, _cef_request_context_t, _cef_settings_t, _cef_task_t,
-    cef_main_args_t, cef_string_t, cef_thread_id_t, cef_window_handle_t, cef_window_info_t,
+    _cef_dictionary_value_t, _cef_frame_t, _cef_request_context_t, _cef_scheme_handler_factory_t,
+    _cef_settings_t, _cef_task_t, cef_main_args_t, cef_string_t, cef_thread_id_t,
+    cef_window_handle_t, cef_window_info_t,
 };
 use libc::{c_char, c_int, c_void};
-use refcount::{CefRefCounted, RefObject, add_ref_raw};
+use refcount::{CefRefCounted, RefObject, add_ref_raw, release_raw};
 use runtime::{BrowserState, shutdown_all};
 use std::{
     ptr,
@@ -194,6 +195,28 @@ pub extern "C" fn cef_api_hash(version: c_int, entry: c_int) -> *const c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_api_version() -> c_int {
     15000
+}
+
+#[unsafe(no_mangle)]
+/// Registers the build-owned custom scheme used by the shared helper.
+///
+/// # Safety
+///
+/// String pointers must be null or valid CEF UTF-16 strings. `factory` must be
+/// null or carry the reference transferred by the CEF caller.
+pub unsafe extern "C" fn cef_register_scheme_handler_factory(
+    scheme_name: *const cef_string_t,
+    domain_name: *const cef_string_t,
+    factory: *mut _cef_scheme_handler_factory_t,
+) -> c_int {
+    let scheme_name = unsafe { cef_string_to_string(scheme_name) };
+    let domain_name = unsafe { cef_string_to_string(domain_name) };
+    unsafe { release_raw(factory) };
+    i32::from(
+        scheme_name.as_deref() == Some("deb")
+            && domain_name.as_deref() == Some("new-tab")
+            && !factory.is_null(),
+    )
 }
 
 #[unsafe(no_mangle)]

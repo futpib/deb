@@ -97,7 +97,7 @@ impl CefBackend {
         if matches!(self, Self::Chromium) {
             return Ok(None);
         }
-        let configured = std::env::var_os("DUAL_ENGINE_FIREFOX_RUNTIME")
+        let configured = std::env::var_os("DEB_FIREFOX_RUNTIME")
             .map(PathBuf::from)
             .unwrap_or_else(|| executable_directory.join("firefox-cef-runtime"));
         let directory = configured.canonicalize().map_err(|error| {
@@ -391,7 +391,7 @@ fn run_controller(
     };
     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
 
-    if let Ok(smoke_url) = std::env::var("DUAL_ENGINE_SMOKE_NAVIGATE_URL") {
+    if let Ok(smoke_url) = std::env::var("DEB_SMOKE_NAVIGATE_URL") {
         if let Some(instance) = &mut chromium {
             instance.navigate(&smoke_url).map_err(|error| {
                 format!("Chromium CEF smoke navigation could not be sent: {error}")
@@ -530,7 +530,7 @@ fn spawn_cef(
             preload.extend(std::env::split_paths(&existing));
         }
         command.env("LD_PRELOAD", std::env::join_paths(preload)?);
-        command.env("DUAL_ENGINE_CEF_SINGLE_THREADED", "1");
+        command.env("DEB_CEF_SINGLE_THREADED", "1");
         command.env(
             "FIREFOX_CEF_APP_INI",
             directory.join("browser/firefox-cef.ini"),

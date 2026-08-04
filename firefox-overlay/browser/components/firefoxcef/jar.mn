@@ -6,3 +6,4 @@ browser.jar:
 % content firefoxcef %content/firefoxcef/
   content/firefoxcef/main.xhtml (content/main.xhtml)
   content/firefoxcef/main.js    (content/main.js)
+  content/firefoxcef/deb-new-tab.html (content/deb-new-tab.html)

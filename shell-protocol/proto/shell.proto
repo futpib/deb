@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package dual_engine.shell;
+package deb.shell;
 
 enum Engine {
   ENGINE_UNSPECIFIED = 0;

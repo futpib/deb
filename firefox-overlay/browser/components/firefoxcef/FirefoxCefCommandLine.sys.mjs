@@ -5,7 +5,7 @@
 export class FirefoxCefCommandLineHandler {
   static classID = Components.ID("{921368d4-54ed-42b7-aa00-ba168284ade4}");
   static contractID =
-    "@dual-engine-browser.local/firefox-cef-command-line;1";
+    "@deb.local/firefox-cef-command-line;1";
 
   QueryInterface = ChromeUtils.generateQI([Ci.nsICommandLineHandler]);
 

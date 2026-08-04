@@ -1,8 +1,8 @@
 import QtQuick
 import QtQuick.Controls.Fusion
 import QtQuick.Layouts
-import dual_engine_browser
-import dual_engine_native
+import deb
+import deb_native
 
 ApplicationWindow {
     id: root
@@ -11,7 +11,7 @@ ApplicationWindow {
     minimumWidth: 900
     minimumHeight: 560
     visible: true
-    title: "Dual-engine browser · native on-screen surfaces"
+    title: "deb · Chromium + Gecko"
 
     Backend {
         id: backend
