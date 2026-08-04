@@ -24,12 +24,12 @@ The socket is unnamed and inherited at process creation. `SOCK_SEQPACKET` preser
 
 1. The shell sends `Hello` with its packet limit and required capabilities.
 2. The helper returns `HelloReply` with the actual engine, engine version, CEF API version, limit, and capabilities. An engine mismatch or missing required capability aborts startup.
-3. The shell sends `CreateBrowser` with a logical browser ID, initial URL, X11 parent window, and viewport.
+3. The shell sends `CreateBrowser` with a logical browser ID, profile ID, resolved XDG data/cache directories, initial URL, X11 parent window, and viewport. The helper validates and creates the profile directories before initializing its CEF implementation.
 4. Creation is complete only after both a successful response and a `SurfaceReady` event. Their order is deliberately unspecified.
 5. Navigation, resize, focus, reload, and close are requests with nonzero IDs. Every accepted request receives exactly one response with the same ID.
 6. Asynchronous state uses browser-scoped, monotonically increasing event sequence numbers. The shell rejects duplicate or reordered events.
 
-The current helper supports one logical browser per process. Browser IDs are already part of every request and event so multiplexing can be added without changing message shapes.
+The current helper supports one logical browser and one engine-native profile per process. A running shell can own multiple isolated helper pairs, one Chromium/Gecko pair for each open deb profile. Browser IDs are already part of every request and event so multiplexing within a profile can be added without changing message shapes.
 
 ## Build-locked contract
 

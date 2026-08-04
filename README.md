@@ -72,7 +72,27 @@ Run the application:
 cargo run -p deb
 ```
 
-It opens `deb://new-tab/` in both panes. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to both implementations.
+It opens `deb://new-tab/` in both panes. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to both implementations. Use **Add profile** to create another isolated Chromium/Gecko workspace in the same running application.
+
+## Profiles and XDG storage
+
+`deb` owns stable profile IDs and uses the maintained Rust `xdg` crate to resolve the XDG Base Directory layout, including the specification's fallback and relative-path rules. The profile registry is stored at `$XDG_CONFIG_HOME/deb/profiles.json`, persistent engine data is below `$XDG_DATA_HOME/deb/profiles/<profile-id>/`, and disposable engine caches are below `$XDG_CACHE_HOME/deb/profiles/<profile-id>/`.
+
+Each deb profile maps to two independent native stores:
+
+```text
+$XDG_DATA_HOME/deb/profiles/<profile-id>/
+  chromium/
+  firefox/
+
+$XDG_CACHE_HOME/deb/profiles/<profile-id>/
+  chromium/
+  firefox/
+```
+
+Chromium receives an explicit persistent CEF `cache_path`; its disk cache is redirected to the XDG cache directory. Gecko runs with the Firefox data directory as its native `--profile` and redirects `cache2` through `browser.cache.disk.parent_directory`. Cookies, local storage, IndexedDB, service workers, permissions, and other profile state remain engine-native and are never shared as raw files.
+
+Each profile workspace owns a Chromium helper and a Firefox helper. Opening another profile tab starts another isolated pair and previously opened profile pairs remain alive while the application is running. This gives complete cookie/storage separation and avoids attempting to switch Gecko's process-global Firefox profile in place.
 
 ## Internal pages
 
@@ -98,10 +118,9 @@ The Qt shell has no Firefox-specific navigation API. Extending Gecko support mea
 
 ## Current limitations
 
-- The Gecko adapter supports one browser surface per helper process. Multiple profiles/accounts and CEF request-context isolation are not implemented.
+- Each helper supports one browser surface and one profile. Multiple profiles are implemented with isolated helper pairs; multiple CEF request contexts inside one helper are not implemented.
 - Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, arbitrary application-defined custom schemes, CEF cookie/request-context APIs, and request interception are outside the current CEF slice.
 - X11 native child windows are the sole presentation backend.
-- Each launch uses temporary Chromium and Firefox profile directories.
 
 ## Verification
 

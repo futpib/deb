@@ -18,6 +18,16 @@ pub mod wire {
 pub const MAX_PACKET_BYTES: usize = 256 * 1024;
 pub const CHILD_CONTROL_FD: RawFd = 3;
 
+pub fn is_valid_profile_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.bytes().enumerate().all(|(index, byte)| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => true,
+            b'-' | b'_' => index != 0,
+            _ => false,
+        })
+}
+
 #[derive(Debug, Error)]
 pub enum ProtocolError {
     #[error("shell protocol I/O failed: {0}")]
@@ -124,7 +134,7 @@ pub fn configure_child_command(command: &mut Command, transport: &Transport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PACKET_BYTES, ProtocolError, Transport, wire};
+    use super::{MAX_PACKET_BYTES, ProtocolError, Transport, is_valid_profile_id, wire};
     use nix::sys::socket::{MsgFlags, send};
     use prost::Message;
     use std::os::fd::AsRawFd;
@@ -137,6 +147,18 @@ mod tests {
                 requested_capabilities: Vec::new(),
             })),
         }
+    }
+
+    #[test]
+    fn validates_filesystem_safe_profile_ids() {
+        assert!(is_valid_profile_id("default"));
+        assert!(is_valid_profile_id("work-2"));
+        assert!(is_valid_profile_id("account_one"));
+        assert!(!is_valid_profile_id(""));
+        assert!(!is_valid_profile_id("Work"));
+        assert!(!is_valid_profile_id("../work"));
+        assert!(!is_valid_profile_id("-work"));
+        assert!(!is_valid_profile_id(&"a".repeat(65)));
     }
 
     #[test]

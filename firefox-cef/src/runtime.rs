@@ -220,13 +220,21 @@ pub fn execute_child(args: *const cef_main_args_t) -> RuntimeResult<c_int> {
 
 pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
     let app_ini = app_ini_path()?;
-    let profile = PathBuf::from(root_cache_path).join("firefox-profile");
+    let profile = PathBuf::from(root_cache_path);
+    let cache = std::env::var_os("DEB_PROFILE_CACHE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| profile.join("cache"));
     fs::create_dir_all(&profile)?;
+    fs::create_dir_all(&cache)?;
     fs::write(
         profile.join("user.js"),
-        concat!(
-            "user_pref(\"browser.startup.blankWindow\", false);\n",
-            "user_pref(\"extensions.enabledScopes\", 0);\n",
+        format!(
+            concat!(
+                "user_pref(\"browser.startup.blankWindow\", false);\n",
+                "user_pref(\"extensions.enabledScopes\", 0);\n",
+                "user_pref(\"browser.cache.disk.parent_directory\", \"{}\");\n",
+            ),
+            javascript_string(cache.to_string_lossy().as_ref()),
         ),
     )?;
     unsafe { std::env::set_var("FIREFOX_CEF_APP_INI", &app_ini) };
@@ -242,6 +250,22 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
     };
     unsafe { (gecko()?.set_callbacks)(&callbacks) };
     Ok(())
+}
+
+fn javascript_string(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\u{2028}' => escaped.push_str("\\u2028"),
+            '\u{2029}' => escaped.push_str("\\u2029"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 pub fn run_message_loop() -> RuntimeResult<c_int> {
@@ -611,7 +635,7 @@ pub unsafe extern "C" fn execute_cef_task(context: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_content_process, terminated_argument_vector};
+    use super::{is_content_process, javascript_string, terminated_argument_vector};
     use cef_dll_sys::cef_main_args_t;
     use std::ffi::CString;
 
@@ -677,5 +701,10 @@ mod tests {
             argv: std::ptr::null_mut(),
         };
         assert!(terminated_argument_vector(&arguments).is_err());
+    }
+
+    #[test]
+    fn escapes_profile_cache_paths_for_user_js() {
+        assert_eq!(javascript_string("/tmp/a\\b\"c\n"), "/tmp/a\\\\b\\\"c\\n");
     }
 }

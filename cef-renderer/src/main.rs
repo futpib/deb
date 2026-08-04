@@ -1,11 +1,12 @@
 use cef::{args::Args, *};
 use shell_protocol::{
-    MAX_PACKET_BYTES, Transport,
+    MAX_PACKET_BYTES, Transport, is_valid_profile_id,
     wire::{self, Capability, Engine},
 };
 use std::{
     error::Error,
     os::fd::RawFd,
+    path::PathBuf,
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -102,6 +103,9 @@ struct BrowserConfig {
     url: String,
     parent: u64,
     bounds: Bounds,
+    profile_id: String,
+    profile_data_path: PathBuf,
+    profile_cache_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -441,6 +445,12 @@ wrap_app! {
                 Some(&"password-store".into()),
                 Some(&"basic".into()),
             );
+            if let Some(cache_path) = std::env::var_os("DEB_PROFILE_CACHE_PATH") {
+                command_line.append_switch_with_value(
+                    Some(&"disk-cache-dir".into()),
+                    Some(&CefString::from(cache_path.to_string_lossy().as_ref())),
+                );
+            }
         }
 
         fn on_register_custom_schemes(&self, registrar: Option<&mut SchemeRegistrar>) {
@@ -602,6 +612,18 @@ fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dy
         if x11.parent_window == 0 {
             return Err("X11 parent window must be nonzero".into());
         }
+        if !is_valid_profile_id(&create.profile_id) {
+            return Err(format!("invalid profile ID {:?}", create.profile_id).into());
+        }
+        let profile_data_path =
+            absolute_profile_path(&create.profile_data_path, "CreateBrowser profile data path")?;
+        let profile_cache_path = absolute_profile_path(
+            &create.profile_cache_path,
+            "CreateBrowser profile cache path",
+        )?;
+        if profile_data_path == profile_cache_path {
+            return Err("profile data and cache paths must be different".into());
+        }
         Ok(BrowserConfig {
             request_id,
             browser_id: request.browser_id,
@@ -612,6 +634,9 @@ fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dy
             },
             parent: x11.parent_window,
             bounds: bounds_from_viewport(x11.viewport)?,
+            profile_id: create.profile_id,
+            profile_data_path,
+            profile_cache_path,
         })
     })();
     if let Err(error) = &parsed
@@ -624,6 +649,14 @@ fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dy
         ))?;
     }
     parsed
+}
+
+fn absolute_profile_path(value: &str, description: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let path = PathBuf::from(value);
+    if value.is_empty() || !path.is_absolute() {
+        return Err(format!("{description} must be an absolute path").into());
+    }
+    Ok(path)
 }
 
 fn run() -> Result<i32, Box<dyn Error>> {
@@ -656,8 +689,17 @@ fn run() -> Result<i32, Box<dyn Error>> {
         .parent()
         .ok_or("CEF executable has no parent directory")?
         .to_path_buf();
-    let cache_path = std::env::temp_dir().join(format!("deb-cef-{}", std::process::id()));
-    std::fs::create_dir_all(&cache_path)?;
+    std::fs::create_dir_all(&browser_config.profile_data_path)?;
+    std::fs::create_dir_all(&browser_config.profile_cache_path)?;
+    eprintln!(
+        "cef-renderer: profile {} uses data {} and cache {}",
+        browser_config.profile_id,
+        browser_config.profile_data_path.display(),
+        browser_config.profile_cache_path.display()
+    );
+    unsafe {
+        std::env::set_var("DEB_PROFILE_CACHE_PATH", &browser_config.profile_cache_path);
+    }
     let remote_debugging_port = std::env::var("DEB_CEF_DEBUG_PORT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -665,7 +707,10 @@ fn run() -> Result<i32, Box<dyn Error>> {
     let settings = Settings {
         no_sandbox: 1,
         multi_threaded_message_loop: i32::from(!single_threaded),
-        root_cache_path: CefString::from(cache_path.to_string_lossy().as_ref()),
+        cache_path: CefString::from(browser_config.profile_data_path.to_string_lossy().as_ref()),
+        root_cache_path: CefString::from(
+            browser_config.profile_data_path.to_string_lossy().as_ref(),
+        ),
         resources_dir_path: CefString::from(runtime_path.to_string_lossy().as_ref()),
         locales_dir_path: CefString::from(runtime_path.join("locales").to_string_lossy().as_ref()),
         log_file: CefString::from("/dev/stderr"),
@@ -862,7 +907,6 @@ fn run() -> Result<i32, Box<dyn Error>> {
         .take();
     drop(client);
     shutdown();
-    let _ = std::fs::remove_dir_all(cache_path);
     Ok(0)
 }
 
@@ -878,7 +922,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlCommand, bounds_from_viewport, control_command, is_deb_internal_url};
+    use super::{
+        ControlCommand, absolute_profile_path, bounds_from_viewport, control_command,
+        is_deb_internal_url,
+    };
     use shell_protocol::wire;
 
     #[test]
@@ -963,5 +1010,12 @@ mod tests {
         assert!(!is_deb_internal_url("deb://settings/"));
         assert!(!is_deb_internal_url("https://new-tab/"));
         assert!(!is_deb_internal_url("deb://new-tab/not-found"));
+    }
+
+    #[test]
+    fn requires_absolute_profile_paths() {
+        assert!(absolute_profile_path("/data/deb/default", "data path").is_ok());
+        assert!(absolute_profile_path("relative/default", "data path").is_err());
+        assert!(absolute_profile_path("", "data path").is_err());
     }
 }

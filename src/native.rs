@@ -1,3 +1,4 @@
+use crate::profile::{EngineDirectories, ProfileDirectories};
 use qtbridge::{QmlMethodInvoker, invoke_method};
 use shell_protocol::{
     MAX_PACKET_BYTES, ProtocolError, Transport, configure_child_command,
@@ -72,6 +73,15 @@ pub struct Controller {
     thread: JoinHandle<()>,
 }
 
+struct ControllerConfig {
+    profile_id: String,
+    profile_directories: ProfileDirectories,
+    url: String,
+    chromium_parent: Window,
+    firefox_parent: Window,
+    layout: Layout,
+}
+
 impl Controller {
     pub fn send(
         &self,
@@ -124,6 +134,13 @@ impl CefBackend {
         match self {
             Self::Chromium => Engine::Chromium,
             Self::Firefox => Engine::Gecko,
+        }
+    }
+
+    fn directories(self, profile: &ProfileDirectories) -> &EngineDirectories {
+        match self {
+            Self::Chromium => &profile.chromium,
+            Self::Firefox => &profile.firefox,
         }
     }
 }
@@ -315,6 +332,8 @@ enum ProtocolNotice {
 }
 
 pub fn spawn_controller(
+    profile_id: String,
+    profile_directories: ProfileDirectories,
     url: String,
     chromium_parent: Window,
     firefox_parent: Window,
@@ -322,15 +341,16 @@ pub fn spawn_controller(
     invoker: QmlMethodInvoker,
 ) -> Controller {
     let (sender, receiver) = mpsc::channel();
+    let config = ControllerConfig {
+        profile_id,
+        profile_directories,
+        url,
+        chromium_parent,
+        firefox_parent,
+        layout,
+    };
     let thread = std::thread::spawn(move || {
-        if let Err(error) = run_controller(
-            url,
-            chromium_parent,
-            firefox_parent,
-            layout,
-            &invoker,
-            receiver,
-        ) {
+        if let Err(error) = run_controller(config, &invoker, receiver) {
             update_statuses(
                 &invoker,
                 format!("Native controller failed: {error}"),
@@ -342,13 +362,18 @@ pub fn spawn_controller(
 }
 
 fn run_controller(
-    initial_url: String,
-    chromium_parent: Window,
-    firefox_parent: Window,
-    initial_layout: Layout,
+    config: ControllerConfig,
     invoker: &QmlMethodInvoker,
     receiver: mpsc::Receiver<ControllerCommand>,
 ) -> NativeResult<()> {
+    let ControllerConfig {
+        profile_id,
+        profile_directories,
+        url: initial_url,
+        chromium_parent,
+        firefox_parent,
+        layout: initial_layout,
+    } = config;
     let (connection, _) = x11rb::connect(None)?;
     let mut layout = initial_layout;
     let mut chromium_status = "Starting Chromium through the CEF ABI…".to_owned();
@@ -360,10 +385,12 @@ fn run_controller(
         chromium_parent,
         layout.chromium,
         &initial_url,
+        &profile_id,
+        CefBackend::Chromium.directories(&profile_directories),
         CefBackend::Chromium,
     ) {
         Ok(instance) => {
-            chromium_status = "Live · libcef.so / Chromium · shared CEF helper".to_owned();
+            chromium_status = format!("Live · profile {profile_id} · libcef.so / Chromium");
             Some(instance)
         }
         Err(error) => {
@@ -378,10 +405,12 @@ fn run_controller(
         firefox_parent,
         layout.firefox,
         &initial_url,
+        &profile_id,
+        CefBackend::Firefox.directories(&profile_directories),
         CefBackend::Firefox,
     ) {
         Ok(instance) => {
-            firefox_status = "Live · libcef.so / Gecko · native X11 child".to_owned();
+            firefox_status = format!("Live · profile {profile_id} · libcef.so / Gecko");
             Some(instance)
         }
         Err(error) => {
@@ -425,7 +454,7 @@ fn run_controller(
                     match instance.navigate(&url) {
                         Ok(()) => {
                             chromium_status =
-                                "Live · libcef.so / Chromium · shared CEF helper".to_owned()
+                                format!("Live · profile {profile_id} · libcef.so / Chromium")
                         }
                         Err(error) => {
                             chromium_status = format!("Chromium CEF navigation failed: {error}")
@@ -436,7 +465,7 @@ fn run_controller(
                     match instance.navigate(&url) {
                         Ok(()) => {
                             firefox_status =
-                                "Live · libcef.so / Gecko · native X11 child".to_owned()
+                                format!("Live · profile {profile_id} · libcef.so / Gecko")
                         }
                         Err(error) => {
                             firefox_status = format!("Firefox CEF navigation failed: {error}")
@@ -508,6 +537,8 @@ fn spawn_cef(
     parent: Window,
     bounds: NativeRect,
     url: &str,
+    profile_id: &str,
+    directories: &EngineDirectories,
     backend: CefBackend,
 ) -> NativeResult<CefInstance> {
     let executable = std::env::current_exe()?;
@@ -556,6 +587,8 @@ fn spawn_cef(
         parent,
         bounds,
         url,
+        profile_id,
+        directories,
     ) {
         Ok(ready) => ready,
         Err(error) => {
@@ -618,6 +651,8 @@ fn initialize_helper(
     parent: Window,
     bounds: NativeRect,
     url: &str,
+    profile_id: &str,
+    directories: &EngineDirectories,
 ) -> NativeResult<(Window, u64)> {
     transport.send(&wire::Packet {
         request_id: 1,
@@ -653,6 +688,9 @@ fn initialize_helper(
                 parent_window: u64::from(parent),
                 viewport: Some(bounds.viewport()),
             }),
+            profile_id: profile_id.to_owned(),
+            profile_data_path: protocol_path(&directories.data)?,
+            profile_cache_path: protocol_path(&directories.cache)?,
         }),
     ))?;
 
@@ -719,6 +757,12 @@ fn initialize_helper(
         window.expect("surface readiness was checked"),
         last_event_sequence,
     ))
+}
+
+fn protocol_path(path: &Path) -> NativeResult<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("profile path is not valid UTF-8: {}", path.display()).into())
 }
 
 fn receive_startup_packet(

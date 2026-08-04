@@ -59,6 +59,9 @@ message Request {
 message CreateBrowser {
   string initial_url = 1;
   X11Target x11 = 2;
+  string profile_id = 3;
+  string profile_data_path = 4;
+  string profile_cache_path = 5;
 }
 
 message Viewport {
