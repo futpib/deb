@@ -1,0 +1,21 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+#include "nsISupports.idl"
+
+[scriptable, uuid(3c9aa7f6-46dd-422e-887e-c63ac30d1b07)]
+interface nsIFirefoxCefBridge : nsISupports
+{
+  readonly attribute unsigned long browserId;
+  readonly attribute AUTF8String initialUrl;
+  readonly attribute unsigned long initialWidth;
+  readonly attribute unsigned long initialHeight;
+
+  void runtimeReady();
+  void loadingStateChanged(in boolean loading);
+  void loadError(in long errorCode,
+                 in AUTF8String errorText,
+                 in AUTF8String failedUrl);
+  void beforeClose();
+};

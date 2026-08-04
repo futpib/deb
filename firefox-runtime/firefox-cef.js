@@ -1,0 +1,10 @@
+pref("toolkit.defaultChromeURI", "chrome://firefoxcef/content/main.xhtml");
+pref("toolkit.defaultChromeFeatures", "chrome,dialog=no,all");
+pref("toolkit.singletonWindowType", "firefox-cef:main");
+pref("browser.shell.checkDefaultBrowser", false);
+pref("browser.aboutwelcome.enabled", false);
+pref("browser.startup.firstrunSkipsHomepage", true);
+pref("browser.sessionstore.resume_from_crash", false);
+pref("datareporting.policy.dataSubmissionEnabled", false);
+pref("toolkit.telemetry.enabled", false);
+pref("app.update.enabled", false);

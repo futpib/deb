@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<?xml-stylesheet href="chrome://global/skin/" type="text/css"?>
+<window id="firefox-cef-window"
+        windowtype="firefox-cef:main"
+        title="FirefoxCEF"
+        width="900"
+        height="700"
+        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+  <script src="chrome://firefoxcef/content/main.js"/>
+  <browser id="content"
+           type="content"
+           primary="true"
+           remote="true"
+           remoteType="web"
+           flex="1"/>
+</window>

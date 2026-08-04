@@ -1,0 +1,59 @@
+diff --git a/browser/components/moz.build b/browser/components/moz.build
+index e5e114604177..a262d454482e 100644
+--- a/browser/components/moz.build
++++ b/browser/components/moz.build
+@@ -41,6 +41,7 @@ DIRS += [
+     "downloads",
+     "enterprisepolicies",
+     "extensions",
++    "firefoxcef",
+     "firefoxview",
+     "genai",
+     "ipprotection",
+diff --git a/widget/gtk/nsWindow.cpp b/widget/gtk/nsWindow.cpp
+index 03dcdfdf88ad..d62438bb7ec8 100644
+--- a/widget/gtk/nsWindow.cpp
++++ b/widget/gtk/nsWindow.cpp
+@@ -13,5 +13,6 @@
+ #include <algorithm>
+ #include <cstdint>
++#include <cstdlib>
+ #ifdef MOZ_X11
+ #  include <X11/Xlib.h>
+ #endif
+@@ -101,6 +102,7 @@
+ #include "nsString.h"
+ #include "nsWidgetsCID.h"
+ #include "nsXPLookAndFeel.h"
++#include "prenv.h"
+ #include "prlink.h"
+ #include "Screen.h"
+ #include "ScreenHelperGTK.h"
+@@ -4463,2 +4465,27 @@ nsresult nsWindow::Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
++#ifdef MOZ_X11
++  if (mWindowType == WindowType::TopLevel && GdkIsX11Display()) {
++    const char* parentIdString = PR_GetEnv("FIREFOX_CEF_PARENT_XID");
++    if (parentIdString && *parentIdString) {
++      char* end = nullptr;
++      uint64_t parentId = std::strtoull(parentIdString, &end, 10);
++      GdkWindow* shellWindow = gtk_widget_get_window(mShell);
++      if (parentId && end && !*end && shellWindow) {
++        GdkWindow* parentWindow = gdk_x11_window_foreign_new_for_display(
++            gtk_widget_get_display(mShell), parentId);
++        if (parentWindow) {
++          gtk_window_set_decorated(GTK_WINDOW(mShell), FALSE);
++          gdk_window_reparent(shellWindow, parentWindow, 0, 0);
++          g_object_unref(parentWindow);
++          unsetenv("FIREFOX_CEF_PARENT_XID");
++          auto setNativeWindow = reinterpret_cast<void (*)(uint64_t)>(dlsym(
++              RTLD_DEFAULT, "firefox_cef_gecko_set_native_window"));
++          if (setNativeWindow) {
++            setNativeWindow(GDK_WINDOW_XID(shellWindow));
++          }
++        }
++      }
++    }
++  }
++#endif
+   // mGdkWindow is set by moz_container_realize() / SetGdkWindow().
+   MOZ_DIAGNOSTIC_ASSERT(mGdkWindow, "MozContainer realize failed?");
