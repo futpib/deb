@@ -3,7 +3,7 @@ use std::{
     error::Error,
     io::{self, BufRead, Write},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::sleep,
@@ -103,11 +103,47 @@ fn parse_control_command(line: &str) -> Option<ControlCommand> {
 }
 
 wrap_life_span_handler! {
-    struct BrowserLifeSpanHandler;
+    struct BrowserLifeSpanHandler {
+        browser: Arc<(Mutex<Option<Browser>>, Condvar)>,
+        closed: Arc<(Mutex<bool>, Condvar)>,
+    }
 
     impl LifeSpanHandler {
+        fn on_after_created(&self, browser: Option<&mut Browser>) {
+            let Some(browser) = browser else {
+                return;
+            };
+            let Some(host) = browser.host() else {
+                return;
+            };
+            let native_window = host.window_handle();
+            if native_window == 0 {
+                return;
+            }
+            host.set_focus(1);
+            *self
+                .browser
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(browser.clone());
+            self.browser.1.notify_all();
+            println!("ready\t{native_window}");
+            let _ = io::stdout().flush();
+            eprintln!("cef-renderer: native browser ready");
+        }
+
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            quit_message_loop();
+            self.browser
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            *self
+                .closed
+                .0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = true;
+            self.closed.1.notify_all();
         }
     }
 }
@@ -118,17 +154,12 @@ wrap_load_handler! {
     impl LoadHandler {
         fn on_loading_state_change(
             &self,
-            browser: Option<&mut Browser>,
+            _browser: Option<&mut Browser>,
             is_loading: i32,
             _can_go_back: i32,
             _can_go_forward: i32,
         ) {
             if is_loading == 0 {
-                if let Some(browser) = browser
-                    && let Err(error) = resize_browser(browser)
-                {
-                    eprintln!("cef-renderer: post-load repaint failed: {error}");
-                }
                 eprintln!("cef-renderer: page load settled");
             }
         }
@@ -201,6 +232,10 @@ wrap_app! {
             command_line.append_switch(Some(&"disable-gpu".into()));
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             command_line.append_switch(Some(&"noerrdialogs".into()));
+            command_line.append_switch_with_value(
+                Some(&"password-store".into()),
+                Some(&"basic".into()),
+            );
         }
 
         fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
@@ -258,8 +293,6 @@ fn resize_browser(browser: &Browser) -> Result<(), Box<dyn Error>> {
         return Err("CEF browser has no native window yet".into());
     }
     host.notify_move_or_resize_started();
-    host.was_resized();
-    host.invalidate(PaintElementType::VIEW);
     Ok(())
 }
 
@@ -285,14 +318,20 @@ fn run() -> Result<i32, Box<dyn Error>> {
     let cache_path =
         std::env::temp_dir().join(format!("dual-engine-browser-cef-{}", std::process::id()));
     std::fs::create_dir_all(&cache_path)?;
+    let remote_debugging_port = std::env::var("DUAL_ENGINE_CEF_DEBUG_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
     let settings = Settings {
         no_sandbox: 1,
+        multi_threaded_message_loop: 1,
         root_cache_path: CefString::from(cache_path.to_string_lossy().as_ref()),
         resources_dir_path: CefString::from(runtime_path.to_string_lossy().as_ref()),
         locales_dir_path: CefString::from(runtime_path.join("locales").to_string_lossy().as_ref()),
         log_file: CefString::from("/dev/stderr"),
         log_severity: LogSeverity::INFO,
         background_color: 0xffff_ffff,
+        remote_debugging_port,
         ..Default::default()
     };
     if initialize(
@@ -307,7 +346,6 @@ fn run() -> Result<i32, Box<dyn Error>> {
 
     let initialization_deadline = Instant::now() + Duration::from_secs(10);
     while !context_ready.load(Ordering::Acquire) && Instant::now() < initialization_deadline {
-        do_message_loop_work();
         sleep(Duration::from_millis(10));
     }
     if !context_ready.load(Ordering::Acquire) {
@@ -315,7 +353,10 @@ fn run() -> Result<i32, Box<dyn Error>> {
         return Err("CEF context initialization timed out".into());
     }
 
-    let life_span_handler = BrowserLifeSpanHandler::new();
+    let browser_slot = Arc::new((Mutex::new(None), Condvar::new()));
+    let browser_closed = Arc::new((Mutex::new(false), Condvar::new()));
+    let life_span_handler =
+        BrowserLifeSpanHandler::new(browser_slot.clone(), browser_closed.clone());
     let load_handler = BrowserLoadHandler::new();
     let mut client = BrowserClient::new(life_span_handler, load_handler);
     let cef_bounds = Rect {
@@ -324,36 +365,40 @@ fn run() -> Result<i32, Box<dyn Error>> {
         width: config.bounds.width as i32,
         height: config.bounds.height as i32,
     };
-    let window_info = WindowInfo::default().set_as_child(config.parent as _, &cef_bounds);
+    let window_info = WindowInfo {
+        runtime_style: RuntimeStyle::ALLOY,
+        ..WindowInfo::default().set_as_child(config.parent as _, &cef_bounds)
+    };
     let browser_settings = BrowserSettings {
         background_color: 0xffff_ffff,
         ..Default::default()
     };
-    let browser = browser_host_create_browser_sync(
+    let initial_url = CefString::from(config.url.as_str());
+    if browser_host_create_browser(
         Some(&window_info),
         Some(&mut client),
-        Some(&CefString::from(config.url.as_str())),
+        Some(&initial_url),
         Some(&browser_settings),
         None,
         None,
-    )
-    .ok_or("CEF did not create a browser")?;
-    let native_window = browser
-        .host()
-        .map(|host| {
-            host.set_focus(1);
-            host.window_handle()
-        })
-        .ok_or("CEF browser has no host")?;
-    if native_window == 0 {
-        return Err("CEF browser has no native window".into());
+    ) != 1
+    {
+        shutdown();
+        return Err("CEF did not accept asynchronous browser creation".into());
     }
-    println!("ready\t{native_window}");
-    io::stdout().flush()?;
-    eprintln!("cef-renderer: native browser ready");
 
-    let command_browser = browser.clone();
+    let command_browser = browser_slot.clone();
     std::thread::spawn(move || {
+        let command_browser = {
+            let (browser, ready) = &*command_browser;
+            let mut browser = browser.lock().unwrap_or_else(|error| error.into_inner());
+            while browser.is_none() {
+                browser = ready
+                    .wait(browser)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+            browser.as_ref().unwrap().clone()
+        };
         for line in io::stdin().lock().lines() {
             let Ok(line) = line else {
                 break;
@@ -370,9 +415,21 @@ fn run() -> Result<i32, Box<dyn Error>> {
         let _ = post_task(ThreadId::UI, Some(&mut task));
     });
 
-    run_message_loop();
+    {
+        let (closed, wakeup) = &*browser_closed;
+        let mut closed = closed.lock().unwrap_or_else(|error| error.into_inner());
+        while !*closed {
+            closed = wakeup
+                .wait(closed)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
 
-    drop(browser);
+    browser_slot
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
     drop(client);
     shutdown();
     let _ = std::fs::remove_dir_all(cache_path);

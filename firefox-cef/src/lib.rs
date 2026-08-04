@@ -17,6 +17,7 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
+    thread::{self, JoinHandle},
 };
 use strings::cef_string_to_string;
 
@@ -24,9 +25,14 @@ const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0
 const API_HASH_EXPERIMENTAL_LINUX: &[u8] = b"a5d187477e0cbe23eb1043c2f1868582b7018260\0";
 static QUIT_MESSAGE_LOOP: AtomicBool = AtomicBool::new(false);
 static TASK_QUEUE: OnceLock<(Mutex<VecDeque<usize>>, Condvar)> = OnceLock::new();
+static MESSAGE_LOOP_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 
 fn task_queue() -> &'static (Mutex<VecDeque<usize>>, Condvar) {
     TASK_QUEUE.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
+}
+
+fn message_loop_thread() -> &'static Mutex<Option<JoinHandle<()>>> {
+    MESSAGE_LOOP_THREAD.get_or_init(|| Mutex::new(None))
 }
 
 unsafe fn execute_task(task: *mut _cef_task_t) {
@@ -245,11 +251,20 @@ pub unsafe extern "C" fn cef_execute_process(
 /// ABI for the duration of this call. `application` callbacks may be invoked.
 pub unsafe extern "C" fn cef_initialize(
     _args: *const cef_main_args_t,
-    _settings: *const _cef_settings_t,
+    settings: *const _cef_settings_t,
     application: *mut _cef_app_t,
     _sandbox: *mut c_void,
 ) -> c_int {
     QUIT_MESSAGE_LOOP.store(false, Ordering::Release);
+    release_queued_tasks();
+    if unsafe { settings.as_ref() }
+        .is_some_and(|settings| settings.multi_threaded_message_loop != 0)
+    {
+        *message_loop_thread()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            Some(thread::spawn(|| cef_run_message_loop()));
+    }
     if let Some(application) = unsafe { application.as_mut() }
         && let Some(get_handler) = application.get_browser_process_handler
     {
@@ -300,6 +315,37 @@ pub unsafe extern "C" fn cef_browser_host_create_browser_sync(
     state.notify_loading(false);
     eprintln!("firefox-cef: created browser {} for {url}", state.id);
     browser
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// The arguments must follow the CEF C ABI. Non-null pointers must remain
+/// valid for the duration of this call, including any invoked client callbacks.
+pub unsafe extern "C" fn cef_browser_host_create_browser(
+    window_info: *const cef_window_info_t,
+    client: *mut _cef_client_t,
+    url: *const cef_string_t,
+    settings: *const _cef_browser_settings_t,
+    extra_info: *mut _cef_dictionary_value_t,
+    request_context: *mut _cef_request_context_t,
+) -> c_int {
+    let browser = unsafe {
+        cef_browser_host_create_browser_sync(
+            window_info,
+            client,
+            url,
+            settings,
+            extra_info,
+            request_context,
+        )
+    };
+    if browser.is_null() {
+        0
+    } else {
+        unsafe { refcount::release_raw(browser) };
+        1
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -356,6 +402,14 @@ extern "C" fn cef_quit_message_loop() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_shutdown() {
+    cef_quit_message_loop();
+    if let Some(thread) = message_loop_thread()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take()
+    {
+        let _ = thread.join();
+    }
     release_queued_tasks();
     shutdown_all();
     eprintln!("firefox-cef: shutdown complete");

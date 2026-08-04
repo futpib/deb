@@ -37,7 +37,7 @@ cargo build --workspace
 cargo run -p dual-engine-browser
 ```
 
-The application starts both helpers at `https://www.google.com/`. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to each implementation. The application selects Qt's `xcb` platform when `DISPLAY` is available because the native-window integration is X11-specific.
+The application starts both helpers at `https://www.google.com/`. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to each implementation. The application selects Qt's `xcb` platform when `DISPLAY` is available because the native-window integration is X11-specific. Chromium uses its basic local password store for the helper's temporary profile so cookie initialization does not block on a desktop keyring.
 
 By default the Firefox helper loads `target/debug/libfirefox_cef.so`. A different shim build can be selected with:
 
@@ -52,7 +52,7 @@ This is a real Gecko-backed CEF ABI shim for this controlled client, not a drop-
 The current subset exports:
 
 - CEF API hash/version, process entry, initialize, shutdown, and UTF string functions
-- synchronous browser creation and CEF message-loop/task functions
+- synchronous and asynchronous browser creation and CEF message-loop/task functions
 - reference-counted browser, browser-host, and main-frame objects
 - client life-span and loading callbacks
 - main-frame navigation, reload, focus, resize, window handle, and close behavior
@@ -65,7 +65,6 @@ Extending the shim means implementing another coherent slice of CEF behavior in 
 - Firefox remains a coordinated top-level X11 window rather than a reparented child because stock Firefox's compositor stopped painting when reparented across processes. Clipping and unusual window-manager transitions are therefore limited.
 - A navigation opens a new Firefox tab through the isolated profile. The temporary profile lasts for one helper lifetime; persistent accounts and CEF request-context/profile APIs are not implemented yet.
 - Keyboard focus and IME forwarding into the Chromium child are incomplete. Native repaint, resize, mouse activation, and URL-bar navigation are wired.
-- Under this host's Xvfb/Openbox test display, Chromium CEF reports successful external page loads but leaves the network page surface dark. The same CEF pane visibly renders local `data:` content, while the Firefox-backed CEF pane visibly rendered Google and Example Domain over HTTPS. This should be rechecked on a real GPU-backed X11/XWayland desktop.
 
 ## Verification
 
