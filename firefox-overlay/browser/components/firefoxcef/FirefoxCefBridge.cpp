@@ -255,16 +255,6 @@ extern "C" NS_EXPORT int firefox_cef_gecko_focus() {
   return 1;
 }
 
-extern "C" NS_EXPORT int firefox_cef_gecko_resize(uint32_t aWidth,
-                                                   uint32_t aHeight) {
-  nsAutoCString command("resize\t");
-  command.AppendInt(std::max(aWidth, 2U));
-  command.Append('\t');
-  command.AppendInt(std::max(aHeight, 2U));
-  NotifyCommand(std::move(command));
-  return 1;
-}
-
 extern "C" NS_EXPORT int firefox_cef_gecko_close() {
   NotifyCommand(nsCString("close"));
   return 1;
@@ -288,31 +278,41 @@ extern "C" NS_EXPORT int firefox_cef_gecko_run(int aArgc, char** aArgv,
     }
     mozilla::SetGeckoProcessType(aArgv[--aArgc]);
     mozilla::SetGeckoChildID(aArgv[--aArgc]);
-    bool forkServerLogging = false;
+    mozilla::Bootstrap::UniquePtr bootstrap;
+    mozilla::XRE_GetBootstrap(bootstrap);
+    if (!bootstrap) {
+      return 4;
+    }
+    bootstrap->NS_LogInit();
 #ifdef MOZ_ENABLE_FORKSERVER
     if (mozilla::GetGeckoProcessType() == GeckoProcessType_ForkServer) {
-      NS_LogInit();
-      forkServerLogging = true;
-      if (XRE_ForkServer(&aArgc, &aArgv)) {
-        NS_LogTerm();
+      if (bootstrap->XRE_ForkServer(&aArgc, &aArgv)) {
+        bootstrap->NS_LogTerm();
         return 0;
       }
     }
 #endif
     XREChildData childData;
-    nsresult result = XRE_InitChildProcess(aArgc, aArgv, &childData);
-    if (forkServerLogging) {
-      NS_LogTerm();
-    }
+    nsresult result =
+        bootstrap->XRE_InitChildProcess(aArgc, aArgv, &childData);
+    bootstrap->NS_LogTerm();
     return NS_FAILED(result) ? 1 : 0;
   }
 
   if (!aAppIni) {
     return 2;
   }
-  XRE_EnableSameExecutableForContentProc();
+  mozilla::Bootstrap::UniquePtr bootstrap;
+  mozilla::XRE_GetBootstrap(bootstrap);
+  if (!bootstrap) {
+    return 4;
+  }
+  bootstrap->NS_LogInit();
+  bootstrap->XRE_EnableSameExecutableForContentProc();
   mozilla::BootstrapConfig config{};
   config.appData = nullptr;
   config.appDataPath = aAppIni;
-  return XRE_main(aArgc, aArgv, config);
+  int result = bootstrap->XRE_main(aArgc, aArgv, config);
+  bootstrap->NS_LogTerm();
+  return result;
 }

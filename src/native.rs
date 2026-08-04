@@ -353,7 +353,7 @@ fn spawn_cef(
     let mut command = Command::new(helper);
     if let Some(directory) = &loader_directory {
         command.env("LD_LIBRARY_PATH", directory);
-        let mut preload = vec![directory.join("libmozglue.so"), directory.join("libxul.so")];
+        let mut preload = vec![directory.join("libmozglue-cef.so")];
         if let Some(existing) = std::env::var_os("LD_PRELOAD") {
             preload.extend(std::env::split_paths(&existing));
         }

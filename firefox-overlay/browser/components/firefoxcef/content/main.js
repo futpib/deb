@@ -56,9 +56,6 @@ window.addEventListener("load", () => {
         window.focus();
         browser.focus();
         break;
-      case "resize":
-        window.resizeTo(Number(arguments_[0]), Number(arguments_[1]));
-        break;
       case "close":
         window.close();
         break;
@@ -66,7 +63,6 @@ window.addEventListener("load", () => {
   }, "firefox-cef-command");
 
   bridge.runtimeReady();
-  window.resizeTo(bridge.initialWidth, bridge.initialHeight);
   loadUrl(browser, bridge.initialUrl);
   browser.focus();
 }, { once: true });

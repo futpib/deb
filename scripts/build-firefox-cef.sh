@@ -51,7 +51,7 @@ if [[ "$runtime_directory" != "$project_root/target/debug/firefox-cef-runtime" ]
 fi
 rm -rf "$runtime_directory"
 mkdir -p "$runtime_directory"
-cp -a "$object_directory/dist/bin/." "$runtime_directory/"
+cp -aL "$object_directory/dist/bin/." "$runtime_directory/"
 mkdir -p "$runtime_directory/browser/defaults/preferences"
 cp "$project_root/firefox-runtime/firefox-cef.ini" \
   "$runtime_directory/browser/firefox-cef.ini"
@@ -59,5 +59,34 @@ cp "$project_root/firefox-runtime/firefox-cef.js" \
   "$runtime_directory/browser/defaults/preferences/zz-firefox-cef.js"
 cp "$project_root/target/debug/cef-renderer" "$runtime_directory/cef-renderer"
 cp "$project_root/target/debug/libfirefox_cef.so" "$runtime_directory/libcef.so"
+
+cxx_line=$(rg '^_CXX = ' "$object_directory/config/autoconf.mk")
+cxx=${cxx_line#_CXX = }
+if [[ ! -x "$cxx" ]]; then
+  echo "Firefox C++ compiler is unavailable: $cxx" >&2
+  exit 1
+fi
+
+mozglue_objects=()
+collect_mozglue=0
+while IFS= read -r object; do
+  if [[ "$object" == "../../mozglue/build/dummy.o" ]]; then
+    collect_mozglue=1
+  fi
+  if ((collect_mozglue)); then
+    mozglue_objects+=("$object")
+  fi
+done <"$object_directory/browser/app/firefox.list"
+if ((${#mozglue_objects[@]} == 0)); then
+  echo "Firefox launcher did not provide its mozglue object list" >&2
+  exit 1
+fi
+
+pushd "$object_directory/browser/app" >/dev/null
+"$cxx" -shared -o "$runtime_directory/libmozglue-cef.so" \
+  "${mozglue_objects[@]}" \
+  ../../build/pure_virtual/libpure_virtual.a \
+  -pthread -ldl -lm
+popd >/dev/null
 
 echo "Staged FirefoxCEF in $runtime_directory"

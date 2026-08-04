@@ -4,6 +4,8 @@
 
 FINAL_LIBRARY = "xul"
 
+EXTRA_JS_MODULES += ["FirefoxCefCommandLine.sys.mjs"]
+
 JAR_MANIFESTS += ["jar.mn"]
 XPCOM_MANIFESTS += ["components.conf"]
 

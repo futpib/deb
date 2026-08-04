@@ -15,7 +15,10 @@ use std::{
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
 };
-use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::{
+    connection::Connection,
+    protocol::xproto::{ConfigureWindowAux, ConnectionExt},
+};
 
 use crate::refcount::{add_ref_raw, release_raw};
 
@@ -36,20 +39,17 @@ type SetCallbacks = unsafe extern "C" fn(*const FirefoxCefCallbacks);
 type Configure = unsafe extern "C" fn(u32, u64, u32, u32, *const c_char) -> c_int;
 type Command = unsafe extern "C" fn() -> c_int;
 type StringCommand = unsafe extern "C" fn(*const c_char) -> c_int;
-type Resize = unsafe extern "C" fn(u32, u32) -> c_int;
 type PostTask =
     unsafe extern "C" fn(Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void) -> c_int;
 type Run = unsafe extern "C" fn(c_int, *mut *mut c_char, *const c_char) -> c_int;
 
 struct GeckoApi {
-    _mozglue: usize,
     _libxul: usize,
     set_callbacks: SetCallbacks,
     configure: Configure,
     navigate: StringCommand,
     reload: Command,
     focus: Command,
-    resize: Resize,
     close: Command,
     post_task: PostTask,
     run: Run,
@@ -64,17 +64,14 @@ impl GeckoApi {
             .parent()
             .ok_or("FirefoxCEF helper executable has no parent directory")?
             .to_path_buf();
-        let mozglue = load_library(&directory.join("libmozglue.so"))?;
         let libxul = load_library(&directory.join("libxul.so"))?;
         Ok(Self {
-            _mozglue: mozglue as usize,
             _libxul: libxul as usize,
             set_callbacks: unsafe { symbol(libxul, b"firefox_cef_gecko_set_callbacks\0")? },
             configure: unsafe { symbol(libxul, b"firefox_cef_gecko_configure\0")? },
             navigate: unsafe { symbol(libxul, b"firefox_cef_gecko_navigate\0")? },
             reload: unsafe { symbol(libxul, b"firefox_cef_gecko_reload\0")? },
             focus: unsafe { symbol(libxul, b"firefox_cef_gecko_focus\0")? },
-            resize: unsafe { symbol(libxul, b"firefox_cef_gecko_resize\0")? },
             close: unsafe { symbol(libxul, b"firefox_cef_gecko_close\0")? },
             post_task: unsafe { symbol(libxul, b"firefox_cef_gecko_post_task\0")? },
             run: unsafe { symbol(libxul, b"firefox_cef_gecko_run\0")? },
@@ -200,16 +197,38 @@ pub fn is_content_process(args: *const cef_main_args_t) -> bool {
     argument == b"-contentproc" || argument == b"--contentproc"
 }
 
+fn terminated_argument_vector(args: &cef_main_args_t) -> RuntimeResult<Vec<*mut c_char>> {
+    let argument_count = usize::try_from(args.argc)?;
+    if argument_count != 0 && args.argv.is_null() {
+        return Err("missing CEF process argument vector".into());
+    }
+    let mut arguments = if argument_count == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(args.argv, argument_count) }.to_vec()
+    };
+    arguments.push(ptr::null_mut());
+    Ok(arguments)
+}
+
 pub fn execute_child(args: *const cef_main_args_t) -> RuntimeResult<c_int> {
     let args = unsafe { args.as_ref() }.ok_or("missing CEF process arguments")?;
+    let mut arguments = terminated_argument_vector(args)?;
     let app_ini = path_cstring(&app_ini_path()?)?;
-    Ok(unsafe { (gecko()?.run)(args.argc, args.argv, app_ini.as_ptr()) })
+    Ok(unsafe { (gecko()?.run)(args.argc, arguments.as_mut_ptr(), app_ini.as_ptr()) })
 }
 
 pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
     let app_ini = app_ini_path()?;
     let profile = PathBuf::from(root_cache_path).join("firefox-profile");
     fs::create_dir_all(&profile)?;
+    fs::write(
+        profile.join("user.js"),
+        concat!(
+            "user_pref(\"browser.startup.blankWindow\", false);\n",
+            "user_pref(\"extensions.enabledScopes\", 0);\n",
+        ),
+    )?;
     unsafe { std::env::set_var("FIREFOX_CEF_APP_INI", &app_ini) };
     *config().lock().unwrap_or_else(|error| error.into_inner()) =
         Some(RuntimeConfig { profile, app_ini });
@@ -242,14 +261,10 @@ pub fn run_message_loop() -> RuntimeResult<c_int> {
         .iter()
         .map(|argument| argument.as_ptr().cast_mut())
         .collect::<Vec<_>>();
+    let argument_count = c_int::try_from(pointers.len())?;
+    pointers.push(ptr::null_mut());
     let app_ini = path_cstring(&runtime.app_ini)?;
-    Ok(unsafe {
-        (gecko()?.run)(
-            c_int::try_from(pointers.len())?,
-            pointers.as_mut_ptr(),
-            app_ini.as_ptr(),
-        )
-    })
+    Ok(unsafe { (gecko()?.run)(argument_count, pointers.as_mut_ptr(), app_ini.as_ptr()) })
 }
 
 pub fn post_task(
@@ -358,9 +373,18 @@ impl BrowserState {
         let height = u32::from(geometry.height).max(2);
         self.width.store(width, Ordering::Release);
         self.height.store(height, Ordering::Release);
-        let api = gecko()?;
-        if unsafe { (api.resize)(width, height) } == 0 {
-            return Err("Gecko rejected resize".into());
+        let window = self.window();
+        if window != 0 {
+            connection.configure_window(
+                window,
+                &ConfigureWindowAux::new()
+                    .x(0)
+                    .y(0)
+                    .width(width)
+                    .height(height)
+                    .border_width(0),
+            )?;
+            connection.flush()?;
         }
         if focus {
             self.focus()?;
@@ -587,7 +611,7 @@ pub unsafe extern "C" fn execute_cef_task(context: *mut c_void) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_content_process;
+    use super::{is_content_process, terminated_argument_vector};
     use cef_dll_sys::cef_main_args_t;
     use std::ffi::CString;
 
@@ -623,5 +647,35 @@ mod tests {
             argv: pointers.as_mut_ptr(),
         };
         assert!(!is_content_process(&arguments));
+    }
+
+    #[test]
+    fn terminates_gecko_child_argument_vectors() {
+        let mut values = [
+            CString::new("cef-renderer").unwrap(),
+            CString::new("-contentproc").unwrap(),
+        ];
+        let mut pointers = values
+            .iter_mut()
+            .map(|value| value.as_ptr().cast_mut())
+            .collect::<Vec<_>>();
+        let arguments = cef_main_args_t {
+            argc: pointers.len() as i32,
+            argv: pointers.as_mut_ptr(),
+        };
+
+        let terminated = terminated_argument_vector(&arguments).unwrap();
+
+        assert_eq!(&terminated[..pointers.len()], pointers.as_slice());
+        assert!(terminated.last().unwrap().is_null());
+    }
+
+    #[test]
+    fn rejects_missing_gecko_child_argument_vector() {
+        let arguments = cef_main_args_t {
+            argc: 1,
+            argv: std::ptr::null_mut(),
+        };
+        assert!(terminated_argument_vector(&arguments).is_err());
     }
 }

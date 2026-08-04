@@ -1,86 +1,116 @@
 # Dual-engine browser prototype
 
-This is a Linux/X11 Qt Quick shell that drives Chromium and Firefox through the same CEF-facing helper. The shell uses the official Qt Bridge for Rust from the start, and both engine panes are live on-screen surfaces.
+This Linux/X11 desktop prototype puts Chromium and Gecko in one Qt Quick window. The Rust/Qt shell uses Qt Bridges, and both panes are native child windows controlled through the same CEF-facing `cef-renderer` executable.
 
-| Pane | Shared helper dependency | Loaded implementation | Browser engine |
-| --- | --- | --- | --- |
-| Chromium | `DT_NEEDED: libcef.so` | Arch CEF's `libcef.so` | Chromium |
-| Firefox | `DT_NEEDED: libcef.so` | `libfirefox_cef.so`, exposed as `libcef.so` in a private loader directory | Gecko in stock Firefox |
+| Pane | `cef-renderer` resolves `libcef.so` to | Engine |
+| --- | --- | --- |
+| Chromium | Arch CEF | Chromium |
+| Firefox | the private `firefox-cef` adapter | Gecko from the pinned Firefox source tree |
 
-`cef-renderer` is one binary, not separate Chromium and Firefox integrations. The controller starts it normally for Chromium. For Firefox it creates a private `libcef.so` symlink pointing to `libfirefox_cef.so` and sets that helper's loader path. The Gecko adapter then implements the CEF 150 C ABI subset used by the helper, including initialization, browser/host/frame objects, reference counting, load and life-span callbacks, UI-thread task dispatch, navigation, resize, focus, and shutdown.
+The Firefox side is not automation of a separately installed Firefox. Its private helper loads the project-built CEF adapter, the adapter loads `libxul.so`, and a small component compiled into that Firefox runtime provides the bridge between CEF operations and Gecko. The patched GTK widget creates the `FirefoxCEF` surface as a direct X11 child of the Qt host.
 
-The adapter currently launches stock Firefox with an isolated profile behind that ABI. It removes the helper's loader overrides before starting Firefox, locates the resulting X11 window, and keeps its outer frame aligned and stacked over a Qt-owned host surface. The shell itself has no Firefox-specific process or navigation path.
+## Architecture
+
+```text
+Qt/Rust application process
+  Qt GUI thread
+    Chromium host QWidget ── X11 parent ──┐
+    Firefox host QWidget  ── X11 parent ──┼──────────────────────────┐
+                                          │                          │
+Chromium cef-renderer process             │  Firefox cef-renderer process
+  helper main/control threads             │    main thread: CEF loop -> XRE_main
+  Arch libcef.so                          │    private libcef.so (Rust adapter)
+  Chromium CEF UI thread                  │      -> libxul.so bridge
+  Chromium child processes                │    FirefoxCEF GTK child ─────────┘
+    renderer / GPU / network ─────────────┘    Gecko child processes
+                                                web content / socket / RDD
+```
+
+Both helpers have the same `DT_NEEDED: libcef.so` dependency and execute the same CEF calls. Loader isolation selects the implementation. The Chromium helper enables CEF's multi-threaded loop; the Gecko helper runs the CEF loop and XRE on its process main thread. Standard Chromium and Gecko content isolation remains in place behind those browser processes.
+
+Linux Firefox links its allocator glue into the launcher rather than shipping it as a reusable shared object. The staging script therefore links `libmozglue-cef.so` from the pinned build's exact launcher object list and preloads it before the adapter loads `libxul.so`. Gecko startup and child startup use Mozilla's `Bootstrap` interface, including the required null-terminated argument vectors.
 
 ## Requirements
 
-- Rust 1.87 or newer
-- A C++ compiler and `pkg-config`
-- Qt 6.10 or newer with Qt Base and Qt Declarative development files
-- CEF 150.0.14
-- Firefox
-- An X11 display, or XWayland for experimentation
-- Xvfb and a small window manager such as Openbox for isolated UI tests
+- Linux with X11, or XWayland; native Wayland embedding is not implemented
+- Rust with Edition 2024 support
+- Qt 6 Base and Qt 6 Declarative development files
+- CEF matching `cef = 150.2.1`
+- Firefox build prerequisites and enough space for a full Firefox object tree
+- `pkg-config`, a C/C++ toolchain, Python, Node.js, and the Firefox-provided build toolchains
 
-On Arch Linux:
+On Arch Linux, the core host packages can be installed with:
 
 ```sh
-paru -S --needed base-devel cef firefox openbox pkgconf qt6-base qt6-declarative xorg-server-xvfb
-./scripts/setup-arch-cef.sh
+paru -S --needed base-devel cef pkgconf qt6-base qt6-declarative
 ```
 
-The setup script stages symlinks to Arch's CEF runtime in the ignored `cef-runtime/` directory. If that directory is absent, `cef-rs` can download its matching CEF archive during the first build instead.
+If Firefox's build reports another missing prerequisite, run `./mach bootstrap` in the pinned `firefox` submodule and select the desktop Firefox build environment.
 
 ## Build and run
 
+Initialize the pinned Firefox source and stage Arch's CEF runtime:
+
 ```sh
-cargo build --workspace
+git submodule update --init firefox
+scripts/setup-arch-cef.sh
+```
+
+Build the patched Firefox runtime, the Gecko-backed adapter, the shared helper, and the Qt shell:
+
+```sh
+scripts/build-firefox-cef.sh
+```
+
+The first Firefox build is large. Later runs reuse `target/firefox-source` and `target/firefox-obj` and are incremental. The script refuses a Firefox worktree that is not at the submodule's pinned commit, applies `firefox-patches/0001-firefox-cef-runtime.patch`, overlays the maintained bridge sources, and stages the result under `target/debug/firefox-cef-runtime`.
+
+Run the application:
+
+```sh
 cargo run -p dual-engine-browser
 ```
 
-The application starts both helpers at `https://www.google.com/`. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to each implementation. The application selects Qt's `xcb` platform when `DISPLAY` is available because the native-window integration is X11-specific. Chromium uses its basic local password store for the helper's temporary profile so cookie initialization does not block on a desktop keyring.
+It opens `https://www.google.com/` in both panes. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to both implementations.
 
-By default the Firefox helper loads `target/debug/libfirefox_cef.so`. A different shim build can be selected with:
+## CEF compatibility boundary
 
-```sh
-DUAL_ENGINE_FIREFOX_CEF=/path/to/libfirefox_cef.so cargo run -p dual-engine-browser
-```
+`firefox-cef` is a real exported CEF C ABI implementation for this controlled client. It is not yet a drop-in replacement for arbitrary CEF applications. Matching symbol names and object layouts is only part of compatibility; general CEF clients can depend on hundreds of methods and Chromium-specific behavior.
 
-## Compatibility boundary
+The implemented slice covers:
 
-This is a real Gecko-backed CEF ABI shim for this controlled client, not a drop-in replacement for every CEF application. Exporting the same functions and object layouts is only the first compatibility layer; arbitrary CEF clients can call hundreds of methods and rely on Chromium-specific multiprocess, request-context, extension, accessibility, popup, off-screen rendering, and callback behavior that this prototype does not implement.
+- API version/hash queries, process entry, initialization, shutdown, and UTF string functions
+- synchronous and asynchronous browser creation
+- CEF message-loop and UI-task dispatch
+- reference-counted browser, browser-host, main-frame, and task objects
+- life-span, loading-state, and load-error callbacks
+- navigation, reload, focus, resize, native-window lookup, and close
 
-The current subset exports:
-
-- CEF API hash/version, process entry, initialize, shutdown, and UTF string functions
-- synchronous and asynchronous browser creation and CEF message-loop/task functions
-- reference-counted browser, browser-host, and main-frame objects
-- client life-span and loading callbacks
-- main-frame navigation, reload, focus, resize, window handle, and close behavior
-
-Extending the shim means implementing another coherent slice of CEF behavior in `firefox-cef`, not adding a second API to the Qt shell.
+The Qt shell has no Firefox-specific navigation API. Extending Gecko support means implementing another coherent CEF behavior slice in `firefox-cef` and its Firefox bridge.
 
 ## Current limitations
 
-- Gecko is not linked in-process. `libfirefox_cef.so` owns a stock Firefox subprocess and adapts it to the CEF subset.
-- Firefox remains a coordinated top-level X11 window rather than a reparented child because stock Firefox's compositor stopped painting when reparented across processes. Clipping and unusual window-manager transitions are therefore limited.
-- A navigation opens a new Firefox tab through the isolated profile. The temporary profile lasts for one helper lifetime; persistent accounts and CEF request-context/profile APIs are not implemented yet.
-- Keyboard focus and IME forwarding into the Chromium child are incomplete. Native repaint, resize, mouse activation, and URL-bar navigation are wired.
+- The Gecko adapter supports one browser surface per helper process. Multiple profiles/accounts and CEF request-context isolation are not implemented.
+- Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, custom schemes, CEF cookie/request-context APIs, and request interception are outside the current CEF slice.
+- Native Wayland child-surface embedding is not implemented; the application selects Qt's XCB platform when `DISPLAY` is available.
+- Each launch uses temporary Chromium and Firefox profile directories.
 
 ## Verification
 
-The shared-helper loader split can be inspected statically:
+Static loader checks:
 
 ```sh
 readelf -d target/debug/cef-renderer
-nm -D --defined-only target/debug/libfirefox_cef.so
+nm -D --defined-only target/debug/firefox-cef-runtime/libcef.so
+nm -D --defined-only target/debug/firefox-cef-runtime/libxul.so
 ```
 
-`readelf` should show one `NEEDED` entry for `libcef.so`. During a run, `/proc/<chromium-helper>/maps` resolves it to the real `libcef.so`, while `/proc/<firefox-helper>/maps` resolves the same dependency to `libfirefox_cef.so`.
+`readelf` should report `libcef.so` for the shared helper. The staged adapter should export the implemented `cef_*` entry points, and `libxul.so` should export the `firefox_cef_gecko_*` bridge.
 
 Local checks:
 
 ```sh
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+shellcheck scripts/build-firefox-cef.sh scripts/setup-arch-cef.sh
 ```
