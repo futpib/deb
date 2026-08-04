@@ -45,13 +45,18 @@ pushd "$project_root" >/dev/null
 cargo build --workspace
 popd >/dev/null
 
+if [[ "$runtime_directory" != "$project_root/target/debug/firefox-cef-runtime" ]]; then
+  echo "Refusing to replace unexpected runtime path: $runtime_directory" >&2
+  exit 1
+fi
+rm -rf "$runtime_directory"
 mkdir -p "$runtime_directory"
 cp -a "$object_directory/dist/bin/." "$runtime_directory/"
 mkdir -p "$runtime_directory/browser/defaults/preferences"
 cp "$project_root/firefox-runtime/firefox-cef.ini" \
   "$runtime_directory/browser/firefox-cef.ini"
 cp "$project_root/firefox-runtime/firefox-cef.js" \
-  "$runtime_directory/browser/defaults/preferences/firefox-cef.js"
+  "$runtime_directory/browser/defaults/preferences/zz-firefox-cef.js"
 cp "$project_root/target/debug/cef-renderer" "$runtime_directory/cef-renderer"
 cp "$project_root/target/debug/libfirefox_cef.so" "$runtime_directory/libcef.so"
 

@@ -323,9 +323,10 @@ fn run() -> Result<i32, Box<dyn Error>> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or_default();
+    let single_threaded = std::env::var_os("DUAL_ENGINE_CEF_SINGLE_THREADED").is_some();
     let settings = Settings {
         no_sandbox: 1,
-        multi_threaded_message_loop: 1,
+        multi_threaded_message_loop: i32::from(!single_threaded),
         root_cache_path: CefString::from(cache_path.to_string_lossy().as_ref()),
         resources_dir_path: CefString::from(runtime_path.to_string_lossy().as_ref()),
         locales_dir_path: CefString::from(runtime_path.join("locales").to_string_lossy().as_ref()),
@@ -416,7 +417,9 @@ fn run() -> Result<i32, Box<dyn Error>> {
         let _ = post_task(ThreadId::UI, Some(&mut task));
     });
 
-    {
+    if single_threaded {
+        run_message_loop();
+    } else {
         let (closed, wakeup) = &*browser_closed;
         let mut closed = closed.lock().unwrap_or_else(|error| error.into_inner());
         while !*closed {

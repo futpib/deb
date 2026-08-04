@@ -1,5 +1,5 @@
 diff --git a/browser/components/moz.build b/browser/components/moz.build
-index e5e114604177..a262d454482e 100644
+index d1d769ab09..982b571428 100644
 --- a/browser/components/moz.build
 +++ b/browser/components/moz.build
 @@ -41,6 +41,7 @@ DIRS += [
@@ -10,11 +10,31 @@ index e5e114604177..a262d454482e 100644
      "firefoxview",
      "genai",
      "ipprotection",
+diff --git a/toolkit/library/libxul.symbols b/toolkit/library/libxul.symbols
+index e63e3e7442..902d5ee39f 100644
+--- a/toolkit/library/libxul.symbols
++++ b/toolkit/library/libxul.symbols
+@@ -1,4 +1,14 @@
+ XRE_GetBootstrap
++firefox_cef_gecko_set_callbacks
++firefox_cef_gecko_configure
++firefox_cef_gecko_set_native_window
++firefox_cef_gecko_navigate
++firefox_cef_gecko_reload
++firefox_cef_gecko_focus
++firefox_cef_gecko_resize
++firefox_cef_gecko_close
++firefox_cef_gecko_post_task
++firefox_cef_gecko_run
+ uprofiler_get
+ #ifdef XP_IOS
+ MainProcessInit
 diff --git a/widget/gtk/nsWindow.cpp b/widget/gtk/nsWindow.cpp
-index 03dcdfdf88ad..d62438bb7ec8 100644
+index 9d11df1895..6faa5578c6 100644
 --- a/widget/gtk/nsWindow.cpp
 +++ b/widget/gtk/nsWindow.cpp
-@@ -13,5 +13,6 @@
+@@ -12,6 +12,7 @@
+
  #include <algorithm>
  #include <cstdint>
 +#include <cstdlib>
@@ -29,7 +49,10 @@ index 03dcdfdf88ad..d62438bb7ec8 100644
  #include "prlink.h"
  #include "Screen.h"
  #include "ScreenHelperGTK.h"
-@@ -4463,2 +4465,27 @@ nsresult nsWindow::Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
+@@ -4460,5 +4462,31 @@ nsresult nsWindow::Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
+   }
+
+   gtk_widget_realize(container);
 +#ifdef MOZ_X11
 +  if (mWindowType == WindowType::TopLevel && GdkIsX11Display()) {
 +    const char* parentIdString = PR_GetEnv("FIREFOX_CEF_PARENT_XID");
@@ -55,5 +78,6 @@ index 03dcdfdf88ad..d62438bb7ec8 100644
 +    }
 +  }
 +#endif
++
    // mGdkWindow is set by moz_container_realize() / SetGdkWindow().
    MOZ_DIAGNOSTIC_ASSERT(mGdkWindow, "MozContainer realize failed?");

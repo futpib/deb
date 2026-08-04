@@ -87,26 +87,19 @@ impl CefBackend {
         if matches!(self, Self::Chromium) {
             return Ok(None);
         }
-        let configured = std::env::var_os("DUAL_ENGINE_FIREFOX_CEF")
+        let configured = std::env::var_os("DUAL_ENGINE_FIREFOX_RUNTIME")
             .map(PathBuf::from)
-            .unwrap_or_else(|| executable_directory.join("libfirefox_cef.so"));
-        let library = configured.canonicalize().map_err(|error| {
+            .unwrap_or_else(|| executable_directory.join("firefox-cef-runtime"));
+        let directory = configured.canonicalize().map_err(|error| {
             format!(
                 "cannot resolve {} at {}: {error}",
                 self.name(),
                 configured.display()
             )
         })?;
-        let directory = std::env::temp_dir().join(format!(
-            "dual-engine-browser-firefox-cef-loader-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory)?;
-        let link = directory.join("libcef.so");
-        if std::fs::symlink_metadata(&link).is_ok() {
-            std::fs::remove_file(&link)?;
+        if !directory.join("libcef.so").is_file() {
+            return Err(format!("{} has no libcef.so", directory.display()).into());
         }
-        std::os::unix::fs::symlink(library, link)?;
         Ok(Some(directory))
     }
 
@@ -123,7 +116,6 @@ struct CefInstance {
     input: ChildStdin,
     window: Window,
     native_child: bool,
-    loader_directory: Option<PathBuf>,
 }
 
 impl CefInstance {
@@ -173,9 +165,6 @@ impl CefInstance {
     fn stop(mut self) {
         let _ = self.send("quit");
         stop_child(&mut self.child);
-        if let Some(directory) = self.loader_directory {
-            let _ = std::fs::remove_dir_all(directory);
-        }
     }
 }
 
@@ -246,8 +235,7 @@ fn run_controller(
         CefBackend::Firefox,
     ) {
         Ok(instance) => {
-            firefox_status =
-                "Live · libfirefox_cef.so / Gecko · shared CEF helper subset".to_owned();
+            firefox_status = "Live · libcef.so / Gecko · native X11 child".to_owned();
             Some(instance)
         }
         Err(error) => {
@@ -289,8 +277,7 @@ fn run_controller(
                     match instance.navigate(&url) {
                         Ok(()) => {
                             firefox_status =
-                                "Live · libfirefox_cef.so / Gecko · shared CEF helper subset"
-                                    .to_owned()
+                                "Live · libcef.so / Gecko · native X11 child".to_owned()
                         }
                         Err(error) => {
                             firefox_status = format!("Firefox CEF navigation failed: {error}")
@@ -355,11 +342,29 @@ fn spawn_cef(
     let executable_directory = executable
         .parent()
         .ok_or("application executable has no parent directory")?;
-    let helper = executable_directory.join("cef-renderer");
     let loader_directory = backend.loader_directory(executable_directory)?;
+    let helper = match backend {
+        CefBackend::Chromium => executable_directory.join("cef-renderer"),
+        CefBackend::Firefox => loader_directory
+            .as_ref()
+            .ok_or("FirefoxCEF runtime directory is unavailable")?
+            .join("cef-renderer"),
+    };
     let mut command = Command::new(helper);
     if let Some(directory) = &loader_directory {
         command.env("LD_LIBRARY_PATH", directory);
+        let mut preload = vec![directory.join("libmozglue.so"), directory.join("libxul.so")];
+        if let Some(existing) = std::env::var_os("LD_PRELOAD") {
+            preload.extend(std::env::split_paths(&existing));
+        }
+        command.env("LD_PRELOAD", std::env::join_paths(preload)?);
+        command.env("DUAL_ENGINE_CEF_SINGLE_THREADED", "1");
+        command.env(
+            "FIREFOX_CEF_APP_INI",
+            directory.join("browser/firefox-cef.ini"),
+        );
+        command.env("GDK_BACKEND", "x11");
+        command.env("MOZ_ENABLE_WAYLAND", "0");
     }
     let mut child = command
         .arg("--parent")
@@ -379,31 +384,34 @@ fn spawn_cef(
         .stdout
         .take()
         .ok_or("CEF readiness pipe is unavailable")?;
-    let window = match wait_for_cef_ready(output, &mut child, Duration::from_secs(30)) {
+    let readiness_timeout = match backend {
+        CefBackend::Chromium => Duration::from_secs(30),
+        CefBackend::Firefox => Duration::from_secs(90),
+    };
+    let window = match wait_for_cef_ready(output, &mut child, readiness_timeout) {
         Ok(window) => window,
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            if let Some(directory) = loader_directory {
-                let _ = std::fs::remove_dir_all(directory);
-            }
             return Err(format!("{} did not become ready: {error}", backend.name()).into());
         }
     };
     let native_child = connection.query_tree(window)?.reply()?.parent == parent;
-    if native_child {
-        connection.change_window_attributes(
-            window,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS),
-        )?;
-        configure_native_window(connection, window, bounds)?;
+    if !native_child {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{} returned a window outside the Qt host", backend.name()).into());
     }
+    connection.change_window_attributes(
+        window,
+        &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS),
+    )?;
+    configure_native_window(connection, window, bounds)?;
     Ok(CefInstance {
         child,
         input,
         window,
         native_child,
-        loader_directory,
     })
 }
 
@@ -466,7 +474,7 @@ fn update_statuses(invoker: &QmlMethodInvoker, chromium: String, firefox: String
 }
 
 fn stop_child(child: &mut Child) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,

@@ -11,49 +11,13 @@ use libc::{c_char, c_int, c_void};
 use refcount::{CefRefCounted, RefObject, add_ref_raw};
 use runtime::{BrowserState, shutdown_all};
 use std::{
-    collections::VecDeque,
     ptr,
-    sync::{
-        Arc, Condvar, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    thread::{self, JoinHandle},
+    sync::{Arc, atomic::Ordering},
 };
 use strings::cef_string_to_string;
 
 const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0";
 const API_HASH_EXPERIMENTAL_LINUX: &[u8] = b"a5d187477e0cbe23eb1043c2f1868582b7018260\0";
-static QUIT_MESSAGE_LOOP: AtomicBool = AtomicBool::new(false);
-static TASK_QUEUE: OnceLock<(Mutex<VecDeque<usize>>, Condvar)> = OnceLock::new();
-static MESSAGE_LOOP_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-
-fn task_queue() -> &'static (Mutex<VecDeque<usize>>, Condvar) {
-    TASK_QUEUE.get_or_init(|| (Mutex::new(VecDeque::new()), Condvar::new()))
-}
-
-fn message_loop_thread() -> &'static Mutex<Option<JoinHandle<()>>> {
-    MESSAGE_LOOP_THREAD.get_or_init(|| Mutex::new(None))
-}
-
-unsafe fn execute_task(task: *mut _cef_task_t) {
-    if let Some(task) = unsafe { task.as_mut() } {
-        if let Some(execute) = task.execute {
-            unsafe { execute(task) };
-        }
-        unsafe { refcount::release_raw(task) };
-    }
-}
-
-fn release_queued_tasks() {
-    let (queue, _) = task_queue();
-    let queued = {
-        let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
-        queue.drain(..).collect::<Vec<_>>()
-    };
-    for task in queued {
-        unsafe { refcount::release_raw(task as *mut _cef_task_t) };
-    }
-}
 
 fn state_from<T: CefRefCounted>(raw: *mut T) -> Arc<BrowserState> {
     unsafe { RefObject::<T, Arc<BrowserState>>::get(raw).state.clone() }
@@ -69,8 +33,8 @@ unsafe extern "C" fn browser_get_host(browser: *mut _cef_browser_t) -> *mut _cef
     host
 }
 
-unsafe extern "C" fn browser_is_loading(_browser: *mut _cef_browser_t) -> c_int {
-    0
+unsafe extern "C" fn browser_is_loading(browser: *mut _cef_browser_t) -> c_int {
+    i32::from(state_from(browser).is_loading())
 }
 
 unsafe extern "C" fn browser_reload(browser: *mut _cef_browser_t) {
@@ -211,6 +175,7 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     browser.get_frame_count = Some(browser_get_frame_count);
     let browser = RefObject::allocate(browser, state.clone());
     state.browser.store(browser, Ordering::Release);
+    unsafe { add_ref_raw(browser) };
     browser
 }
 
@@ -237,10 +202,20 @@ pub extern "C" fn cef_api_version() -> c_int {
 /// The pointers must either be null or point to values that follow the CEF C
 /// ABI for the duration of this call.
 pub unsafe extern "C" fn cef_execute_process(
-    _args: *const cef_main_args_t,
-    _application: *mut _cef_app_t,
+    args: *const cef_main_args_t,
+    application: *mut _cef_app_t,
     _sandbox: *mut c_void,
 ) -> c_int {
+    unsafe { refcount::release_raw(application) };
+    if runtime::is_content_process(args) {
+        return match runtime::execute_child(args) {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("firefox-cef: Gecko child startup failed: {error}");
+                1
+            }
+        };
+    }
     -1
 }
 
@@ -255,15 +230,27 @@ pub unsafe extern "C" fn cef_initialize(
     application: *mut _cef_app_t,
     _sandbox: *mut c_void,
 ) -> c_int {
-    QUIT_MESSAGE_LOOP.store(false, Ordering::Release);
-    release_queued_tasks();
-    if unsafe { settings.as_ref() }
-        .is_some_and(|settings| settings.multi_threaded_message_loop != 0)
-    {
-        *message_loop_thread()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) =
-            Some(thread::spawn(|| cef_run_message_loop()));
+    let Some(settings) = (unsafe { settings.as_ref() }) else {
+        unsafe { refcount::release_raw(application) };
+        return 0;
+    };
+    if settings.multi_threaded_message_loop != 0 {
+        eprintln!("firefox-cef: Gecko requires the CEF loop on the process main thread");
+        unsafe { refcount::release_raw(application) };
+        return 0;
+    }
+    let root_cache_path = unsafe { cef_string_to_string(&settings.root_cache_path) }
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join(format!("firefox-cef-{}", std::process::id()))
+                .to_string_lossy()
+                .into_owned()
+        });
+    if let Err(error) = runtime::initialize(&root_cache_path) {
+        eprintln!("firefox-cef: Gecko initialization failed: {error}");
+        unsafe { refcount::release_raw(application) };
+        return 0;
     }
     if let Some(application) = unsafe { application.as_mut() }
         && let Some(get_handler) = application.get_browser_process_handler
@@ -276,7 +263,8 @@ pub unsafe extern "C" fn cef_initialize(
             unsafe { refcount::release_raw(handler) };
         }
     }
-    eprintln!("firefox-cef: initialized Gecko-backed CEF subset");
+    unsafe { refcount::release_raw(application) };
+    eprintln!("firefox-cef: initialized the in-process Gecko runtime");
     1
 }
 
@@ -290,30 +278,35 @@ pub unsafe extern "C" fn cef_browser_host_create_browser_sync(
     client: *mut _cef_client_t,
     url: *const cef_string_t,
     _settings: *const _cef_browser_settings_t,
-    _extra_info: *mut _cef_dictionary_value_t,
-    _request_context: *mut _cef_request_context_t,
+    extra_info: *mut _cef_dictionary_value_t,
+    request_context: *mut _cef_request_context_t,
 ) -> *mut _cef_browser_t {
+    unsafe {
+        refcount::release_raw(extra_info);
+        refcount::release_raw(request_context);
+    }
     let Some(window_info) = (unsafe { window_info.as_ref() }) else {
+        unsafe { refcount::release_raw(client) };
         return ptr::null_mut();
     };
     let Some(url) = (unsafe { cef_string_to_string(url) }) else {
+        unsafe { refcount::release_raw(client) };
         return ptr::null_mut();
     };
     let parent = window_info.parent_window as u32;
     let width = window_info.bounds.width.max(2) as u32;
     let height = window_info.bounds.height.max(2) as u32;
-    let state = match BrowserState::launch(parent, width, height, &url) {
+    let state = match BrowserState::create(parent, width, height, &url) {
         Ok(state) => state,
         Err(error) => {
             eprintln!("firefox-cef: browser creation failed: {error}");
+            unsafe { refcount::release_raw(client) };
             return ptr::null_mut();
         }
     };
-    state.set_client(client);
+    state.take_client(client);
     let browser = make_browser_objects(state.clone());
-    state.notify_after_created();
-    state.notify_loading(false);
-    eprintln!("firefox-cef: created browser {} for {url}", state.id);
+    eprintln!("firefox-cef: queued Gecko browser {} for {url}", state.id);
     browser
 }
 
@@ -349,68 +342,39 @@ pub unsafe extern "C" fn cef_browser_host_create_browser(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cef_do_message_loop_work() {
-    let task = task_queue()
-        .0
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .pop_front();
-    if let Some(task) = task {
-        unsafe { execute_task(task as *mut _cef_task_t) };
-    }
-}
+pub extern "C" fn cef_do_message_loop_work() {}
 
 #[unsafe(no_mangle)]
 unsafe extern "C" fn cef_post_task(_thread: cef_thread_id_t, task: *mut _cef_task_t) -> c_int {
     if task.is_null() {
         return 0;
     }
-    let (queue, wakeup) = task_queue();
-    queue
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .push_back(task as usize);
-    wakeup.notify_one();
-    1
+    match runtime::post_task(Some(runtime::execute_cef_task), task.cast()) {
+        Ok(()) => 1,
+        Err(error) => {
+            unsafe { refcount::release_raw(task) };
+            eprintln!("firefox-cef: UI task dispatch failed: {error}");
+            0
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn cef_run_message_loop() {
-    let (queue, wakeup) = task_queue();
-    loop {
-        let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
-        while queue.is_empty() && !QUIT_MESSAGE_LOOP.load(Ordering::Acquire) {
-            queue = wakeup
-                .wait(queue)
-                .unwrap_or_else(|error| error.into_inner());
-        }
-        if QUIT_MESSAGE_LOOP.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(task) = queue.pop_front() {
-            drop(queue);
-            unsafe { execute_task(task as *mut _cef_task_t) };
-        }
+    match runtime::run_message_loop() {
+        Ok(0) => {}
+        Ok(code) => eprintln!("firefox-cef: Gecko message loop exited with {code}"),
+        Err(error) => eprintln!("firefox-cef: Gecko message loop failed: {error}"),
     }
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn cef_quit_message_loop() {
-    QUIT_MESSAGE_LOOP.store(true, Ordering::Release);
-    task_queue().1.notify_all();
+    runtime::quit_message_loop();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_shutdown() {
-    cef_quit_message_loop();
-    if let Some(thread) = message_loop_thread()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take()
-    {
-        let _ = thread.join();
-    }
-    release_queued_tasks();
     shutdown_all();
     eprintln!("firefox-cef: shutdown complete");
 }
