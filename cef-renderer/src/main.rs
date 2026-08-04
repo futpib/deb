@@ -1,6 +1,6 @@
 use cef::{args::Args, *};
 use shell_protocol::{
-    MAX_PACKET_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, Transport,
+    MAX_PACKET_BYTES, Transport,
     wire::{self, Capability, Engine},
 };
 use std::{
@@ -142,7 +142,6 @@ impl ProtocolEmitter {
     fn event(&self, value: wire::event::Value) {
         let packet = wire::Packet {
             request_id: 0,
-            attached_files: Vec::new(),
             body: Some(wire::packet::Body::Event(wire::Event {
                 sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed),
                 browser_id: self.browser_id,
@@ -158,7 +157,6 @@ impl ProtocolEmitter {
 fn response_packet(request_id: u64, result: wire::response::Result) -> wire::Packet {
     wire::Packet {
         request_id,
-        attached_files: Vec::new(),
         body: Some(wire::packet::Body::Response(wire::Response {
             result: Some(result),
         })),
@@ -205,11 +203,9 @@ wrap_life_span_handler! {
             self.browser.1.notify_all();
             self.emitter.event(wire::event::Value::SurfaceReady(
                 wire::SurfaceReady {
-                    presentation: Some(wire::surface_ready::Presentation::X11(
-                        wire::X11Surface {
-                            window: native_window,
-                        },
-                    )),
+                    x11: Some(wire::X11Surface {
+                        window: native_window,
+                    }),
                 },
             ));
             eprintln!("cef-renderer: native browser ready");
@@ -426,7 +422,6 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::Focus,
         Capability::LoadingEvents,
         Capability::NativeX11Surface,
-        Capability::FileDescriptorPassing,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -435,34 +430,20 @@ fn advertised_capabilities() -> Vec<i32> {
 
 fn negotiate_protocol(transport: &Transport, engine: Engine) -> Result<(), Box<dyn Error>> {
     let received = transport.receive()?;
-    if !received.files.is_empty() {
-        return Err("hello packet must not carry files".into());
-    }
-    let request_id = received.packet.request_id;
-    let hello = match received.packet.body {
+    let request_id = received.request_id;
+    let hello = match received.body {
         Some(wire::packet::Body::Hello(hello)) => hello,
         _ => return Err("first shell protocol packet must be Hello".into()),
     };
     if request_id == 0 {
         return Err("hello request ID must be nonzero".into());
     }
-    if hello.minimum_major > PROTOCOL_MAJOR || hello.maximum_major < PROTOCOL_MAJOR {
-        transport.send(&error_packet(
-            request_id,
-            "UNSUPPORTED_PROTOCOL",
-            format!(
-                "helper supports protocol {PROTOCOL_MAJOR}; shell offered {} through {}",
-                hello.minimum_major, hello.maximum_major
-            ),
-        ))?;
-        return Err("shell and helper have no compatible protocol version".into());
+    if hello.maximum_packet_bytes == 0 {
+        return Err("shell packet limit must be nonzero".into());
     }
     transport.send(&wire::Packet {
         request_id,
-        attached_files: Vec::new(),
         body: Some(wire::packet::Body::HelloReply(wire::HelloReply {
-            major: PROTOCOL_MAJOR,
-            minor: PROTOCOL_MINOR,
             engine: engine as i32,
             engine_version: match engine {
                 Engine::Chromium => "Chromium through CEF".to_owned(),
@@ -479,15 +460,12 @@ fn negotiate_protocol(transport: &Transport, engine: Engine) -> Result<(), Box<d
 
 fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dyn Error>> {
     let received = transport.receive()?;
-    if !received.files.is_empty() {
-        return Err("CreateBrowser packet must not carry files".into());
-    }
-    let request_id = received.packet.request_id;
+    let request_id = received.request_id;
     let parsed = (|| -> Result<BrowserConfig, Box<dyn Error>> {
         if request_id == 0 {
             return Err("CreateBrowser request ID must be nonzero".into());
         }
-        let request = match received.packet.body {
+        let request = match received.body {
             Some(wire::packet::Body::Request(request)) => request,
             _ => return Err("second shell protocol packet must be a request".into()),
         };
@@ -498,11 +476,7 @@ fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dy
             Some(wire::request::Operation::CreateBrowser(create)) => create,
             _ => return Err("first shell request must be CreateBrowser".into()),
         };
-        let surface = create.surface.ok_or("CreateBrowser surface is required")?;
-        let x11 = match surface.target {
-            Some(wire::surface_target::Target::X11(x11)) => x11,
-            _ => return Err("helper currently requires an X11 surface target".into()),
-        };
+        let x11 = create.x11.ok_or("CreateBrowser X11 target is required")?;
         if x11.parent_window == 0 {
             return Err("X11 parent window must be nonzero".into());
         }
@@ -673,8 +647,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     break;
                 }
             };
-            let request_id = received.packet.request_id;
-            let request = match received.packet.body {
+            let request_id = received.request_id;
+            let request = match received.body {
                 Some(wire::packet::Body::Request(request)) => request,
                 _ => {
                     command_emitter.error(
@@ -767,8 +741,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ControlCommand, bounds_from_viewport, control_command, negotiate_protocol};
-    use shell_protocol::{MAX_PACKET_BYTES, PROTOCOL_MAJOR, Transport, wire};
+    use super::{ControlCommand, bounds_from_viewport, control_command};
+    use shell_protocol::wire;
 
     #[test]
     fn parses_native_viewport() {
@@ -843,34 +817,5 @@ mod tests {
             }),
             Ok(ControlCommand::Focus(true))
         ));
-    }
-
-    #[test]
-    fn rejects_an_incompatible_protocol_major() {
-        let (shell, helper) = Transport::pair().unwrap();
-        let helper_thread = std::thread::spawn(move || {
-            assert!(negotiate_protocol(&helper, wire::Engine::Chromium).is_err());
-        });
-        shell
-            .send(&wire::Packet {
-                request_id: 41,
-                attached_files: Vec::new(),
-                body: Some(wire::packet::Body::Hello(wire::Hello {
-                    minimum_major: PROTOCOL_MAJOR + 1,
-                    maximum_major: PROTOCOL_MAJOR + 1,
-                    maximum_packet_bytes: MAX_PACKET_BYTES as u32,
-                    requested_capabilities: Vec::new(),
-                })),
-            })
-            .unwrap();
-        let response = shell.receive().unwrap().packet;
-        assert_eq!(response.request_id, 41);
-        assert!(matches!(
-            response.body,
-            Some(wire::packet::Body::Response(wire::Response {
-                result: Some(wire::response::Result::Error(wire::Error { code, .. }))
-            })) if code == "UNSUPPORTED_PROTOCOL"
-        ));
-        helper_thread.join().unwrap();
     }
 }

@@ -1,29 +1,21 @@
 use std::{
-    io::{IoSlice, IoSliceMut},
-    os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     os::unix::process::CommandExt,
     process::Command,
 };
 
 use nix::{
-    cmsg_space,
     fcntl::{FcntlArg, FdFlag, fcntl},
-    sys::socket::{
-        AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
-        sendmsg, socketpair,
-    },
+    sys::socket::{AddressFamily, MsgFlags, SockFlag, SockType, recv, send, socketpair},
 };
 use prost::Message;
 use thiserror::Error;
 
 pub mod wire {
-    include!(concat!(env!("OUT_DIR"), "/dual_engine.shell.v1.rs"));
+    include!(concat!(env!("OUT_DIR"), "/dual_engine.shell.rs"));
 }
 
-pub const PROTOCOL_MAJOR: u32 = 1;
-pub const PROTOCOL_MINOR: u32 = 0;
 pub const MAX_PACKET_BYTES: usize = 256 * 1024;
-pub const MAX_ATTACHED_FILES: usize = 8;
 pub const CHILD_CONTROL_FD: RawFd = 3;
 
 #[derive(Debug, Error)]
@@ -40,19 +32,8 @@ pub enum ProtocolError {
     PacketTooLarge { actual: usize, maximum: usize },
     #[error("shell protocol packet was truncated")]
     Truncated,
-    #[error("shell protocol packet declared {declared} files but carried {received}")]
-    AttachedFileCount { declared: usize, received: usize },
-    #[error("shell protocol packet carried too many file descriptors")]
-    TooManyAttachedFiles,
-    #[error("shell protocol attached-file index {actual} is invalid; expected {expected}")]
-    InvalidAttachedFileIndex { actual: u32, expected: usize },
     #[error("shell protocol socket closed")]
     Closed,
-}
-
-pub struct ReceivedPacket {
-    pub packet: wire::Packet,
-    pub files: Vec<OwnedFd>,
 }
 
 pub struct Transport {
@@ -86,23 +67,6 @@ impl Transport {
     }
 
     pub fn send(&self, packet: &wire::Packet) -> Result<(), ProtocolError> {
-        self.send_with_files(packet, &[])
-    }
-
-    pub fn send_with_files(
-        &self,
-        packet: &wire::Packet,
-        files: &[BorrowedFd<'_>],
-    ) -> Result<(), ProtocolError> {
-        if files.len() > MAX_ATTACHED_FILES {
-            return Err(ProtocolError::TooManyAttachedFiles);
-        }
-        if packet.attached_files.len() != files.len() {
-            return Err(ProtocolError::AttachedFileCount {
-                declared: packet.attached_files.len(),
-                received: files.len(),
-            });
-        }
         let mut payload = Vec::with_capacity(packet.encoded_len());
         packet.encode(&mut payload)?;
         if payload.len() > MAX_PACKET_BYTES {
@@ -111,20 +75,7 @@ impl Transport {
                 maximum: MAX_PACKET_BYTES,
             });
         }
-        let vectors = [IoSlice::new(&payload)];
-        let raw_files = files.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>();
-        let control = if raw_files.is_empty() {
-            Vec::new()
-        } else {
-            vec![ControlMessage::ScmRights(&raw_files)]
-        };
-        let written = sendmsg::<()>(
-            self.socket.as_raw_fd(),
-            &vectors,
-            &control,
-            MsgFlags::MSG_NOSIGNAL,
-            None,
-        )?;
+        let written = send(self.socket.as_raw_fd(), &payload, MsgFlags::MSG_NOSIGNAL)?;
         if written != payload.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
@@ -135,53 +86,16 @@ impl Transport {
         Ok(())
     }
 
-    pub fn receive(&self) -> Result<ReceivedPacket, ProtocolError> {
+    pub fn receive(&self) -> Result<wire::Packet, ProtocolError> {
         let mut payload = vec![0; MAX_PACKET_BYTES];
-        let mut vectors = [IoSliceMut::new(&mut payload)];
-        let mut control = cmsg_space!([RawFd; MAX_ATTACHED_FILES]);
-        let message = recvmsg::<()>(
-            self.socket.as_raw_fd(),
-            &mut vectors,
-            Some(&mut control),
-            MsgFlags::MSG_CMSG_CLOEXEC,
-        )?;
-        if message.bytes == 0 {
+        let bytes = recv(self.socket.as_raw_fd(), &mut payload, MsgFlags::MSG_TRUNC)?;
+        if bytes == 0 {
             return Err(ProtocolError::Closed);
         }
-        if message
-            .flags
-            .intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC)
-        {
+        if bytes > payload.len() {
             return Err(ProtocolError::Truncated);
         }
-        let bytes = message.bytes;
-        let mut files = Vec::new();
-        for control in message.cmsgs()? {
-            if let ControlMessageOwned::ScmRights(received) = control {
-                for fd in received {
-                    if files.len() == MAX_ATTACHED_FILES {
-                        return Err(ProtocolError::TooManyAttachedFiles);
-                    }
-                    files.push(unsafe { OwnedFd::from_raw_fd(fd) });
-                }
-            }
-        }
-        let packet = wire::Packet::decode(&payload[..bytes])?;
-        if packet.attached_files.len() != files.len() {
-            return Err(ProtocolError::AttachedFileCount {
-                declared: packet.attached_files.len(),
-                received: files.len(),
-            });
-        }
-        for (index, descriptor) in packet.attached_files.iter().enumerate() {
-            if descriptor.index as usize != index {
-                return Err(ProtocolError::InvalidAttachedFileIndex {
-                    actual: descriptor.index,
-                    expected: index,
-                });
-            }
-        }
-        Ok(ReceivedPacket { packet, files })
+        Ok(wire::Packet::decode(&payload[..bytes])?)
     }
 }
 
@@ -210,18 +124,15 @@ pub fn configure_child_command(command: &mut Command, transport: &Transport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PACKET_BYTES, PROTOCOL_MAJOR, ProtocolError, Transport, wire};
+    use super::{MAX_PACKET_BYTES, ProtocolError, Transport, wire};
     use nix::sys::socket::{MsgFlags, send};
     use prost::Message;
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsRawFd;
 
     fn hello_packet() -> wire::Packet {
         wire::Packet {
             request_id: 1,
-            attached_files: Vec::new(),
             body: Some(wire::packet::Body::Hello(wire::Hello {
-                minimum_major: PROTOCOL_MAJOR,
-                maximum_major: PROTOCOL_MAJOR,
                 maximum_packet_bytes: MAX_PACKET_BYTES as u32,
                 requested_capabilities: Vec::new(),
             })),
@@ -229,52 +140,12 @@ mod tests {
     }
 
     #[test]
-    fn transports_a_versioned_packet() {
+    fn transports_a_packet() {
         let (sender, receiver) = Transport::pair().unwrap();
         sender.send(&hello_packet()).unwrap();
         let received = receiver.receive().unwrap();
-        assert_eq!(received.packet.request_id, 1);
-        assert!(matches!(
-            received.packet.body,
-            Some(wire::packet::Body::Hello(wire::Hello {
-                minimum_major: PROTOCOL_MAJOR,
-                maximum_major: PROTOCOL_MAJOR,
-                ..
-            }))
-        ));
-    }
-
-    #[test]
-    fn transports_an_attached_file() {
-        let (sender, receiver) = Transport::pair().unwrap();
-        let file = std::fs::File::open("/dev/null").unwrap();
-        let mut packet = hello_packet();
-        packet.attached_files.push(wire::AttachedFile {
-            index: 0,
-            size: 0,
-            purpose: "test".to_owned(),
-        });
-        sender.send_with_files(&packet, &[file.as_fd()]).unwrap();
-        let received = receiver.receive().unwrap();
-        assert_eq!(received.files.len(), 1);
-    }
-
-    #[test]
-    fn rejects_mismatched_file_metadata() {
-        let (sender, _) = Transport::pair().unwrap();
-        let mut packet = hello_packet();
-        packet.attached_files.push(wire::AttachedFile {
-            index: 0,
-            size: 0,
-            purpose: "missing".to_owned(),
-        });
-        assert!(matches!(
-            sender.send(&packet),
-            Err(ProtocolError::AttachedFileCount {
-                declared: 1,
-                received: 0
-            })
-        ));
+        assert_eq!(received.request_id, 1);
+        assert!(matches!(received.body, Some(wire::packet::Body::Hello(_))));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package dual_engine.shell.v1;
+package dual_engine.shell;
 
 enum Engine {
   ENGINE_UNSPECIFIED = 0;
@@ -16,12 +16,10 @@ enum Capability {
   CAPABILITY_FOCUS = 4;
   CAPABILITY_LOADING_EVENTS = 5;
   CAPABILITY_NATIVE_X11_SURFACE = 6;
-  CAPABILITY_FILE_DESCRIPTOR_PASSING = 7;
 }
 
 message Packet {
   uint64 request_id = 1;
-  repeated AttachedFile attached_files = 2;
 
   oneof body {
     Hello hello = 10;
@@ -32,27 +30,17 @@ message Packet {
   }
 }
 
-message AttachedFile {
-  uint32 index = 1;
-  uint64 size = 2;
-  string purpose = 3;
-}
-
 message Hello {
-  uint32 minimum_major = 1;
-  uint32 maximum_major = 2;
-  uint32 maximum_packet_bytes = 3;
-  repeated Capability requested_capabilities = 4;
+  uint32 maximum_packet_bytes = 1;
+  repeated Capability requested_capabilities = 2;
 }
 
 message HelloReply {
-  uint32 major = 1;
-  uint32 minor = 2;
-  Engine engine = 3;
-  string engine_version = 4;
-  uint32 cef_api_version = 5;
-  uint32 maximum_packet_bytes = 6;
-  repeated Capability capabilities = 7;
+  Engine engine = 1;
+  string engine_version = 2;
+  uint32 cef_api_version = 3;
+  uint32 maximum_packet_bytes = 4;
+  repeated Capability capabilities = 5;
 }
 
 message Request {
@@ -70,15 +58,7 @@ message Request {
 
 message CreateBrowser {
   string initial_url = 1;
-  SurfaceTarget surface = 2;
-}
-
-message SurfaceTarget {
-  oneof target {
-    X11Target x11 = 1;
-    WaylandTarget wayland = 2;
-    OffscreenTarget offscreen = 3;
-  }
+  X11Target x11 = 2;
 }
 
 message Viewport {
@@ -92,15 +72,6 @@ message Viewport {
 message X11Target {
   uint64 parent_window = 1;
   Viewport viewport = 2;
-}
-
-message WaylandTarget {
-  string presentation_token = 1;
-  Viewport viewport = 2;
-}
-
-message OffscreenTarget {
-  Viewport viewport = 1;
 }
 
 message Navigate {
@@ -153,29 +124,11 @@ message Event {
 }
 
 message SurfaceReady {
-  oneof presentation {
-    X11Surface x11 = 1;
-    WaylandSurface wayland = 2;
-    DmabufStream dmabuf = 3;
-    OffscreenSurface offscreen = 4;
-  }
+  X11Surface x11 = 1;
 }
 
 message X11Surface {
   uint64 window = 1;
-}
-
-message WaylandSurface {
-  string presentation_token = 1;
-}
-
-message DmabufStream {
-  uint32 format = 1;
-  repeated uint64 modifiers = 2;
-}
-
-message OffscreenSurface {
-  uint32 format = 1;
 }
 
 message LoadingChanged {

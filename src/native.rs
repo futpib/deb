@@ -1,7 +1,6 @@
 use qtbridge::{QmlMethodInvoker, invoke_method};
 use shell_protocol::{
-    MAX_PACKET_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, ProtocolError, ReceivedPacket, Transport,
-    configure_child_command,
+    MAX_PACKET_BYTES, ProtocolError, Transport, configure_child_command,
     wire::{self, Capability, Engine},
 };
 use std::{
@@ -132,7 +131,7 @@ impl CefBackend {
 struct CefInstance {
     child: Child,
     transport: Transport,
-    incoming: mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
+    incoming: mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
     window: Window,
     native_child: bool,
     browser_id: u64,
@@ -238,19 +237,13 @@ impl CefInstance {
         notices
     }
 
-    fn handle_packet(&mut self, received: ReceivedPacket) -> Option<ProtocolNotice> {
-        if !received.files.is_empty() {
-            return Some(ProtocolNotice::ProtocolFailed(
-                "unexpected attached files".to_owned(),
-            ));
-        }
-        match received.packet.body {
+    fn handle_packet(&mut self, received: wire::Packet) -> Option<ProtocolNotice> {
+        let request_id = received.request_id;
+        match received.body {
             Some(wire::packet::Body::Response(response)) => {
-                let Some(description) = self.pending_requests.remove(&received.packet.request_id)
-                else {
+                let Some(description) = self.pending_requests.remove(&request_id) else {
                     return Some(ProtocolNotice::ProtocolFailed(format!(
-                        "unsolicited response for request {}",
-                        received.packet.request_id
+                        "unsolicited response for request {request_id}"
                     )));
                 };
                 match response.result {
@@ -599,7 +592,7 @@ fn spawn_cef(
 fn spawn_protocol_reader(
     transport: Transport,
 ) -> (
-    mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
+    mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
     JoinHandle<()>,
 ) {
     let (sender, receiver) = mpsc::channel();
@@ -618,7 +611,7 @@ fn spawn_protocol_reader(
 #[allow(clippy::too_many_arguments)]
 fn initialize_helper(
     transport: &Transport,
-    incoming: &mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
+    incoming: &mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
     child: &mut Child,
     timeout: Duration,
     backend: CefBackend,
@@ -628,27 +621,21 @@ fn initialize_helper(
 ) -> NativeResult<(Window, u64)> {
     transport.send(&wire::Packet {
         request_id: 1,
-        attached_files: Vec::new(),
         body: Some(wire::packet::Body::Hello(wire::Hello {
-            minimum_major: PROTOCOL_MAJOR,
-            maximum_major: PROTOCOL_MAJOR,
             maximum_packet_bytes: MAX_PACKET_BYTES as u32,
             requested_capabilities: required_capabilities(),
         })),
     })?;
     let deadline = Instant::now() + timeout;
     let hello = receive_startup_packet(incoming, child, deadline)?;
-    if !hello.files.is_empty() {
-        return Err("HelloReply unexpectedly carried files".into());
-    }
-    if hello.packet.request_id != 1 {
+    if hello.request_id != 1 {
         return Err(format!(
             "HelloReply used request ID {}, expected 1",
-            hello.packet.request_id
+            hello.request_id
         )
         .into());
     }
-    let reply = match hello.packet.body {
+    let reply = match hello.body {
         Some(wire::packet::Body::HelloReply(reply)) => reply,
         Some(wire::packet::Body::Response(response)) => {
             return Err(format_response_error("protocol negotiation", response).into());
@@ -662,11 +649,9 @@ fn initialize_helper(
         1,
         wire::request::Operation::CreateBrowser(wire::CreateBrowser {
             initial_url: url.to_owned(),
-            surface: Some(wire::SurfaceTarget {
-                target: Some(wire::surface_target::Target::X11(wire::X11Target {
-                    parent_window: u64::from(parent),
-                    viewport: Some(bounds.viewport()),
-                })),
+            x11: Some(wire::X11Target {
+                parent_window: u64::from(parent),
+                viewport: Some(bounds.viewport()),
             }),
         }),
     ))?;
@@ -676,15 +661,13 @@ fn initialize_helper(
     let mut last_event_sequence = 0;
     while !create_succeeded || window.is_none() {
         let received = receive_startup_packet(incoming, child, deadline)?;
-        if !received.files.is_empty() {
-            return Err("browser startup packet unexpectedly carried files".into());
-        }
-        match received.packet.body {
+        let request_id = received.request_id;
+        match received.body {
             Some(wire::packet::Body::Response(response)) => {
-                if received.packet.request_id != 2 {
+                if request_id != 2 {
                     return Err(format!(
                         "startup response used request ID {}, expected 2",
-                        received.packet.request_id
+                        request_id
                     )
                     .into());
                 }
@@ -711,10 +694,10 @@ fn initialize_helper(
                 last_event_sequence = event.sequence;
                 match event.value {
                     Some(wire::event::Value::SurfaceReady(ready)) => {
-                        let raw_window = match ready.presentation {
-                            Some(wire::surface_ready::Presentation::X11(surface)) => surface.window,
-                            _ => return Err("helper did not return an X11 surface".into()),
-                        };
+                        let raw_window = ready
+                            .x11
+                            .ok_or("helper did not return an X11 surface")?
+                            .window;
                         window = Some(u32::try_from(raw_window)?);
                     }
                     Some(wire::event::Value::BrowserCrashed(crash)) => {
@@ -739,10 +722,10 @@ fn initialize_helper(
 }
 
 fn receive_startup_packet(
-    incoming: &mpsc::Receiver<Result<ReceivedPacket, ProtocolError>>,
+    incoming: &mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
     child: &mut Child,
     deadline: Instant,
-) -> NativeResult<ReceivedPacket> {
+) -> NativeResult<wire::Packet> {
     while Instant::now() < deadline {
         match incoming.recv_timeout(Duration::from_millis(50)) {
             Ok(Ok(received)) => return Ok(received),
@@ -760,13 +743,6 @@ fn receive_startup_packet(
 }
 
 fn validate_hello_reply(reply: &wire::HelloReply, backend: CefBackend) -> NativeResult<()> {
-    if reply.major != PROTOCOL_MAJOR {
-        return Err(format!(
-            "helper selected protocol {}.{}, shell requires {PROTOCOL_MAJOR}.{PROTOCOL_MINOR}",
-            reply.major, reply.minor
-        )
-        .into());
-    }
     let engine = Engine::try_from(reply.engine).unwrap_or(Engine::Unspecified);
     if engine != backend.engine() {
         return Err(format!("{} identified itself as {engine:?}", backend.name()).into());
@@ -794,7 +770,6 @@ fn required_capabilities() -> Vec<i32> {
         Capability::Focus,
         Capability::LoadingEvents,
         Capability::NativeX11Surface,
-        Capability::FileDescriptorPassing,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -808,7 +783,6 @@ fn request_packet(
 ) -> wire::Packet {
     wire::Packet {
         request_id,
-        attached_files: Vec::new(),
         body: Some(wire::packet::Body::Request(wire::Request {
             browser_id,
             operation: Some(operation),
@@ -880,7 +854,7 @@ fn stop_child(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::{CefBackend, NativeRect, validate_hello_reply};
-    use shell_protocol::{MAX_PACKET_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR, wire};
+    use shell_protocol::{MAX_PACKET_BYTES, wire};
 
     #[test]
     fn rejects_zero_sized_surfaces() {
@@ -906,8 +880,6 @@ mod tests {
     #[test]
     fn rejects_a_helper_with_the_wrong_engine() {
         let reply = wire::HelloReply {
-            major: PROTOCOL_MAJOR,
-            minor: PROTOCOL_MINOR,
             engine: wire::Engine::Gecko as i32,
             engine_version: "test".to_owned(),
             cef_api_version: 1,
@@ -923,11 +895,8 @@ mod tests {
     #[test]
     fn rejects_a_helper_missing_a_required_capability() {
         let mut capabilities = super::required_capabilities();
-        capabilities
-            .retain(|capability| *capability != wire::Capability::FileDescriptorPassing as i32);
+        capabilities.retain(|capability| *capability != wire::Capability::NativeX11Surface as i32);
         let reply = wire::HelloReply {
-            major: PROTOCOL_MAJOR,
-            minor: PROTOCOL_MINOR,
             engine: wire::Engine::Chromium as i32,
             engine_version: "test".to_owned(),
             cef_api_version: 1,
@@ -937,6 +906,6 @@ mod tests {
         let error = validate_hello_reply(&reply, CefBackend::Chromium)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("FileDescriptorPassing"));
+        assert!(error.contains("NativeX11Surface"));
     }
 }
