@@ -230,6 +230,7 @@ wrap_app! {
 
             command_line.append_switch(Some(&"disable-session-crashed-bubble".into()));
             command_line.append_switch(Some(&"disable-gpu".into()));
+            command_line.append_switch(Some(&"disable-gpu-compositing".into()));
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             command_line.append_switch(Some(&"noerrdialogs".into()));
             command_line.append_switch_with_value(
