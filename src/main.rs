@@ -22,7 +22,7 @@ impl Default for Backend {
         Self {
             url: std::env::var("DUAL_ENGINE_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned()),
             chromium_status: "Waiting for Qt native host…".to_owned(),
-            firefox_status: "Waiting for on-screen surface…".to_owned(),
+            firefox_status: "Waiting for Qt native host…".to_owned(),
             controller: None,
             last_layout: None,
         }
@@ -65,7 +65,7 @@ impl Backend {
             return;
         }
         self.chromium_status = "Navigating CEF / Chromium…".to_owned();
-        self.firefox_status = "Restarting Firefox / Gecko…".to_owned();
+        self.firefox_status = "Navigating Firefox / Gecko through CEF…".to_owned();
         self.chromium_status_changed();
         self.firefox_status_changed();
         let send_failed = self
@@ -81,14 +81,12 @@ impl Backend {
     }
 
     #[qslot]
-    #[allow(clippy::too_many_arguments)]
     fn sync_geometry(
         &mut self,
         chromium_host_id: String,
         chromium_width: i32,
         chromium_height: i32,
-        firefox_x: i32,
-        firefox_y: i32,
+        firefox_host_id: String,
         firefox_width: i32,
         firefox_height: i32,
     ) {
@@ -98,11 +96,16 @@ impl Backend {
         if chromium_host_id == 0 {
             return;
         }
+        let Ok(firefox_host_id) = firefox_host_id.parse::<u32>() else {
+            return;
+        };
+        if firefox_host_id == 0 {
+            return;
+        }
         let Some(chromium) = NativeRect::new(0, 0, chromium_width, chromium_height) else {
             return;
         };
-        let Some(firefox) = NativeRect::new(firefox_x, firefox_y, firefox_width, firefox_height)
-        else {
+        let Some(firefox) = NativeRect::new(0, 0, firefox_width, firefox_height) else {
             return;
         };
         let layout = Layout { chromium, firefox };
@@ -117,12 +120,13 @@ impl Backend {
         }
 
         self.chromium_status = "Starting CEF inside its Qt host…".to_owned();
-        self.firefox_status = "Starting Firefox on-screen window…".to_owned();
+        self.firefox_status = "Starting Firefox through the CEF ABI…".to_owned();
         self.chromium_status_changed();
         self.firefox_status_changed();
         self.controller = Some(native::spawn_controller(
             self.url.clone(),
             chromium_host_id,
+            firefox_host_id,
             layout,
             self.get_qml_method_invoker(),
         ));

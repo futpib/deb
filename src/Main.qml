@@ -22,15 +22,14 @@ ApplicationWindow {
     }
 
     property var chromiumHost: nativeWindows.createHost()
+    property var firefoxHost: nativeWindows.createHost()
 
     function syncNativeGeometry() {
-        const firefoxPosition = firefoxPane.surface.mapToGlobal(Qt.point(0, 0))
         backend.sync_geometry(
             nativeWindows.windowId(chromiumHost),
             Math.round(chromiumPane.surface.width),
             Math.round(chromiumPane.surface.height),
-            Math.round(firefoxPosition.x),
-            Math.round(firefoxPosition.y),
+            nativeWindows.windowId(firefoxHost),
             Math.round(firefoxPane.surface.width),
             Math.round(firefoxPane.surface.height)
         )
@@ -79,9 +78,9 @@ ApplicationWindow {
         EnginePane {
             id: firefoxPane
             SplitView.fillWidth: true
-            title: "Firefox / Gecko · managed stock process"
+            title: "Firefox / Gecko · CEF ABI adapter"
             status: backend.firefoxStatus
-            hostedWindow: null
+            hostedWindow: firefoxHost
         }
     }
 

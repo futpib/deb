@@ -96,6 +96,7 @@ impl BrowserState {
             .arg(&profile)
             .arg("--new-window")
             .arg(url)
+            .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_PRELOAD")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -158,6 +159,7 @@ impl BrowserState {
             .arg(&self.profile)
             .arg("--new-tab")
             .arg(url)
+            .env_remove("LD_LIBRARY_PATH")
             .env_remove("LD_PRELOAD")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -238,6 +240,7 @@ impl BrowserState {
                 return;
             }
             if let Some(callback) = (*handler).on_after_created {
+                add_ref_raw(browser);
                 callback(handler, browser);
             }
             release_raw(handler);
@@ -259,6 +262,7 @@ impl BrowserState {
                 return;
             }
             if let Some(callback) = (*handler).on_loading_state_change {
+                add_ref_raw(browser);
                 callback(handler, browser, i32::from(loading), 0, 0);
             }
             release_raw(handler);
@@ -279,6 +283,7 @@ impl BrowserState {
                 return;
             }
             if let Some(callback) = (*handler).on_before_close {
+                add_ref_raw(browser);
                 callback(handler, browser);
             }
             release_raw(handler);
@@ -293,19 +298,39 @@ impl BrowserState {
         let (connection, screen_number) = x11rb::connect(None)?;
         let root = connection.setup().roots[screen_number].root;
         let atoms = Atoms::new(&connection)?;
+        let shell = connection.query_tree(self.parent)?.reply()?.parent;
+        if shell != root {
+            connection.change_property32(
+                PropMode::REPLACE,
+                window,
+                AtomEnum::WM_TRANSIENT_FOR,
+                AtomEnum::WINDOW,
+                &[shell],
+            )?;
+        }
         let translated = connection
             .translate_coordinates(self.parent, root, 0, 0)?
             .reply()?;
         let extents = frame_extents(&connection, &atoms, window);
-        let x = i32::from(translated.dst_x) - extents.0;
-        let y = i32::from(translated.dst_y) - extents.2;
+        let x = i32::from(translated.dst_x);
+        let y = i32::from(translated.dst_y);
+        let width = self
+            .width
+            .load(Ordering::Acquire)
+            .saturating_sub((extents.0 + extents.1).max(0) as u32)
+            .max(2);
+        let height = self
+            .height
+            .load(Ordering::Acquire)
+            .saturating_sub((extents.2 + extents.3).max(0) as u32)
+            .max(2);
         connection.configure_window(
             window,
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(y)
-                .width(self.width.load(Ordering::Acquire))
-                .height(self.height.load(Ordering::Acquire))
+                .width(width)
+                .height(height)
                 .stack_mode(StackMode::ABOVE),
         )?;
         request_above(&connection, &atoms, root, window)?;
@@ -344,7 +369,7 @@ fn candidate_windows(
     atoms: &Atoms,
     root: Window,
 ) -> RuntimeResult<BTreeSet<Window>> {
-    let windows = connection
+    let listed = connection
         .get_property(
             false,
             root,
@@ -355,15 +380,11 @@ fn candidate_windows(
         )?
         .reply()?
         .value32()
-        .map(|values| values.collect::<Vec<_>>())
-        .unwrap_or_else(|| {
-            connection
-                .query_tree(root)
-                .unwrap()
-                .reply()
-                .unwrap()
-                .children
-        });
+        .map(|values| values.collect::<Vec<_>>());
+    let windows = match listed {
+        Some(windows) => windows,
+        None => connection.query_tree(root)?.reply()?.children,
+    };
     Ok(windows
         .into_iter()
         .filter(|window| is_firefox_window(connection, atoms, *window))

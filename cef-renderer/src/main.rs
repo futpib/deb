@@ -1,11 +1,10 @@
 use cef::{args::Args, *};
 use std::{
     error::Error,
-    io::{self, BufRead},
+    io::{self, BufRead, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc,
     },
     thread::sleep,
     time::{Duration, Instant},
@@ -81,6 +80,7 @@ fn parse_bounds(value: &str) -> Result<Bounds, Box<dyn Error>> {
     })
 }
 
+#[derive(Clone)]
 enum ControlCommand {
     Navigate(String),
     Resize(Bounds),
@@ -103,32 +103,32 @@ fn parse_control_command(line: &str) -> Option<ControlCommand> {
 }
 
 wrap_life_span_handler! {
-    struct BrowserLifeSpanHandler {
-        closed: Arc<AtomicBool>,
-    }
+    struct BrowserLifeSpanHandler;
 
     impl LifeSpanHandler {
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            self.closed.store(true, Ordering::Release);
+            quit_message_loop();
         }
     }
 }
 
 wrap_load_handler! {
-    struct BrowserLoadHandler {
-        settled: Arc<AtomicBool>,
-    }
+    struct BrowserLoadHandler;
 
     impl LoadHandler {
         fn on_loading_state_change(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             is_loading: i32,
             _can_go_back: i32,
             _can_go_forward: i32,
         ) {
             if is_loading == 0 {
-                self.settled.store(true, Ordering::Release);
+                if let Some(browser) = browser
+                    && let Err(error) = resize_browser(browser)
+                {
+                    eprintln!("cef-renderer: post-load repaint failed: {error}");
+                }
                 eprintln!("cef-renderer: page load settled");
             }
         }
@@ -198,6 +198,7 @@ wrap_app! {
             };
 
             command_line.append_switch(Some(&"disable-session-crashed-bubble".into()));
+            command_line.append_switch(Some(&"disable-gpu".into()));
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             command_line.append_switch(Some(&"noerrdialogs".into()));
         }
@@ -208,12 +209,57 @@ wrap_app! {
     }
 }
 
-fn resize_browser(browser: &Browser, _bounds: Bounds) -> Result<(), Box<dyn Error>> {
+wrap_task! {
+    struct BrowserCommandTask {
+        browser: Browser,
+        command: ControlCommand,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            match &self.command {
+                ControlCommand::Navigate(url) => {
+                    if let Some(frame) = self.browser.main_frame() {
+                        frame.load_url(Some(&CefString::from(url.as_str())));
+                    }
+                    if let Some(host) = self.browser.host() {
+                        host.set_focus(1);
+                    }
+                }
+                ControlCommand::Resize(bounds) => {
+                    if let Err(error) = resize_browser(&self.browser) {
+                        eprintln!(
+                            "cef-renderer: resize to {}x{} failed: {error}",
+                            bounds.width, bounds.height
+                        );
+                    }
+                }
+                ControlCommand::Focus => {
+                    if let Some(host) = self.browser.host() {
+                        host.set_focus(1);
+                        host.notify_move_or_resize_started();
+                    }
+                }
+                ControlCommand::Quit => {
+                    if let Some(host) = self.browser.host() {
+                        host.close_browser(1);
+                    } else {
+                        quit_message_loop();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn resize_browser(browser: &Browser) -> Result<(), Box<dyn Error>> {
     let host = browser.host().ok_or("CEF browser has no host")?;
     if host.window_handle() == 0 {
         return Err("CEF browser has no native window yet".into());
     }
     host.notify_move_or_resize_started();
+    host.was_resized();
+    host.invalidate(PaintElementType::VIEW);
     Ok(())
 }
 
@@ -236,11 +282,11 @@ fn run() -> Result<i32, Box<dyn Error>> {
         .parent()
         .ok_or("CEF executable has no parent directory")?
         .to_path_buf();
-    let cache_path = std::env::temp_dir().join("dual-engine-browser-cef");
+    let cache_path =
+        std::env::temp_dir().join(format!("dual-engine-browser-cef-{}", std::process::id()));
     std::fs::create_dir_all(&cache_path)?;
     let settings = Settings {
         no_sandbox: 1,
-        external_message_pump: 1,
         root_cache_path: CefString::from(cache_path.to_string_lossy().as_ref()),
         resources_dir_path: CefString::from(runtime_path.to_string_lossy().as_ref()),
         locales_dir_path: CefString::from(runtime_path.join("locales").to_string_lossy().as_ref()),
@@ -269,10 +315,8 @@ fn run() -> Result<i32, Box<dyn Error>> {
         return Err("CEF context initialization timed out".into());
     }
 
-    let closed = Arc::new(AtomicBool::new(false));
-    let life_span_handler = BrowserLifeSpanHandler::new(closed.clone());
-    let load_settled = Arc::new(AtomicBool::new(false));
-    let load_handler = BrowserLoadHandler::new(load_settled.clone());
+    let life_span_handler = BrowserLifeSpanHandler::new();
+    let load_handler = BrowserLoadHandler::new();
     let mut client = BrowserClient::new(life_span_handler, load_handler);
     let cef_bounds = Rect {
         x: config.bounds.x,
@@ -294,12 +338,21 @@ fn run() -> Result<i32, Box<dyn Error>> {
         None,
     )
     .ok_or("CEF did not create a browser")?;
-    if let Some(host) = browser.host() {
-        host.set_focus(1);
+    let native_window = browser
+        .host()
+        .map(|host| {
+            host.set_focus(1);
+            host.window_handle()
+        })
+        .ok_or("CEF browser has no host")?;
+    if native_window == 0 {
+        return Err("CEF browser has no native window".into());
     }
+    println!("ready\t{native_window}");
+    io::stdout().flush()?;
     eprintln!("cef-renderer: native browser ready");
 
-    let (command_sender, command_receiver) = mpsc::channel();
+    let command_browser = browser.clone();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines() {
             let Ok(line) = line else {
@@ -307,60 +360,22 @@ fn run() -> Result<i32, Box<dyn Error>> {
             };
             if let Some(command) = parse_control_command(&line) {
                 let quit = matches!(command, ControlCommand::Quit);
-                if command_sender.send(command).is_err() || quit {
+                let mut task = BrowserCommandTask::new(command_browser.clone(), command);
+                if post_task(ThreadId::UI, Some(&mut task)) != 1 || quit {
                     return;
                 }
             }
         }
-        let _ = command_sender.send(ControlCommand::Quit);
+        let mut task = BrowserCommandTask::new(command_browser, ControlCommand::Quit);
+        let _ = post_task(ThreadId::UI, Some(&mut task));
     });
 
-    let mut closing = false;
-    let mut current_bounds = config.bounds;
-    while !closed.load(Ordering::Acquire) {
-        do_message_loop_work();
-        if load_settled.swap(false, Ordering::AcqRel)
-            && let Err(error) = resize_browser(&browser, current_bounds)
-        {
-            eprintln!("cef-renderer: post-load repaint failed: {error}");
-        }
-        while let Ok(command) = command_receiver.try_recv() {
-            match command {
-                ControlCommand::Navigate(url) => {
-                    if let Some(frame) = browser.main_frame() {
-                        frame.load_url(Some(&CefString::from(url.as_str())));
-                    }
-                    if let Some(host) = browser.host() {
-                        host.set_focus(1);
-                    }
-                }
-                ControlCommand::Resize(bounds) => {
-                    current_bounds = bounds;
-                    if let Err(error) = resize_browser(&browser, bounds) {
-                        eprintln!("cef-renderer: resize failed: {error}");
-                    }
-                }
-                ControlCommand::Focus => {
-                    if let Some(host) = browser.host() {
-                        host.set_focus(1);
-                        host.notify_move_or_resize_started();
-                    }
-                }
-                ControlCommand::Quit if !closing => {
-                    closing = true;
-                    if let Some(host) = browser.host() {
-                        host.close_browser(1);
-                    }
-                }
-                ControlCommand::Quit => {}
-            }
-        }
-        sleep(Duration::from_millis(10));
-    }
+    run_message_loop();
 
     drop(browser);
     drop(client);
     shutdown();
+    let _ = std::fs::remove_dir_all(cache_path);
     Ok(0)
 }
 

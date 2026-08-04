@@ -1,12 +1,15 @@
 # Dual-engine browser prototype
 
-This is a Linux/X11 vertical slice of a Qt Quick browser shell with two live, on-screen engine surfaces. The shell and backend boundary use the official Qt Bridge for Rust from the start.
+This is a Linux/X11 Qt Quick shell that drives Chromium and Firefox through the same CEF-facing helper. The shell uses the official Qt Bridge for Rust from the start, and both engine panes are live on-screen surfaces.
 
-- Chromium runs in a persistent CEF 150 helper. CEF creates a native child window inside a Qt-owned `QWindow`, which QML presents with `WindowContainer`.
-- Gecko runs in a stock Firefox 153 process. Its native X11 window is positioned and stacked over the matching Qt pane.
-- The shared URL bar navigates both engines. CEF navigates in place; this prototype restarts the isolated Firefox process with the new URL.
+| Pane | Shared helper dependency | Loaded implementation | Browser engine |
+| --- | --- | --- | --- |
+| Chromium | `DT_NEEDED: libcef.so` | Arch CEF's `libcef.so` | Chromium |
+| Firefox | `DT_NEEDED: libcef.so` | `libfirefox_cef.so`, exposed as `libcef.so` in a private loader directory | Gecko in stock Firefox |
 
-The Firefox side is deliberately not described as a Gecko-backed CEF implementation. Stock Firefox's compositor stops painting page content when its window is reparented into another process, so this milestone keeps it as a managed top-level window. A real `firefox-cef` would need a maintained Gecko embedding runtime and a separate CEF ABI adapter.
+`cef-renderer` is one binary, not separate Chromium and Firefox integrations. The controller starts it normally for Chromium. For Firefox it creates a private `libcef.so` symlink pointing to `libfirefox_cef.so` and sets that helper's loader path. The Gecko adapter then implements the CEF 150 C ABI subset used by the helper, including initialization, browser/host/frame objects, reference counting, load and life-span callbacks, UI-thread task dispatch, navigation, resize, focus, and shutdown.
+
+The adapter currently launches stock Firefox with an isolated profile behind that ABI. It removes the helper's loader overrides before starting Firefox, locates the resulting X11 window, and keeps its outer frame aligned and stacked over a Qt-owned host surface. The shell itself has no Firefox-specific process or navigation path.
 
 ## Requirements
 
@@ -34,34 +37,51 @@ cargo build --workspace
 cargo run -p dual-engine-browser
 ```
 
-The application starts both engines at `https://www.google.com/`. Enter another URL and select **Navigate both** to compare them. The application selects Qt's `xcb` platform when `DISPLAY` is available because the native-window integration is X11-specific.
+The application starts both helpers at `https://www.google.com/`. Enter another URL and select **Navigate both** to send the same CEF `load_url` operation to each implementation. The application selects Qt's `xcb` platform when `DISPLAY` is available because the native-window integration is X11-specific.
+
+By default the Firefox helper loads `target/debug/libfirefox_cef.so`. A different shim build can be selected with:
+
+```sh
+DUAL_ENGINE_FIREFOX_CEF=/path/to/libfirefox_cef.so cargo run -p dual-engine-browser
+```
+
+## Compatibility boundary
+
+This is a real Gecko-backed CEF ABI shim for this controlled client, not a drop-in replacement for every CEF application. Exporting the same functions and object layouts is only the first compatibility layer; arbitrary CEF clients can call hundreds of methods and rely on Chromium-specific multiprocess, request-context, extension, accessibility, popup, off-screen rendering, and callback behavior that this prototype does not implement.
+
+The current subset exports:
+
+- CEF API hash/version, process entry, initialize, shutdown, and UTF string functions
+- synchronous browser creation and CEF message-loop/task functions
+- reference-counted browser, browser-host, and main-frame objects
+- client life-span and loading callbacks
+- main-frame navigation, reload, focus, resize, window handle, and close behavior
+
+Extending the shim means implementing another coherent slice of CEF behavior in `firefox-cef`, not adding a second API to the Qt shell.
 
 ## Current limitations
 
-- The Firefox pane is a coordinated top-level window, not a true child. It can briefly outlive the shell's stacking during window-manager transitions, and clipping is limited to ordinary rectangular pane geometry.
-- Keyboard focus and IME forwarding into the cross-process CEF child are not complete. Navigation through the Qt URL bar works; native CEF repaint, resize, and mouse activation are wired.
-- Firefox navigation currently creates a fresh temporary profile and process, so browser history and login state do not persist between navigations.
-- This is not yet a `libcef.so`-compatible Gecko adapter. The stock Firefox process is an integration stand-in while that much larger runtime and ABI project remains separate.
+- Gecko is not linked in-process. `libfirefox_cef.so` owns a stock Firefox subprocess and adapts it to the CEF subset.
+- Firefox remains a coordinated top-level X11 window rather than a reparented child because stock Firefox's compositor stopped painting when reparented across processes. Clipping and unusual window-manager transitions are therefore limited.
+- A navigation opens a new Firefox tab through the isolated profile. The temporary profile lasts for one helper lifetime; persistent accounts and CEF request-context/profile APIs are not implemented yet.
+- Keyboard focus and IME forwarding into the Chromium child are incomplete. Native repaint, resize, mouse activation, and URL-bar navigation are wired.
+- Under this host's Xvfb/Openbox test display, Chromium CEF reports successful external page loads but leaves the network page surface dark. The same CEF pane visibly renders local `data:` content, while the Firefox-backed CEF pane visibly rendered Google and Example Domain over HTTPS. This should be rechecked on a real GPU-backed X11/XWayland desktop.
 
-## Verification note
+## Verification
 
-The complete on-screen path was exercised under Xvfb/Openbox: the Qt-owned CEF child rendered and resized live `data:` content, while the managed Firefox window rendered Google over HTTPS. On this development host, CEF 150's network service and the matching system Chromium 150 both stall on external URLs, so Google could not be truthfully marked as verified in the CEF pane here. The default remains Google so the same build can exercise it on a normal desktop/network environment.
-
-Useful local checks are:
+The shared-helper loader split can be inspected statically:
 
 ```sh
-cargo fmt --all -- --check
+readelf -d target/debug/cef-renderer
+nm -D --defined-only target/debug/libfirefox_cef.so
+```
+
+`readelf` should show one `NEEDED` entry for `libcef.so`. During a run, `/proc/<chromium-helper>/maps` resolves it to the real `libcef.so`, while `/proc/<firefox-helper>/maps` resolves the same dependency to `libfirefox_cef.so`.
+
+Local checks:
+
+```sh
+cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
-
-## Toward a Firefox CEF backend
-
-The next Gecko-specific milestone is independent of this window-management prototype:
-
-1. Maintain an embeddable Gecko runtime rather than driving stock Firefox UI.
-2. Expose browser, frame, host, client, load-handler, request-context, and off-screen-rendering primitives through a stable C/C++ boundary.
-3. Implement the matching subset of the CEF exported ABI and preserve CEF's process/callback semantics.
-4. Add shared profile/request-context handling, input, IME, accessibility, popup, and lifecycle behavior before expanding compatibility.
-
-That produces an honest Gecko-backed CEF subset for this shell without claiming arbitrary third-party CEF application compatibility.
