@@ -190,6 +190,15 @@ impl Backend {
     }
 
     #[qslot]
+    fn finish_smoke_test(&mut self, outcome: String, details: String) {
+        if let Some(controller) = self.controller.take() {
+            controller.stop();
+        }
+        eprintln!("deb-smoke: {outcome}: {details}");
+        std::process::exit(i32::from(outcome != "PASS"));
+    }
+
+    #[qslot]
     fn stop(&mut self) {
         if let Some(controller) = self.controller.take() {
             controller.stop();

@@ -18,8 +18,8 @@ use x11rb::{
     protocol::{
         Event,
         xproto::{
-            ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, EventMask, InputFocus,
-            MapState, StackMode, Window,
+            ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, EventMask, ImageFormat,
+            InputFocus, MapState, StackMode, Window,
         },
     },
     rust_connection::RustConnection,
@@ -103,6 +103,13 @@ enum CefBackend {
 }
 
 impl CefBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Chromium => "Chromium",
+            Self::Firefox => "Gecko",
+        }
+    }
+
     fn loader_directory(self, executable_directory: &Path) -> NativeResult<Option<PathBuf>> {
         if matches!(self, Self::Chromium) {
             return Ok(None);
@@ -291,6 +298,9 @@ impl CefInstance {
                 }
                 self.last_event_sequence = event.sequence;
                 match event.value {
+                    Some(wire::event::Value::LoadingChanged(loading)) => {
+                        Some(ProtocolNotice::LoadingChanged(loading.loading))
+                    }
                     Some(wire::event::Value::LoadFailed(failure)) => {
                         Some(ProtocolNotice::LoadFailed(format!(
                             "{} ({})",
@@ -325,10 +335,93 @@ impl CefInstance {
 
 enum ProtocolNotice {
     CommandFailed(String),
+    LoadingChanged(bool),
     LoadFailed(String),
     Closed,
     Crashed(String),
     ProtocolFailed(String),
+}
+
+#[derive(Default)]
+struct SmokeEngineState {
+    initial_load_settled: bool,
+    navigation_started: bool,
+    navigation_settled: bool,
+}
+
+struct AutomatedSmokeTest {
+    target_url: String,
+    chromium: SmokeEngineState,
+    firefox: SmokeEngineState,
+    navigation_sent: bool,
+    render_after: Option<Instant>,
+    started_at: Instant,
+}
+
+impl AutomatedSmokeTest {
+    fn new(target_url: String) -> Self {
+        Self {
+            target_url,
+            chromium: SmokeEngineState::default(),
+            firefox: SmokeEngineState::default(),
+            navigation_sent: false,
+            render_after: None,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn from_environment() -> NativeResult<Option<Self>> {
+        if !automated_smoke_requested() {
+            return Ok(None);
+        }
+        let target_url = std::env::var("DEB_SMOKE_NAVIGATE_URL")
+            .map_err(|_| "DEB_AUTOMATED_SMOKE_TEST requires DEB_SMOKE_NAVIGATE_URL")?;
+        if target_url.is_empty() {
+            return Err("DEB_SMOKE_NAVIGATE_URL must not be empty".into());
+        }
+        Ok(Some(Self::new(target_url)))
+    }
+
+    fn observe(&mut self, backend: CefBackend, notices: &[ProtocolNotice]) -> Result<(), String> {
+        let state = match backend {
+            CefBackend::Chromium => &mut self.chromium,
+            CefBackend::Firefox => &mut self.firefox,
+        };
+        for notice in notices {
+            match notice {
+                ProtocolNotice::LoadingChanged(false) if !self.navigation_sent => {
+                    state.initial_load_settled = true;
+                }
+                ProtocolNotice::LoadingChanged(true) if self.navigation_sent => {
+                    state.navigation_started = true;
+                }
+                ProtocolNotice::LoadingChanged(false)
+                    if self.navigation_sent && state.navigation_started =>
+                {
+                    state.navigation_settled = true;
+                }
+                ProtocolNotice::CommandFailed(error)
+                | ProtocolNotice::LoadFailed(error)
+                | ProtocolNotice::Crashed(error)
+                | ProtocolNotice::ProtocolFailed(error) => {
+                    return Err(format!("{}: {error}", backend.label()));
+                }
+                ProtocolNotice::Closed => {
+                    return Err(format!("{} closed during the smoke test", backend.label()));
+                }
+                ProtocolNotice::LoadingChanged(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn initial_loads_settled(&self) -> bool {
+        self.chromium.initial_load_settled && self.firefox.initial_load_settled
+    }
+
+    fn navigations_settled(&self) -> bool {
+        self.chromium.navigation_settled && self.firefox.navigation_settled
+    }
 }
 
 pub fn spawn_controller(
@@ -356,6 +449,9 @@ pub fn spawn_controller(
                 format!("Native controller failed: {error}"),
                 format!("Native controller failed: {error}"),
             );
+            if automated_smoke_requested() {
+                finish_smoke_test(&invoker, "FAIL", error.to_string());
+            }
         }
     });
     Controller { sender, thread }
@@ -420,7 +516,18 @@ fn run_controller(
     };
     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
 
-    if let Ok(smoke_url) = std::env::var("DEB_SMOKE_NAVIGATE_URL") {
+    let mut smoke_test = AutomatedSmokeTest::from_environment()?;
+    let mut smoke_result = None;
+    if smoke_test.is_some() && (chromium.is_none() || firefox.is_none()) {
+        smoke_result = Some((
+            "FAIL",
+            "both Chromium and Gecko must start for the automated smoke test".to_owned(),
+        ));
+    }
+
+    if smoke_test.is_none()
+        && let Ok(smoke_url) = std::env::var("DEB_SMOKE_NAVIGATE_URL")
+    {
         if let Some(instance) = &mut chromium {
             instance.navigate(&smoke_url).map_err(|error| {
                 format!("Chromium CEF smoke navigation could not be sent: {error}")
@@ -433,7 +540,7 @@ fn run_controller(
         }
     }
 
-    loop {
+    while smoke_result.is_none() {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(ControllerCommand::Layout(next_layout)) => {
                 layout = next_layout;
@@ -509,17 +616,103 @@ fn run_controller(
             }
         }
 
-        if let Some(instance) = &mut chromium
-            && let Some(status) = notice_status("Chromium CEF", instance.drain_notices())
-        {
+        let chromium_notices = chromium
+            .as_mut()
+            .map(CefInstance::drain_notices)
+            .unwrap_or_default();
+        let firefox_notices = firefox
+            .as_mut()
+            .map(CefInstance::drain_notices)
+            .unwrap_or_default();
+
+        if let Some(smoke) = &mut smoke_test {
+            let observed = smoke
+                .observe(CefBackend::Chromium, &chromium_notices)
+                .and_then(|()| smoke.observe(CefBackend::Firefox, &firefox_notices));
+            if let Err(error) = observed {
+                smoke_result = Some(("FAIL", error));
+            }
+        }
+
+        if let Some(status) = notice_status("Chromium CEF", chromium_notices) {
             chromium_status = status;
             update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
         }
-        if let Some(instance) = &mut firefox
-            && let Some(status) = notice_status("Firefox CEF adapter", instance.drain_notices())
-        {
+        if let Some(status) = notice_status("Firefox CEF adapter", firefox_notices) {
             firefox_status = status;
             update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
+        }
+
+        if smoke_result.is_some() {
+            break;
+        }
+        if let Some(smoke) = &mut smoke_test {
+            if smoke.started_at.elapsed() > Duration::from_secs(20) {
+                smoke_result = Some((
+                    "FAIL",
+                    "both engines did not complete the smoke test within 20 seconds".to_owned(),
+                ));
+                continue;
+            }
+            if !smoke.navigation_sent && smoke.initial_loads_settled() {
+                let chromium_navigation = chromium
+                    .as_mut()
+                    .expect("automated smoke test requires Chromium")
+                    .navigate(&smoke.target_url);
+                let firefox_navigation = firefox
+                    .as_mut()
+                    .expect("automated smoke test requires Gecko")
+                    .navigate(&smoke.target_url);
+                match (chromium_navigation, firefox_navigation) {
+                    (Ok(()), Ok(())) => {
+                        smoke.navigation_sent = true;
+                        eprintln!(
+                            "deb-smoke: both initial pages settled; navigating to {}",
+                            smoke.target_url
+                        );
+                    }
+                    (chromium_result, firefox_result) => {
+                        smoke_result = Some((
+                            "FAIL",
+                            format!(
+                                "smoke navigation failed: Chromium={chromium_result:?}, Gecko={firefox_result:?}"
+                            ),
+                        ));
+                    }
+                }
+            } else if smoke.navigations_settled() && smoke.render_after.is_none() {
+                smoke.render_after = Some(Instant::now() + Duration::from_millis(500));
+            } else if smoke
+                .render_after
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                let chromium_variants = rendered_pixel_variants(
+                    &connection,
+                    chromium
+                        .as_ref()
+                        .expect("automated smoke test requires Chromium"),
+                );
+                let firefox_variants = rendered_pixel_variants(
+                    &connection,
+                    firefox
+                        .as_ref()
+                        .expect("automated smoke test requires Gecko"),
+                );
+                smoke_result = Some(match (chromium_variants, firefox_variants) {
+                    (Ok(chromium_variants), Ok(firefox_variants)) => (
+                        "PASS",
+                        format!(
+                            "both engines loaded and rendered (Chromium {chromium_variants} sampled colors, Gecko {firefox_variants})"
+                        ),
+                    ),
+                    (chromium_result, firefox_result) => (
+                        "FAIL",
+                        format!(
+                            "render verification failed: Chromium={chromium_result:?}, Gecko={firefox_result:?}"
+                        ),
+                    ),
+                });
+            }
         }
     }
 
@@ -528,6 +721,9 @@ fn run_controller(
     }
     if let Some(instance) = firefox {
         instance.stop();
+    }
+    if let Some((outcome, details)) = smoke_result {
+        finish_smoke_test(invoker, outcome, details);
     }
     Ok(())
 }
@@ -849,14 +1045,58 @@ fn format_response_error(context: &str, response: wire::Response) -> String {
 fn notice_status(prefix: &str, notices: Vec<ProtocolNotice>) -> Option<String> {
     notices
         .into_iter()
-        .map(|notice| match notice {
-            ProtocolNotice::CommandFailed(error) => format!("{prefix} command failed: {error}"),
-            ProtocolNotice::LoadFailed(error) => format!("{prefix} load failed: {error}"),
-            ProtocolNotice::Closed => format!("{prefix} closed"),
-            ProtocolNotice::Crashed(reason) => format!("{prefix} crashed: {reason}"),
-            ProtocolNotice::ProtocolFailed(error) => format!("{prefix} protocol failed: {error}"),
+        .filter_map(|notice| match notice {
+            ProtocolNotice::CommandFailed(error) => {
+                Some(format!("{prefix} command failed: {error}"))
+            }
+            ProtocolNotice::LoadFailed(error) => Some(format!("{prefix} load failed: {error}")),
+            ProtocolNotice::Closed => Some(format!("{prefix} closed")),
+            ProtocolNotice::Crashed(reason) => Some(format!("{prefix} crashed: {reason}")),
+            ProtocolNotice::ProtocolFailed(error) => {
+                Some(format!("{prefix} protocol failed: {error}"))
+            }
+            ProtocolNotice::LoadingChanged(_) => None,
         })
         .next_back()
+}
+
+fn rendered_pixel_variants(
+    connection: &RustConnection,
+    instance: &CefInstance,
+) -> NativeResult<usize> {
+    let mut last_error = "browser surface was not capturable".to_owned();
+    for _ in 0..5 {
+        instance.ensure_visible(connection)?;
+        connection.flush()?;
+        sleep(Duration::from_millis(100));
+        match sampled_pixel_variants(connection, instance.window) {
+            Ok(variants) if variants >= 8 => return Ok(variants),
+            Ok(variants) => {
+                last_error = format!("browser surface has only {variants} sampled pixel variants")
+            }
+            Err(error) => last_error = error.to_string(),
+        }
+    }
+    Err(last_error.into())
+}
+
+fn sampled_pixel_variants(connection: &RustConnection, window: Window) -> NativeResult<usize> {
+    let geometry = connection.get_geometry(window)?.reply()?;
+    let width = geometry.width.saturating_sub(8).min(512);
+    let height = geometry.height.saturating_sub(8).min(512);
+    if width < 2 || height < 2 {
+        return Err("browser surface has no drawable area".into());
+    }
+    let image = connection
+        .get_image(ImageFormat::Z_PIXMAP, window, 4, 4, width, height, u32::MAX)?
+        .reply()?;
+    Ok(image
+        .data
+        .chunks_exact(4)
+        .step_by(97)
+        .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+        .collect::<HashSet<_>>()
+        .len())
 }
 
 fn configure_native_window(
@@ -882,6 +1122,14 @@ fn update_statuses(invoker: &QmlMethodInvoker, chromium: String, firefox: String
     invoke_method!(invoker, "update_statuses", chromium, firefox);
 }
 
+fn automated_smoke_requested() -> bool {
+    std::env::var("DEB_AUTOMATED_SMOKE_TEST").as_deref() == Ok("1")
+}
+
+fn finish_smoke_test(invoker: &QmlMethodInvoker, outcome: &str, details: String) {
+    invoke_method!(invoker, "finish_smoke_test", outcome.to_owned(), details);
+}
+
 fn stop_child(child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
@@ -897,7 +1145,7 @@ fn stop_child(child: &mut Child) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CefBackend, NativeRect, validate_hello_reply};
+    use super::{AutomatedSmokeTest, CefBackend, NativeRect, ProtocolNotice, validate_hello_reply};
     use shell_protocol::{MAX_PACKET_BYTES, wire};
 
     #[test]
@@ -951,5 +1199,57 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("NativeX11Surface"));
+    }
+
+    #[test]
+    fn smoke_test_requires_new_load_cycles_from_both_engines() {
+        let mut smoke = AutomatedSmokeTest::new("deb://new-tab/".to_owned());
+        smoke
+            .observe(
+                CefBackend::Chromium,
+                &[ProtocolNotice::LoadingChanged(false)],
+            )
+            .unwrap();
+        assert!(!smoke.initial_loads_settled());
+        smoke
+            .observe(
+                CefBackend::Firefox,
+                &[ProtocolNotice::LoadingChanged(false)],
+            )
+            .unwrap();
+        assert!(smoke.initial_loads_settled());
+
+        smoke.navigation_sent = true;
+        smoke
+            .observe(
+                CefBackend::Chromium,
+                &[ProtocolNotice::LoadingChanged(false)],
+            )
+            .unwrap();
+        assert!(!smoke.navigations_settled());
+        for backend in [CefBackend::Chromium, CefBackend::Firefox] {
+            smoke
+                .observe(
+                    backend,
+                    &[
+                        ProtocolNotice::LoadingChanged(true),
+                        ProtocolNotice::LoadingChanged(false),
+                    ],
+                )
+                .unwrap();
+        }
+        assert!(smoke.navigations_settled());
+    }
+
+    #[test]
+    fn smoke_test_fails_on_backend_errors() {
+        let mut smoke = AutomatedSmokeTest::new("deb://new-tab/".to_owned());
+        let error = smoke
+            .observe(
+                CefBackend::Firefox,
+                &[ProtocolNotice::LoadFailed("broken page".to_owned())],
+            )
+            .unwrap_err();
+        assert_eq!(error, "Gecko: broken page");
     }
 }

@@ -44,7 +44,7 @@ Linux Firefox links its allocator glue into the launcher rather than shipping it
 On Arch Linux, the core host packages can be installed with:
 
 ```sh
-paru -S --needed base-devel cef pkgconf protobuf qt6-base qt6-declarative
+paru -S --needed base-devel cef pkgconf protobuf qt6-base qt6-declarative xorg-server-xvfb
 ```
 
 If Firefox's build reports another missing prerequisite, run `./mach bootstrap` in the pinned `firefox` submodule and select the desktop Firefox build environment.
@@ -64,7 +64,7 @@ Build the patched Firefox runtime, the Gecko-backed adapter, the shared helper, 
 scripts/build-firefox-cef.sh
 ```
 
-The first Firefox build is large. Later runs reuse `target/firefox-source` and `target/firefox-obj` and are incremental. The script refuses a Firefox worktree that is not at the submodule's pinned commit, applies `firefox-patches/0001-firefox-cef-runtime.patch`, overlays the maintained bridge sources, and stages the result under `target/debug/firefox-cef-runtime`.
+The first Firefox build is large. Later runs reuse `target/firefox-source` and `target/firefox-obj`; when the pinned Firefox commit, mozconfig, patch, overlay, and packaged internal page are unchanged, the script skips `mach` entirely and only rebuilds/restages Rust. Pass `--force` to force the Gecko build or `--no-smoke` to skip the otherwise automatic browser smoke test. The script refuses a Firefox worktree that is not at the submodule's pinned commit, applies `firefox-patches/0001-firefox-cef-runtime.patch`, overlays the maintained bridge sources, and stages the result under `target/debug/firefox-cef-runtime`.
 
 Run the application:
 
@@ -140,13 +140,17 @@ Local checks:
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-shellcheck scripts/build-firefox-cef.sh scripts/setup-arch-cef.sh
+shellcheck scripts/*.sh
 ```
 
-To exercise a real runtime `Navigate` request after both engines report `SurfaceReady`, launch the staged application with an explicit smoke URL:
+For the normal inner loop after changing Rust, QML, or the adapter, run:
 
 ```sh
-DEB_SMOKE_NAVIGATE_URL=https://example.com cargo run -p deb
+scripts/smoke-test.sh
 ```
 
-This hook is opt-in and does not change normal startup. A successful smoke run renders the requested page in both native children through the same shell-protocol request path used by **Navigate both**.
+This performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches `deb` with isolated temporary XDG directories under `xvfb-run`. The application waits for both initial pages, navigates both engines to the offline `deb://new-tab/` page, requires complete loading cycles, samples each native X11 surface to reject blank rendering, shuts down, and returns a real pass/fail exit status. It also checks that both engine-native profile and cache trees were created. On the current development machine the runtime portion takes roughly five to ten seconds.
+
+`scripts/build-firefox-cef.sh` runs the same smoke test automatically after either a full Gecko build or a cached Rust-only rebuild. `scripts/smoke-test.sh --no-build` is available when the binaries and staged runtime are already current.
+
+For interactive debugging, `DEB_SMOKE_NAVIGATE_URL=<url> cargo run -p deb` still sends a one-time navigation after both helpers start without enabling automated exit behavior.
