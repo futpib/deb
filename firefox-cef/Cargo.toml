@@ -7,6 +7,7 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+cef-cookie = { version = "0.1.0", path = "../cef-cookie" }
 cef-dll-sys = "=150.2.1"
 libc = "0.2.189"
 x11rb = "0.14.0"

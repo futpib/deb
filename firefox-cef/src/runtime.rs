@@ -33,6 +33,26 @@ struct FirefoxCefCallbacks {
     on_load_error:
         Option<unsafe extern "C" fn(*mut c_void, i32, i32, *const c_char, *const c_char)>,
     on_before_close: Option<unsafe extern "C" fn(*mut c_void, i32)>,
+    on_cookie_changed: Option<unsafe extern "C" fn(*mut c_void, *const FirefoxCefCookie, u8)>,
+}
+
+#[repr(C)]
+pub struct FirefoxCefCookie {
+    pub name: *const c_char,
+    pub value: *const c_char,
+    pub domain: *const c_char,
+    pub path: *const c_char,
+    pub partition_key_top_level_site: *const c_char,
+    pub secure: u8,
+    pub http_only: u8,
+    pub session: u8,
+    pub partitioned: u8,
+    pub partition_key_has_cross_site_ancestor: u8,
+    pub expires_milliseconds: i64,
+    pub creation_microseconds: i64,
+    pub last_access_microseconds: i64,
+    pub update_microseconds: i64,
+    pub same_site: i32,
 }
 
 type SetCallbacks = unsafe extern "C" fn(*const FirefoxCefCallbacks);
@@ -41,6 +61,12 @@ type Command = unsafe extern "C" fn() -> c_int;
 type StringCommand = unsafe extern "C" fn(*const c_char) -> c_int;
 type PostTask =
     unsafe extern "C" fn(Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void) -> c_int;
+pub type CookieVisitor = unsafe extern "C" fn(*mut c_void, *const FirefoxCefCookie);
+pub type CookieCompletion = unsafe extern "C" fn(*mut c_void, u8);
+type VisitCookies =
+    unsafe extern "C" fn(Option<CookieVisitor>, Option<CookieCompletion>, *mut c_void) -> c_int;
+type MutateCookie =
+    unsafe extern "C" fn(*const FirefoxCefCookie, Option<CookieCompletion>, *mut c_void) -> c_int;
 type Run = unsafe extern "C" fn(c_int, *mut *mut c_char, *const c_char) -> c_int;
 
 struct GeckoApi {
@@ -52,6 +78,9 @@ struct GeckoApi {
     focus: Command,
     close: Command,
     post_task: PostTask,
+    visit_cookies: VisitCookies,
+    set_cookie: MutateCookie,
+    delete_cookie: MutateCookie,
     run: Run,
 }
 
@@ -74,6 +103,9 @@ impl GeckoApi {
             focus: unsafe { symbol(libxul, b"firefox_cef_gecko_focus\0")? },
             close: unsafe { symbol(libxul, b"firefox_cef_gecko_close\0")? },
             post_task: unsafe { symbol(libxul, b"firefox_cef_gecko_post_task\0")? },
+            visit_cookies: unsafe { symbol(libxul, b"firefox_cef_gecko_visit_cookies\0")? },
+            set_cookie: unsafe { symbol(libxul, b"firefox_cef_gecko_set_cookie\0")? },
+            delete_cookie: unsafe { symbol(libxul, b"firefox_cef_gecko_delete_cookie\0")? },
             run: unsafe { symbol(libxul, b"firefox_cef_gecko_run\0")? },
         })
     }
@@ -247,6 +279,7 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
         on_loading_state_change: Some(on_loading_state_change),
         on_load_error: Some(on_load_error),
         on_before_close: Some(on_before_close),
+        on_cookie_changed: Some(on_cookie_changed),
     };
     unsafe { (gecko()?.set_callbacks)(&callbacks) };
     Ok(())
@@ -297,6 +330,39 @@ pub fn post_task(
 ) -> RuntimeResult<()> {
     if unsafe { (gecko()?.post_task)(callback, context) } == 0 {
         return Err("Gecko rejected a main-thread task".into());
+    }
+    Ok(())
+}
+
+pub unsafe fn visit_cookies(
+    visitor: Option<CookieVisitor>,
+    completion: Option<CookieCompletion>,
+    context: *mut c_void,
+) -> RuntimeResult<()> {
+    if unsafe { (gecko()?.visit_cookies)(visitor, completion, context) } == 0 {
+        return Err("Gecko rejected a cookie snapshot".into());
+    }
+    Ok(())
+}
+
+pub unsafe fn set_cookie(
+    cookie: *const FirefoxCefCookie,
+    completion: Option<CookieCompletion>,
+    context: *mut c_void,
+) -> RuntimeResult<()> {
+    if unsafe { (gecko()?.set_cookie)(cookie, completion, context) } == 0 {
+        return Err("Gecko rejected a cookie mutation".into());
+    }
+    Ok(())
+}
+
+pub unsafe fn delete_cookie(
+    cookie: *const FirefoxCefCookie,
+    completion: Option<CookieCompletion>,
+    context: *mut c_void,
+) -> RuntimeResult<()> {
+    if unsafe { (gecko()?.delete_cookie)(cookie, completion, context) } == 0 {
+        return Err("Gecko rejected a cookie deletion".into());
     }
     Ok(())
 }
@@ -606,6 +672,14 @@ unsafe extern "C" fn on_before_close(_context: *mut c_void, id: i32) {
     if let Some(state) = find_state(id) {
         state.notify_before_close();
     }
+}
+
+unsafe extern "C" fn on_cookie_changed(
+    _context: *mut c_void,
+    cookie: *const FirefoxCefCookie,
+    action: u8,
+) {
+    unsafe { crate::notify_cookie_changed(cookie, action) };
 }
 
 pub fn shutdown_all() {

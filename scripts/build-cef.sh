@@ -31,8 +31,10 @@ done
 pushd "$cef_source" >/dev/null
 pinned_commit=$(git rev-parse HEAD)
 popd >/dev/null
+gn_defines="is_official_build=true use_sysroot=true symbol_level=1 is_cfi=false use_thin_lto=false ozone_platform_x11=true ozone_platform_wayland=false"
 patch_hash=$(git hash-object "$patch_file")
-input_manifest="cef=$pinned_commit"$'\n'"patch=$patch_hash"
+script_hash=$(git hash-object "$project_root/scripts/build-cef.sh")
+input_manifest="cef=$pinned_commit"$'\n'"patch=$patch_hash"$'\n'"script=$script_hash"$'\n'"gn=$gn_defines"
 input_stamp="$build_root/inputs"
 
 needs_build=$force_build
@@ -53,19 +55,20 @@ if [[ "$checkout_commit" != "$pinned_commit" ]]; then
   echo "CEF build checkout is at $checkout_commit, expected $pinned_commit" >&2
   exit 1
 fi
-if ! git diff --quiet || [[ -n "$(git status --short)" ]]; then
+if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "CEF automation checkout has local changes: $automation_checkout" >&2
   exit 1
 fi
 popd >/dev/null
 
-gn_defines="is_official_build=true use_sysroot=true use_allocator=none symbol_level=1 is_cfi=false use_thin_lto=false ozone_platform_x11=true ozone_platform_wayland=false"
 automation=(
   python3 "$automation_checkout/tools/automate/automate-git.py"
   --download-dir="$build_root"
   --branch=7871
   --checkout="$pinned_commit"
   --x64-build
+  --force-config
+  --with-pgo-profiles
 )
 
 if [[ ! -e "$chromium_cef_source/.git" ]]; then

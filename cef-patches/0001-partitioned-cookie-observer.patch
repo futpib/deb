@@ -1,5 +1,5 @@
 diff --git a/include/cef_cookie.h b/include/cef_cookie.h
-index 40570d81b..ba66cfde9 100644
+index 40570d81b..45733e92a 100644
 --- a/include/cef_cookie.h
 +++ b/include/cef_cookie.h
 @@ -42,10 +42,14 @@
@@ -17,7 +17,7 @@ index 40570d81b..ba66cfde9 100644
  
  ///
  /// Class used for managing cookies. The methods of this class may be called on
-@@ -124,7 +128,36 @@ class CefCookieManager : public virtual CefBaseRefCounted {
+@@ -124,7 +128,46 @@ class CefCookieManager : public virtual CefBaseRefCounted {
    ///
    /*--cef(optional_param=callback)--*/
    virtual bool FlushStore(CefRefPtr<CefCompletionCallback> callback) = 0;
@@ -33,6 +33,16 @@ index 40570d81b..ba66cfde9 100644
 +  /*--cef(added=experimental)--*/
 +  virtual CefRefPtr<CefRegistration> AddChangeObserver(
 +      CefRefPtr<CefCookieChangeObserver> observer) = 0;
++
++  ///
++  /// Visit all cookies on the UI thread and execute |callback| after the last
++  /// cookie has been visited. |callback| is also executed when the cookie store
++  /// is empty. Returns false if cookies cannot be accessed.
++  ///
++  /*--cef(added=experimental,optional_param=callback)--*/
++  virtual bool VisitAllCookiesWithCompletion(
++      CefRefPtr<CefCookieVisitor> visitor,
++      CefRefPtr<CefCompletionCallback> callback) = 0;
 +#endif
 +};
 +
@@ -159,7 +169,7 @@ index 9aaca31ab..aa24692a2 100644
  };
  
 diff --git a/libcef/browser/net_service/cookie_manager_impl.cc b/libcef/browser/net_service/cookie_manager_impl.cc
-index 79fcd2be7..7cde31785 100644
+index 79fcd2be7..74ba3affb 100644
 --- a/libcef/browser/net_service/cookie_manager_impl.cc
 +++ b/libcef/browser/net_service/cookie_manager_impl.cc
 @@ -10,6 +10,8 @@
@@ -240,7 +250,38 @@ index 79fcd2be7..7cde31785 100644
  // Always execute the callback asynchronously.
  void RunAsyncCompletionOnUIThread(CefRefPtr<CefCompletionCallback> callback) {
    if (!callback.get()) {
-@@ -232,6 +296,20 @@ bool CefCookieManagerImpl::FlushStore(
+@@ -107,6 +171,30 @@ void GetAllCookiesCallbackImpl(
+                                         browser_context_getter, cookies));
+ }
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++void ExecuteVisitorWithCompletion(
++    CefRefPtr<CefCookieVisitor> visitor,
++    CefRefPtr<CefCompletionCallback> callback,
++    const CefBrowserContext::Getter& browser_context_getter,
++    const std::vector<net::CanonicalCookie>& cookies) {
++  ExecuteVisitor(visitor, browser_context_getter, cookies);
++  if (callback) {
++    callback->OnComplete();
++  }
++}
++
++void GetAllCookiesWithCompletionCallbackImpl(
++    CefRefPtr<CefCookieVisitor> visitor,
++    CefRefPtr<CefCompletionCallback> callback,
++    const CefBrowserContext::Getter& browser_context_getter,
++    const net::CookieList& cookies) {
++  CEF_POST_TASK(
++      CEF_UIT,
++      base::BindOnce(&ExecuteVisitorWithCompletion, visitor, callback,
++                     browser_context_getter, cookies));
++}
++#endif
++
+ void GetCookiesCallbackImpl(
+     CefRefPtr<CefCookieVisitor> visitor,
+     const CefBrowserContext::Getter& browser_context_getter,
+@@ -232,6 +320,38 @@ bool CefCookieManagerImpl::FlushStore(
    return FlushStoreInternal(callback);
  }
  
@@ -256,12 +297,57 @@ index 79fcd2be7..7cde31785 100644
 +  registration->Initialize(browser_context_getter_);
 +  return registration;
 +}
++
++bool CefCookieManagerImpl::VisitAllCookiesWithCompletion(
++    CefRefPtr<CefCookieVisitor> visitor,
++    CefRefPtr<CefCompletionCallback> callback) {
++  if (!visitor) {
++    return false;
++  }
++
++  if (!ValidContext()) {
++    StoreOrTriggerInitCallback(base::BindOnce(
++        base::IgnoreResult(
++            &CefCookieManagerImpl::VisitAllCookiesWithCompletionInternal),
++        this, visitor, callback));
++    return true;
++  }
++
++  return VisitAllCookiesWithCompletionInternal(visitor, callback);
++}
 +#endif
 +
  bool CefCookieManagerImpl::VisitAllCookiesInternal(
      CefRefPtr<CefCookieVisitor> visitor) {
    DCHECK(ValidContext());
-@@ -269,7 +347,8 @@ bool CefCookieManagerImpl::VisitUrlCookiesInternal(
+@@ -248,6 +368,26 @@ bool CefCookieManagerImpl::VisitAllCookiesInternal(
+   return true;
+ }
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++bool CefCookieManagerImpl::VisitAllCookiesWithCompletionInternal(
++    CefRefPtr<CefCookieVisitor> visitor,
++    CefRefPtr<CefCompletionCallback> callback) {
++  DCHECK(ValidContext());
++  DCHECK(visitor);
++
++  auto browser_context = GetBrowserContext(browser_context_getter_);
++  if (!browser_context) {
++    return false;
++  }
++
++  GetCookieManager(browser_context)
++      ->GetAllCookies(base::BindOnce(
++          &GetAllCookiesWithCompletionCallbackImpl, visitor, callback,
++          browser_context_getter_));
++  return true;
++}
++#endif
++
+ bool CefCookieManagerImpl::VisitUrlCookiesInternal(
+     const GURL& url,
+     bool includeHttpOnly,
+@@ -269,7 +409,8 @@ bool CefCookieManagerImpl::VisitUrlCookiesInternal(
    }
  
    GetCookieManager(browser_context)
@@ -271,7 +357,7 @@ index 79fcd2be7..7cde31785 100644
                        base::BindOnce(&GetCookiesCallbackImpl, visitor,
                                       browser_context_getter_));
    return true;
-@@ -297,12 +376,31 @@ bool CefCookieManagerImpl::SetCookieInternal(
+@@ -297,12 +438,31 @@ bool CefCookieManagerImpl::SetCookieInternal(
    net::CookiePriority priority =
        net_service::MakeCookiePriority(cookie.priority);
  
@@ -305,20 +391,31 @@ index 79fcd2be7..7cde31785 100644
    if (!canonical_cookie) {
      net::CookieInclusionStatus status;
 diff --git a/libcef/browser/net_service/cookie_manager_impl.h b/libcef/browser/net_service/cookie_manager_impl.h
-index 7c6597f3e..a4f46ba04 100644
+index 7c6597f3e..2484cf1fc 100644
 --- a/libcef/browser/net_service/cookie_manager_impl.h
 +++ b/libcef/browser/net_service/cookie_manager_impl.h
-@@ -36,6 +36,10 @@ class CefCookieManagerImpl : public CefCookieManager {
+@@ -36,9 +36,21 @@ class CefCookieManagerImpl : public CefCookieManager {
                       const CefString& cookie_name,
                       CefRefPtr<CefDeleteCookiesCallback> callback) override;
    bool FlushStore(CefRefPtr<CefCompletionCallback> callback) override;
 +#if CEF_API_ADDED(CEF_EXPERIMENTAL)
 +  CefRefPtr<CefRegistration> AddChangeObserver(
 +      CefRefPtr<CefCookieChangeObserver> observer) override;
++  bool VisitAllCookiesWithCompletion(
++      CefRefPtr<CefCookieVisitor> visitor,
++      CefRefPtr<CefCompletionCallback> callback) override;
 +#endif
  
   private:
    bool VisitAllCookiesInternal(CefRefPtr<CefCookieVisitor> visitor);
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++  bool VisitAllCookiesWithCompletionInternal(
++      CefRefPtr<CefCookieVisitor> visitor,
++      CefRefPtr<CefCompletionCallback> callback);
++#endif
+   bool VisitUrlCookiesInternal(const GURL& url,
+                                bool includeHttpOnly,
+                                CefRefPtr<CefCookieVisitor> visitor);
 diff --git a/libcef/common/net_service/net_service_util.cc b/libcef/common/net_service/net_service_util.cc
 index 2be690b99..cc8837a52 100644
 --- a/libcef/common/net_service/net_service_util.cc

@@ -27,6 +27,7 @@ pub struct EngineDirectories {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileDirectories {
+    pub shared_data: PathBuf,
     pub chromium: EngineDirectories,
     pub firefox: EngineDirectories,
 }
@@ -134,6 +135,7 @@ pub fn profile_directories(profile_id: &str) -> ProfileResult<ProfileDirectories
         .get_cache_home()
         .ok_or("XDG cache home is unavailable")?;
     let directories = ProfileDirectories {
+        shared_data: profile_data.clone(),
         chromium: EngineDirectories {
             data: profile_data.join("chromium"),
             cache: profile_cache.join("chromium"),
@@ -144,6 +146,7 @@ pub fn profile_directories(profile_id: &str) -> ProfileResult<ProfileDirectories
         },
     };
     for directory in [
+        &directories.shared_data,
         &directories.chromium.data,
         &directories.chromium.cache,
         &directories.firefox.data,

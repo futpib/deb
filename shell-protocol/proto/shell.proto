@@ -16,6 +16,7 @@ enum Capability {
   CAPABILITY_FOCUS = 4;
   CAPABILITY_LOADING_EVENTS = 5;
   CAPABILITY_NATIVE_X11_SURFACE = 6;
+  CAPABILITY_COOKIE_SYNC = 7;
 }
 
 message Packet {
@@ -53,6 +54,9 @@ message Request {
     SetFocus set_focus = 13;
     Reload reload = 14;
     Close close = 15;
+    ReadCookies read_cookies = 16;
+    SetCookie set_cookie = 17;
+    DeleteCookie delete_cookie = 18;
   }
 }
 
@@ -95,6 +99,16 @@ message Close {
   bool force = 1;
 }
 
+message ReadCookies {}
+
+message SetCookie {
+  Cookie cookie = 1;
+}
+
+message DeleteCookie {
+  Cookie cookie = 1;
+}
+
 message Response {
   oneof result {
     Success success = 1;
@@ -123,6 +137,9 @@ message Event {
     LoadFailed load_failed = 14;
     BrowserClosed browser_closed = 15;
     BrowserCrashed browser_crashed = 16;
+    CookieSnapshotEntry cookie_snapshot_entry = 17;
+    CookieSnapshotComplete cookie_snapshot_complete = 18;
+    CookieChanged cookie_changed = 19;
   }
 }
 
@@ -156,4 +173,66 @@ message BrowserClosed {}
 
 message BrowserCrashed {
   string reason = 1;
+}
+
+enum CookieSameSite {
+  COOKIE_SAME_SITE_UNSPECIFIED = 0;
+  COOKIE_SAME_SITE_NONE = 1;
+  COOKIE_SAME_SITE_LAX = 2;
+  COOKIE_SAME_SITE_STRICT = 3;
+}
+
+enum CookiePriority {
+  COOKIE_PRIORITY_LOW = 0;
+  COOKIE_PRIORITY_MEDIUM = 1;
+  COOKIE_PRIORITY_HIGH = 2;
+}
+
+enum CookieChangeCause {
+  COOKIE_CHANGE_CAUSE_INSERTED = 0;
+  COOKIE_CHANGE_CAUSE_EXPLICIT = 1;
+  COOKIE_CHANGE_CAUSE_UNKNOWN_DELETION = 2;
+  COOKIE_CHANGE_CAUSE_OVERWRITE = 3;
+  COOKIE_CHANGE_CAUSE_EXPIRED = 4;
+  COOKIE_CHANGE_CAUSE_EVICTED = 5;
+  COOKIE_CHANGE_CAUSE_EXPIRED_OVERWRITE = 6;
+  COOKIE_CHANGE_CAUSE_INSERTED_NO_CHANGE_OVERWRITE = 7;
+  COOKIE_CHANGE_CAUSE_INSERTED_NO_VALUE_CHANGE_OVERWRITE = 8;
+}
+
+message CookiePartitionKey {
+  string top_level_site = 1;
+  bool has_cross_site_ancestor = 2;
+  bool opaque = 3;
+}
+
+message CookieKey {
+  string name = 1;
+  string domain = 2;
+  string path = 3;
+  CookiePartitionKey partition_key = 4;
+}
+
+message Cookie {
+  CookieKey key = 1;
+  string value = 2;
+  bool secure = 3;
+  bool http_only = 4;
+  int64 creation = 5;
+  int64 last_access = 6;
+  optional int64 expires = 7;
+  CookieSameSite same_site = 8;
+  CookiePriority priority = 9;
+  int64 last_update = 10;
+}
+
+message CookieSnapshotEntry {
+  Cookie cookie = 1;
+}
+
+message CookieSnapshotComplete {}
+
+message CookieChanged {
+  Cookie cookie = 1;
+  CookieChangeCause cause = 2;
 }

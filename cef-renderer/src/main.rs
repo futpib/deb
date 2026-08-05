@@ -1,4 +1,7 @@
+mod cookies;
+
 use cef::{args::Args, *};
+use cookies::CookieBridge;
 use shell_protocol::{
     MAX_PACKET_BYTES, Transport, is_valid_profile_id,
     wire::{self, Capability, Engine},
@@ -80,6 +83,9 @@ enum ControlCommand {
     Focus(bool),
     Reload,
     Quit(bool),
+    ReadCookies,
+    SetCookie(wire::Cookie),
+    DeleteCookie(wire::Cookie),
 }
 
 fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Error>> {
@@ -91,6 +97,13 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         wire::request::Operation::SetFocus(command) => Ok(ControlCommand::Focus(command.focused)),
         wire::request::Operation::Reload(_) => Ok(ControlCommand::Reload),
         wire::request::Operation::Close(command) => Ok(ControlCommand::Quit(command.force)),
+        wire::request::Operation::ReadCookies(_) => Ok(ControlCommand::ReadCookies),
+        wire::request::Operation::SetCookie(command) => Ok(ControlCommand::SetCookie(
+            command.cookie.ok_or("SetCookie cookie is required")?,
+        )),
+        wire::request::Operation::DeleteCookie(command) => Ok(ControlCommand::DeleteCookie(
+            command.cookie.ok_or("DeleteCookie cookie is required")?,
+        )),
         wire::request::Operation::CreateBrowser(_) => {
             Err("a browser already exists in this helper".into())
         }
@@ -196,6 +209,7 @@ wrap_life_span_handler! {
         browser: Arc<(Mutex<Option<Browser>>, Condvar)>,
         closed: Arc<(Mutex<bool>, Condvar)>,
         emitter: ProtocolEmitter,
+        cookie_bridge: CookieBridge,
     }
 
     impl LifeSpanHandler {
@@ -211,6 +225,9 @@ wrap_life_span_handler! {
                 return;
             }
             host.set_focus(1);
+            if let Err(error) = self.cookie_bridge.ensure_observer() {
+                eprintln!("cef-renderer: cookie observer setup failed: {error}");
+            }
             *self
                 .browser
                 .0
@@ -478,6 +495,7 @@ wrap_task! {
         command: ControlCommand,
         request_id: u64,
         emitter: ProtocolEmitter,
+        cookie_bridge: CookieBridge,
     }
 
     impl Task {
@@ -526,6 +544,22 @@ wrap_task! {
                     }
                     return;
                 }
+                ControlCommand::ReadCookies => match self.cookie_bridge.read_all(self.request_id) {
+                    Ok(()) => return,
+                    Err(error) => Err(error),
+                },
+                ControlCommand::SetCookie(cookie) => {
+                    match self.cookie_bridge.set(self.request_id, cookie.clone()) {
+                        Ok(()) => return,
+                        Err(error) => Err(error),
+                    }
+                }
+                ControlCommand::DeleteCookie(cookie) => {
+                    match self.cookie_bridge.delete(self.request_id, cookie.clone()) {
+                        Ok(()) => return,
+                        Err(error) => Err(error),
+                    }
+                }
             };
             match result {
                 Ok(()) => self.emitter.success(self.request_id),
@@ -554,6 +588,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::Focus,
         Capability::LoadingEvents,
         Capability::NativeX11Surface,
+        Capability::CookieSync,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -766,10 +801,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
 
     let browser_slot = Arc::new((Mutex::new(None), Condvar::new()));
     let browser_closed = Arc::new((Mutex::new(false), Condvar::new()));
+    let cookie_bridge = CookieBridge::new(emitter.clone());
     let life_span_handler = BrowserLifeSpanHandler::new(
         browser_slot.clone(),
         browser_closed.clone(),
         emitter.clone(),
+        cookie_bridge.clone(),
     );
     let load_handler = BrowserLoadHandler::new(emitter.clone());
     let mut client = BrowserClient::new(life_span_handler, load_handler);
@@ -809,6 +846,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
 
     let command_browser = browser_slot.clone();
     let command_emitter = emitter.clone();
+    let command_cookie_bridge = cookie_bridge.clone();
     let browser_id = browser_config.browser_id;
     std::thread::spawn(move || {
         let command_browser = {
@@ -866,6 +904,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 command,
                 request_id,
                 command_emitter.clone(),
+                command_cookie_bridge.clone(),
             );
             if post_task(ThreadId::UI, Some(&mut task)) != 1 {
                 command_emitter.error(
@@ -884,6 +923,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             ControlCommand::Quit(true),
             0,
             command_emitter,
+            command_cookie_bridge,
         );
         let _ = post_task(ThreadId::UI, Some(&mut task));
     });
@@ -906,6 +946,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
         .unwrap_or_else(|error| error.into_inner())
         .take();
     drop(client);
+    cookie_bridge.shutdown();
     shutdown();
     Ok(0)
 }

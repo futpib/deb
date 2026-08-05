@@ -4,11 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["cef-renderer", "firefox-cef", "shell-protocol"]
+members = ["cef-cookie", "cef-renderer", "firefox-cef", "shell-protocol"]
 resolver = "3"
 
 [dependencies]
 qtbridge = "0.2.0"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 shell-protocol = { version = "0.1.0", path = "shell-protocol" }
@@ -18,3 +19,6 @@ xdg = "3.0.0"
 [build-dependencies]
 cc = "1.4.0"
 pkg-config = "0.3.33"
+
+[dev-dependencies]
+tempfile = "3.27.0"

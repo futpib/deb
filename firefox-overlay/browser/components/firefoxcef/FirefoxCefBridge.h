@@ -6,13 +6,15 @@
 #define mozilla_FirefoxCefBridge_h
 
 #include "nsIFirefoxCefBridge.h"
+#include "nsIObserver.h"
 
 namespace mozilla {
 
-class FirefoxCefBridge final : public nsIFirefoxCefBridge {
+class FirefoxCefBridge final : public nsIFirefoxCefBridge, public nsIObserver {
  public:
   NS_DECL_THREADSAFE_ISUPPORTS
   NS_DECL_NSIFIREFOXCEFBRIDGE
+  NS_DECL_NSIOBSERVER
 
   FirefoxCefBridge() = default;
   static already_AddRefed<FirefoxCefBridge> GetSingleton();

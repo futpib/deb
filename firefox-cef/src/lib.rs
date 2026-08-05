@@ -1,3 +1,4 @@
+mod cookies;
 mod refcount;
 mod runtime;
 mod strings;
@@ -398,8 +399,13 @@ extern "C" fn cef_quit_message_loop() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_shutdown() {
+    cookies::shutdown();
     shutdown_all();
     eprintln!("firefox-cef: shutdown complete");
+}
+
+unsafe fn notify_cookie_changed(cookie: *const runtime::FirefoxCefCookie, action: u8) {
+    unsafe { cookies::notify_changed(cookie, action) };
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
-use crate::profile::{EngineDirectories, ProfileDirectories};
+use crate::{
+    cookie_store::{CanonicalCookie, CookieIdentity, CookieStore, cookie_contents_equal},
+    profile::{EngineDirectories, ProfileDirectories},
+};
 use qtbridge::{QmlMethodInvoker, invoke_method};
 use shell_protocol::{
     MAX_PACKET_BYTES, ProtocolError, Transport, configure_child_command,
@@ -96,7 +99,7 @@ impl Controller {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum CefBackend {
     Chromium,
     Firefox,
@@ -188,6 +191,31 @@ impl CefInstance {
                 url: url.to_owned(),
             }),
             "navigation",
+        )
+    }
+
+    fn read_cookies(&mut self) -> NativeResult<()> {
+        self.send_request(
+            wire::request::Operation::ReadCookies(wire::ReadCookies {}),
+            "cookie snapshot",
+        )
+    }
+
+    fn set_cookie(&mut self, cookie: wire::Cookie) -> NativeResult<()> {
+        self.send_request(
+            wire::request::Operation::SetCookie(wire::SetCookie {
+                cookie: Some(cookie),
+            }),
+            "cookie set",
+        )
+    }
+
+    fn delete_cookie(&mut self, cookie: wire::Cookie) -> NativeResult<()> {
+        self.send_request(
+            wire::request::Operation::DeleteCookie(wire::DeleteCookie {
+                cookie: Some(cookie),
+            }),
+            "cookie delete",
         )
     }
 
@@ -311,6 +339,30 @@ impl CefInstance {
                     Some(wire::event::Value::BrowserCrashed(crash)) => {
                         Some(ProtocolNotice::Crashed(crash.reason))
                     }
+                    Some(wire::event::Value::CookieSnapshotEntry(entry)) => match entry.cookie {
+                        Some(cookie) => Some(ProtocolNotice::CookieSnapshotEntry(cookie)),
+                        None => Some(ProtocolNotice::ProtocolFailed(
+                            "cookie snapshot entry has no cookie".to_owned(),
+                        )),
+                    },
+                    Some(wire::event::Value::CookieSnapshotComplete(_)) => {
+                        Some(ProtocolNotice::CookieSnapshotComplete)
+                    }
+                    Some(wire::event::Value::CookieChanged(change)) => match (
+                        change.cookie,
+                        wire::CookieChangeCause::try_from(change.cause),
+                    ) {
+                        (Some(cookie), Ok(cause)) => {
+                            Some(ProtocolNotice::CookieChanged(cookie, cause))
+                        }
+                        (None, _) => Some(ProtocolNotice::ProtocolFailed(
+                            "cookie change has no cookie".to_owned(),
+                        )),
+                        (_, Err(_)) => Some(ProtocolNotice::ProtocolFailed(format!(
+                            "cookie change has invalid cause {}",
+                            change.cause
+                        ))),
+                    },
                     Some(_) => None,
                     None => None,
                 }
@@ -340,6 +392,243 @@ enum ProtocolNotice {
     Closed,
     Crashed(String),
     ProtocolFailed(String),
+    CookieSnapshotEntry(wire::Cookie),
+    CookieSnapshotComplete,
+    CookieChanged(wire::Cookie, wire::CookieChangeCause),
+}
+
+#[derive(Default)]
+struct EngineCookieSnapshot {
+    expected: bool,
+    complete: bool,
+    cookies: Vec<wire::Cookie>,
+}
+
+struct CookieBroker {
+    store: CookieStore,
+    chromium: EngineCookieSnapshot,
+    firefox: EngineCookieSnapshot,
+    pending_changes: Vec<(CefBackend, wire::Cookie, wire::CookieChangeCause)>,
+    reconciled: bool,
+}
+
+impl CookieBroker {
+    fn new(
+        profile_data: &Path,
+        chromium_expected: bool,
+        firefox_expected: bool,
+    ) -> NativeResult<Self> {
+        Ok(Self {
+            store: CookieStore::open(profile_data)?,
+            chromium: EngineCookieSnapshot {
+                expected: chromium_expected,
+                ..Default::default()
+            },
+            firefox: EngineCookieSnapshot {
+                expected: firefox_expected,
+                ..Default::default()
+            },
+            pending_changes: Vec::new(),
+            reconciled: false,
+        })
+    }
+
+    fn start(
+        &mut self,
+        chromium: &mut Option<CefInstance>,
+        firefox: &mut Option<CefInstance>,
+    ) -> NativeResult<()> {
+        if let Some(instance) = chromium {
+            instance.read_cookies()?;
+        }
+        if let Some(instance) = firefox {
+            instance.read_cookies()?;
+        }
+        if !self.chromium.expected && !self.firefox.expected {
+            self.reconciled = true;
+        }
+        Ok(())
+    }
+
+    fn is_reconciled(&self) -> bool {
+        self.reconciled
+    }
+
+    fn observe(
+        &mut self,
+        backend: CefBackend,
+        notices: &[ProtocolNotice],
+        chromium: &mut Option<CefInstance>,
+        firefox: &mut Option<CefInstance>,
+    ) -> NativeResult<()> {
+        for notice in notices {
+            match notice {
+                ProtocolNotice::CookieSnapshotEntry(cookie) if !self.reconciled => {
+                    self.snapshot_mut(backend).cookies.push(cookie.clone());
+                }
+                ProtocolNotice::CookieSnapshotComplete if !self.reconciled => {
+                    self.snapshot_mut(backend).complete = true;
+                }
+                ProtocolNotice::CookieChanged(cookie, cause) if self.reconciled => {
+                    self.apply_change(backend, cookie, *cause, chromium, firefox)?;
+                }
+                ProtocolNotice::CookieChanged(cookie, cause) => {
+                    self.pending_changes.push((backend, cookie.clone(), *cause));
+                }
+                ProtocolNotice::CommandFailed(error)
+                    if !self.reconciled && error.starts_with("cookie snapshot rejected") =>
+                {
+                    return Err(
+                        format!("{} cookie snapshot failed: {error}", backend.label()).into(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        if !self.reconciled && self.snapshots_complete() {
+            self.reconcile(chromium, firefox)?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_mut(&mut self, backend: CefBackend) -> &mut EngineCookieSnapshot {
+        match backend {
+            CefBackend::Chromium => &mut self.chromium,
+            CefBackend::Firefox => &mut self.firefox,
+        }
+    }
+
+    fn snapshot(&self, backend: CefBackend) -> &EngineCookieSnapshot {
+        match backend {
+            CefBackend::Chromium => &self.chromium,
+            CefBackend::Firefox => &self.firefox,
+        }
+    }
+
+    fn snapshots_complete(&self) -> bool {
+        (!self.chromium.expected || self.chromium.complete)
+            && (!self.firefox.expected || self.firefox.complete)
+    }
+
+    fn reconcile(
+        &mut self,
+        chromium: &mut Option<CefInstance>,
+        firefox: &mut Option<CefInstance>,
+    ) -> NativeResult<()> {
+        for backend in [CefBackend::Chromium, CefBackend::Firefox] {
+            for cookie in &self.snapshot(backend).cookies {
+                let identity = CookieIdentity::from_cookie(cookie)?;
+                if identity.is_opaque() {
+                    eprintln!(
+                        "deb: {} has an opaque partitioned cookie that cannot cross engines",
+                        backend.label()
+                    );
+                    continue;
+                }
+                self.store.merge_snapshot(cookie)?;
+            }
+        }
+
+        let canonical = self.store.all()?;
+        for backend in [CefBackend::Chromium, CefBackend::Firefox] {
+            if !self.snapshot(backend).expected {
+                continue;
+            }
+            let snapshot = snapshot_index(&self.snapshot(backend).cookies)?;
+            let instance = match backend {
+                CefBackend::Chromium => chromium.as_mut(),
+                CefBackend::Firefox => firefox.as_mut(),
+            }
+            .ok_or("cookie snapshot expected an unavailable engine")?;
+            for entry in &canonical {
+                reconcile_cookie(instance, &snapshot, entry)?;
+            }
+        }
+
+        self.reconciled = true;
+        let pending = std::mem::take(&mut self.pending_changes);
+        for (backend, cookie, cause) in pending {
+            self.apply_change(backend, &cookie, cause, chromium, firefox)?;
+        }
+        eprintln!(
+            "deb: canonical cookie store reconciled {} records across {} engine(s)",
+            canonical.len(),
+            usize::from(self.chromium.expected) + usize::from(self.firefox.expected)
+        );
+        Ok(())
+    }
+
+    fn apply_change(
+        &self,
+        source: CefBackend,
+        cookie: &wire::Cookie,
+        cause: wire::CookieChangeCause,
+        chromium: &mut Option<CefInstance>,
+        firefox: &mut Option<CefInstance>,
+    ) -> NativeResult<()> {
+        let identity = CookieIdentity::from_cookie(cookie)?;
+        if identity.is_opaque() {
+            return Ok(());
+        }
+        let changed = match cause {
+            wire::CookieChangeCause::Inserted
+            | wire::CookieChangeCause::InsertedNoChangeOverwrite
+            | wire::CookieChangeCause::InsertedNoValueChangeOverwrite => {
+                self.store.apply_live_change(cookie)?
+            }
+            wire::CookieChangeCause::Explicit
+            | wire::CookieChangeCause::UnknownDeletion
+            | wire::CookieChangeCause::Expired
+            | wire::CookieChangeCause::Evicted => self.store.apply_deletion(cookie)?,
+            wire::CookieChangeCause::Overwrite | wire::CookieChangeCause::ExpiredOverwrite => false,
+        };
+        if !changed {
+            return Ok(());
+        }
+        let target = match source {
+            CefBackend::Chromium => firefox.as_mut(),
+            CefBackend::Firefox => chromium.as_mut(),
+        };
+        if let Some(target) = target {
+            if matches!(
+                cause,
+                wire::CookieChangeCause::Explicit
+                    | wire::CookieChangeCause::UnknownDeletion
+                    | wire::CookieChangeCause::Expired
+                    | wire::CookieChangeCause::Evicted
+            ) {
+                target.delete_cookie(cookie.clone())?;
+            } else {
+                target.set_cookie(cookie.clone())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_index(cookies: &[wire::Cookie]) -> NativeResult<HashMap<CookieIdentity, wire::Cookie>> {
+    let mut index = HashMap::new();
+    for cookie in cookies {
+        let identity = CookieIdentity::from_cookie(cookie)?;
+        if !identity.is_opaque() {
+            index.insert(identity, cookie.clone());
+        }
+    }
+    Ok(index)
+}
+
+fn reconcile_cookie(
+    instance: &mut CefInstance,
+    snapshot: &HashMap<CookieIdentity, wire::Cookie>,
+    canonical: &CanonicalCookie,
+) -> NativeResult<()> {
+    let identity = CookieIdentity::from_cookie(&canonical.cookie)?;
+    match (canonical.deleted, snapshot.get(&identity)) {
+        (true, Some(_)) => instance.delete_cookie(canonical.cookie.clone()),
+        (true, None) => Ok(()),
+        (false, Some(cookie)) if cookie_contents_equal(cookie, &canonical.cookie) => Ok(()),
+        (false, _) => instance.set_cookie(canonical.cookie.clone()),
+    }
 }
 
 #[derive(Default)]
@@ -354,6 +643,9 @@ struct AutomatedSmokeTest {
     chromium: SmokeEngineState,
     firefox: SmokeEngineState,
     navigation_sent: bool,
+    cookie_sync_started: bool,
+    chromium_cookie_seen: bool,
+    firefox_cookie_seen: bool,
     render_after: Option<Instant>,
     started_at: Instant,
 }
@@ -365,6 +657,9 @@ impl AutomatedSmokeTest {
             chromium: SmokeEngineState::default(),
             firefox: SmokeEngineState::default(),
             navigation_sent: false,
+            cookie_sync_started: false,
+            chromium_cookie_seen: false,
+            firefox_cookie_seen: false,
             render_after: None,
             started_at: Instant::now(),
         }
@@ -409,7 +704,24 @@ impl AutomatedSmokeTest {
                 ProtocolNotice::Closed => {
                     return Err(format!("{} closed during the smoke test", backend.label()));
                 }
-                ProtocolNotice::LoadingChanged(_) => {}
+                ProtocolNotice::CookieChanged(cookie, cause)
+                    if is_smoke_cookie(cookie)
+                        && matches!(
+                            cause,
+                            wire::CookieChangeCause::Inserted
+                                | wire::CookieChangeCause::InsertedNoChangeOverwrite
+                                | wire::CookieChangeCause::InsertedNoValueChangeOverwrite
+                        ) =>
+                {
+                    match backend {
+                        CefBackend::Chromium => self.chromium_cookie_seen = true,
+                        CefBackend::Firefox => self.firefox_cookie_seen = true,
+                    }
+                }
+                ProtocolNotice::LoadingChanged(_)
+                | ProtocolNotice::CookieSnapshotEntry(_)
+                | ProtocolNotice::CookieSnapshotComplete
+                | ProtocolNotice::CookieChanged(_, _) => {}
             }
         }
         Ok(())
@@ -422,6 +734,38 @@ impl AutomatedSmokeTest {
     fn navigations_settled(&self) -> bool {
         self.chromium.navigation_settled && self.firefox.navigation_settled
     }
+
+    fn cookies_synced(&self) -> bool {
+        self.chromium_cookie_seen && self.firefox_cookie_seen
+    }
+}
+
+fn smoke_cookie() -> wire::Cookie {
+    wire::Cookie {
+        key: Some(wire::CookieKey {
+            name: "deb_cross_engine_smoke".to_owned(),
+            domain: ".deb-smoke.invalid".to_owned(),
+            path: "/".to_owned(),
+            partition_key: None,
+        }),
+        value: "chromium-to-gecko".to_owned(),
+        secure: false,
+        http_only: true,
+        creation: 0,
+        last_access: 0,
+        expires: None,
+        same_site: wire::CookieSameSite::Lax as i32,
+        priority: wire::CookiePriority::Medium as i32,
+        last_update: 0,
+    }
+}
+
+fn is_smoke_cookie(cookie: &wire::Cookie) -> bool {
+    cookie
+        .key
+        .as_ref()
+        .is_some_and(|key| key.name == "deb_cross_engine_smoke")
+        && cookie.value == "chromium-to-gecko"
 }
 
 pub fn spawn_controller(
@@ -515,6 +859,13 @@ fn run_controller(
         }
     };
     update_statuses(invoker, chromium_status.clone(), firefox_status.clone());
+
+    let mut cookie_broker = CookieBroker::new(
+        &profile_directories.shared_data,
+        chromium.is_some(),
+        firefox.is_some(),
+    )?;
+    cookie_broker.start(&mut chromium, &mut firefox)?;
 
     let mut smoke_test = AutomatedSmokeTest::from_environment()?;
     let mut smoke_result = None;
@@ -625,6 +976,19 @@ fn run_controller(
             .map(CefInstance::drain_notices)
             .unwrap_or_default();
 
+        cookie_broker.observe(
+            CefBackend::Chromium,
+            &chromium_notices,
+            &mut chromium,
+            &mut firefox,
+        )?;
+        cookie_broker.observe(
+            CefBackend::Firefox,
+            &firefox_notices,
+            &mut chromium,
+            &mut firefox,
+        )?;
+
         if let Some(smoke) = &mut smoke_test {
             let observed = smoke
                 .observe(CefBackend::Chromium, &chromium_notices)
@@ -632,6 +996,18 @@ fn run_controller(
             if let Err(error) = observed {
                 smoke_result = Some(("FAIL", error));
             }
+        }
+
+        if let Some(smoke) = &mut smoke_test
+            && cookie_broker.is_reconciled()
+            && !smoke.cookie_sync_started
+        {
+            chromium
+                .as_mut()
+                .expect("automated smoke test requires Chromium")
+                .set_cookie(smoke_cookie())?;
+            smoke.cookie_sync_started = true;
+            eprintln!("deb-smoke: exercising Chromium-to-Gecko cookie synchronization");
         }
 
         if let Some(status) = notice_status("Chromium CEF", chromium_notices) {
@@ -680,7 +1056,10 @@ fn run_controller(
                         ));
                     }
                 }
-            } else if smoke.navigations_settled() && smoke.render_after.is_none() {
+            } else if smoke.navigations_settled()
+                && smoke.cookies_synced()
+                && smoke.render_after.is_none()
+            {
                 smoke.render_after = Some(Instant::now() + Duration::from_millis(500));
             } else if smoke
                 .render_after
@@ -702,7 +1081,7 @@ fn run_controller(
                     (Ok(chromium_variants), Ok(firefox_variants)) => (
                         "PASS",
                         format!(
-                            "both engines loaded and rendered (Chromium {chromium_variants} sampled colors, Gecko {firefox_variants})"
+                            "both engines loaded, rendered, and synchronized a cookie (Chromium {chromium_variants} sampled colors, Gecko {firefox_variants})"
                         ),
                     ),
                     (chromium_result, firefox_result) => (
@@ -1010,6 +1389,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::Focus,
         Capability::LoadingEvents,
         Capability::NativeX11Surface,
+        Capability::CookieSync,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -1056,6 +1436,9 @@ fn notice_status(prefix: &str, notices: Vec<ProtocolNotice>) -> Option<String> {
                 Some(format!("{prefix} protocol failed: {error}"))
             }
             ProtocolNotice::LoadingChanged(_) => None,
+            ProtocolNotice::CookieSnapshotEntry(_)
+            | ProtocolNotice::CookieSnapshotComplete
+            | ProtocolNotice::CookieChanged(_, _) => None,
         })
         .next_back()
 }

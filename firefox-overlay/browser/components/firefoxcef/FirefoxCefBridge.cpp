@@ -13,17 +13,48 @@
 #include "XREChildData.h"
 #include "mozilla/Bootstrap.h"
 #include "mozilla/ClearOnShutdown.h"
+#include "mozilla/OriginAttributes.h"
 #include "mozilla/ProcessType.h"
 #include "mozilla/Services.h"
 #include "mozilla/StaticMutex.h"
 #include "mozilla/StaticPtr.h"
+#include "nsIArray.h"
+#include "nsArrayUtils.h"
+#include "nsICookie.h"
+#include "nsICookieManager.h"
+#include "nsICookieNotification.h"
+#include "nsICookieValidation.h"
 #include "nsIObserverService.h"
+#include "nsNetUtil.h"
+#include "nsServiceManagerUtils.h"
 #include "nsString.h"
 #include "nsThreadUtils.h"
 #include "nsXPCOM.h"
 #include "nsXULAppAPI.h"
 
 namespace {
+
+struct FirefoxCefCookie {
+  const char* name;
+  const char* value;
+  const char* domain;
+  const char* path;
+  const char* partitionKeyTopLevelSite;
+  uint8_t secure;
+  uint8_t httpOnly;
+  uint8_t session;
+  uint8_t partitioned;
+  uint8_t partitionKeyHasCrossSiteAncestor;
+  int64_t expiresMilliseconds;
+  int64_t creationMicroseconds;
+  int64_t lastAccessMicroseconds;
+  int64_t updateMicroseconds;
+  int32_t sameSite;
+};
+
+using FirefoxCefCookieVisitor = void (*)(void* context,
+                                         const FirefoxCefCookie* cookie);
+using FirefoxCefCookieCompletion = void (*)(void* context, uint8_t success);
 
 struct FirefoxCefCallbacks {
   size_t size;
@@ -35,6 +66,8 @@ struct FirefoxCefCallbacks {
   void (*onLoadError)(void* context, int32_t browserId, int32_t errorCode,
                       const char* errorText, const char* failedUrl);
   void (*onBeforeClose)(void* context, int32_t browserId);
+  void (*onCookieChanged)(void* context, const FirefoxCefCookie* cookie,
+                          uint8_t action);
 };
 
 mozilla::StaticMutex sMutex;
@@ -47,6 +80,123 @@ nsCString sInitialUrl;
 bool sRuntimeReady;
 bool sAfterCreated;
 bool sBeforeClose;
+bool sObservingCookies;
+
+class CookieView {
+ public:
+  explicit CookieView(nsICookie* aCookie) {
+    aCookie->GetName(mName);
+    aCookie->GetValue(mValue);
+    aCookie->GetHost(mDomain);
+    aCookie->GetPath(mPath);
+    bool secure = false;
+    bool httpOnly = false;
+    bool session = false;
+    aCookie->GetIsSecure(&secure);
+    aCookie->GetIsHttpOnly(&httpOnly);
+    aCookie->GetIsSession(&session);
+    mRaw.secure = secure;
+    mRaw.httpOnly = httpOnly;
+    mRaw.session = session;
+    aCookie->GetExpiry(&mRaw.expiresMilliseconds);
+    aCookie->GetCreationTime(&mRaw.creationMicroseconds);
+    aCookie->GetLastAccessed(&mRaw.lastAccessMicroseconds);
+    aCookie->GetUpdateTime(&mRaw.updateMicroseconds);
+    aCookie->GetSameSite(&mRaw.sameSite);
+
+    const mozilla::OriginAttributes& attributes =
+        aCookie->OriginAttributesNative();
+    if (!attributes.mPartitionKey.IsEmpty()) {
+      nsAutoString scheme;
+      nsAutoString domain;
+      int32_t port = -1;
+      bool ancestor = false;
+      if (mozilla::OriginAttributes::ParsePartitionKey(
+              attributes.mPartitionKey, scheme, domain, port, ancestor) &&
+          mozilla::OriginAttributes::ExtractSiteFromPartitionKey(
+              attributes.mPartitionKey, mPartitionKeyTopLevelSite)) {
+        mRaw.partitioned = 1;
+        mRaw.partitionKeyHasCrossSiteAncestor = ancestor;
+      }
+    }
+
+    mPartitionKeyTopLevelSiteUtf8 =
+        NS_ConvertUTF16toUTF8(mPartitionKeyTopLevelSite);
+    mRaw.name = mName.get();
+    mRaw.value = mValue.get();
+    mRaw.domain = mDomain.get();
+    mRaw.path = mPath.get();
+    mRaw.partitionKeyTopLevelSite = mPartitionKeyTopLevelSiteUtf8.get();
+  }
+
+  const FirefoxCefCookie* Raw() const { return &mRaw; }
+
+ private:
+  FirefoxCefCookie mRaw{};
+  nsCString mName;
+  nsCString mValue;
+  nsCString mDomain;
+  nsCString mPath;
+  nsString mPartitionKeyTopLevelSite;
+  nsCString mPartitionKeyTopLevelSiteUtf8;
+};
+
+void VisitCookie(nsICookie* aCookie, FirefoxCefCookieVisitor aVisitor,
+                 void* aContext) {
+  if (!aCookie || !aVisitor) {
+    return;
+  }
+  CookieView view(aCookie);
+  aVisitor(aContext, view.Raw());
+}
+
+nsresult CookieUri(const FirefoxCefCookie* aCookie, nsIURI** aUri) {
+  nsAutoCString host(aCookie->domain ? aCookie->domain : "");
+  if (!host.IsEmpty() && host.First() == '.') {
+    host.Cut(0, 1);
+  }
+  if (!host.IsEmpty() && host.FindChar(':') != kNotFound &&
+      host.First() != '[') {
+    host.Insert('[', 0);
+    host.Append(']');
+  }
+  nsAutoCString spec(aCookie->secure ? "https://" : "http://");
+  spec.Append(host);
+  spec.Append(aCookie->path ? aCookie->path : "/");
+  return NS_NewURI(aUri, spec);
+}
+
+bool CookieOriginAttributes(const FirefoxCefCookie* aCookie,
+                            mozilla::OriginAttributes& aAttributes) {
+  if (!aCookie->partitioned) {
+    return true;
+  }
+  if (!aCookie->partitionKeyTopLevelSite ||
+      !*aCookie->partitionKeyTopLevelSite) {
+    return false;
+  }
+  nsCOMPtr<nsIURI> partitionUri;
+  if (NS_FAILED(NS_NewURI(getter_AddRefs(partitionUri),
+                         nsDependentCString(
+                             aCookie->partitionKeyTopLevelSite)))) {
+    return false;
+  }
+  aAttributes.SetPartitionKey(
+      partitionUri, aCookie->partitionKeyHasCrossSiteAncestor != 0);
+  return !aAttributes.mPartitionKey.IsEmpty();
+}
+
+void DispatchCookieCompletion(FirefoxCefCookieCompletion aCompletion,
+                              void* aContext, bool aSuccess) {
+  if (!aCompletion) {
+    return;
+  }
+  NS_DispatchToMainThread(NS_NewRunnableFunction(
+      "FirefoxCefBridge::CookieCompletion",
+      [aCompletion, aContext, aSuccess] {
+        aCompletion(aContext, static_cast<uint8_t>(aSuccess));
+      }));
+}
 
 FirefoxCefCallbacks Callbacks(uint32_t* aBrowserId = nullptr) {
   mozilla::StaticMutexAutoLock lock(sMutex);
@@ -112,7 +262,7 @@ namespace mozilla {
 
 static StaticRefPtr<FirefoxCefBridge> sSingleton;
 
-NS_IMPL_ISUPPORTS(FirefoxCefBridge, nsIFirefoxCefBridge)
+NS_IMPL_ISUPPORTS(FirefoxCefBridge, nsIFirefoxCefBridge, nsIObserver)
 
 already_AddRefed<FirefoxCefBridge> FirefoxCefBridge::GetSingleton() {
   if (!sSingleton) {
@@ -151,7 +301,63 @@ NS_IMETHODIMP FirefoxCefBridge::RuntimeReady() {
     StaticMutexAutoLock lock(sMutex);
     sRuntimeReady = true;
   }
+  nsCOMPtr<nsIObserverService> observerService =
+      mozilla::services::GetObserverService();
+  if (observerService && !sObservingCookies) {
+    nsresult rv = observerService->AddObserver(this, "cookie-changed", false);
+    if (NS_SUCCEEDED(rv)) {
+      sObservingCookies = true;
+    }
+  }
   MaybeFireAfterCreated();
+  return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::Observe(nsISupports* aSubject,
+                                        const char* aTopic,
+                                        const char16_t* /* aData */) {
+  if (strcmp(aTopic, "cookie-changed") != 0) {
+    return NS_OK;
+  }
+  nsCOMPtr<nsICookieNotification> notification = do_QueryInterface(aSubject);
+  if (!notification) {
+    return NS_OK;
+  }
+  FirefoxCefCallbacks callbacks = Callbacks();
+  if (!callbacks.onCookieChanged) {
+    return NS_OK;
+  }
+
+  nsICookieNotification::Action action;
+  notification->GetAction(&action);
+  if (action == nsICookieNotification::COOKIES_BATCH_DELETED) {
+    nsCOMPtr<nsIArray> cookies;
+    notification->GetBatchDeletedCookies(getter_AddRefs(cookies));
+    uint32_t length = 0;
+    if (cookies) {
+      cookies->GetLength(&length);
+    }
+    for (uint32_t index = 0; index < length; ++index) {
+      nsCOMPtr<nsICookie> cookie = do_QueryElementAt(cookies, index);
+      if (cookie) {
+        CookieView view(cookie);
+        callbacks.onCookieChanged(callbacks.context, view.Raw(),
+                                  static_cast<uint8_t>(action));
+      }
+    }
+    return NS_OK;
+  }
+
+  nsCOMPtr<nsICookie> cookie;
+  notification->GetCookie(getter_AddRefs(cookie));
+  if (cookie) {
+    CookieView view(cookie);
+    callbacks.onCookieChanged(callbacks.context, view.Raw(),
+                              static_cast<uint8_t>(action));
+  } else if (action == nsICookieNotification::ALL_COOKIES_CLEARED) {
+    callbacks.onCookieChanged(callbacks.context, nullptr,
+                              static_cast<uint8_t>(action));
+  }
   return NS_OK;
 }
 
@@ -233,6 +439,80 @@ extern "C" NS_EXPORT void firefox_cef_gecko_set_native_window(
     sNativeWindow = aNativeWindow;
   }
   MaybeFireAfterCreated();
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_visit_cookies(
+    FirefoxCefCookieVisitor aVisitor, FirefoxCefCookieCompletion aCompletion,
+    void* aContext) {
+  if (!aVisitor || !aCompletion) {
+    return 0;
+  }
+  nsresult rv = NS_DispatchToMainThread(NS_NewRunnableFunction(
+      "FirefoxCefBridge::VisitCookies",
+      [aVisitor, aCompletion, aContext] {
+        nsCOMPtr<nsICookieManager> manager =
+            do_GetService(NS_COOKIEMANAGER_CONTRACTID);
+        nsTArray<RefPtr<nsICookie>> cookies;
+        bool success = manager && NS_SUCCEEDED(manager->GetCookies(cookies));
+        if (success) {
+          for (const auto& cookie : cookies) {
+            VisitCookie(cookie, aVisitor, aContext);
+          }
+        }
+        aCompletion(aContext, static_cast<uint8_t>(success));
+      }));
+  return NS_SUCCEEDED(rv);
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_set_cookie(
+    const FirefoxCefCookie* aCookie, FirefoxCefCookieCompletion aCompletion,
+    void* aContext) {
+  if (!NS_IsMainThread() || !aCookie || !aCompletion || !aCookie->name ||
+      !aCookie->value || !aCookie->domain || !aCookie->path) {
+    return 0;
+  }
+  nsCOMPtr<nsICookieManager> manager =
+      do_GetService(NS_COOKIEMANAGER_CONTRACTID);
+  nsCOMPtr<nsIURI> cookieUri;
+  mozilla::OriginAttributes attributes;
+  bool success =
+      manager && NS_SUCCEEDED(CookieUri(aCookie, getter_AddRefs(cookieUri))) &&
+      CookieOriginAttributes(aCookie, attributes);
+  if (success) {
+    nsCOMPtr<nsICookieValidation> validation;
+    nsICookie::schemeType scheme =
+        aCookie->secure ? nsICookie::SCHEME_HTTPS : nsICookie::SCHEME_HTTP;
+    success = NS_SUCCEEDED(manager->AddNative(
+        cookieUri, nsDependentCString(aCookie->domain),
+        nsDependentCString(aCookie->path), nsDependentCString(aCookie->name),
+        nsDependentCString(aCookie->value), aCookie->secure != 0,
+        aCookie->httpOnly != 0, aCookie->session != 0,
+        aCookie->expiresMilliseconds, &attributes, aCookie->sameSite, scheme,
+        aCookie->partitioned != 0, true, nullptr,
+        getter_AddRefs(validation)));
+  }
+  DispatchCookieCompletion(aCompletion, aContext, success);
+  return 1;
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_delete_cookie(
+    const FirefoxCefCookie* aCookie, FirefoxCefCookieCompletion aCompletion,
+    void* aContext) {
+  if (!NS_IsMainThread() || !aCookie || !aCompletion || !aCookie->name ||
+      !aCookie->domain || !aCookie->path) {
+    return 0;
+  }
+  nsCOMPtr<nsICookieManager> manager =
+      do_GetService(NS_COOKIEMANAGER_CONTRACTID);
+  mozilla::OriginAttributes attributes;
+  bool success = manager && CookieOriginAttributes(aCookie, attributes);
+  if (success) {
+    success = NS_SUCCEEDED(manager->RemoveNative(
+        nsDependentCString(aCookie->domain), nsDependentCString(aCookie->name),
+        nsDependentCString(aCookie->path), &attributes, true, nullptr));
+  }
+  DispatchCookieCompletion(aCompletion, aContext, success);
+  return 1;
 }
 
 extern "C" NS_EXPORT int firefox_cef_gecko_navigate(const char* aUrl) {

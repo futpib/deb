@@ -72,6 +72,7 @@ rg '^deb-smoke:' "$log_file"
 
 required_profile_files=(
   "$test_root/config/deb/profiles.json"
+  "$test_root/data/deb/profiles/default/cookies.sqlite3"
   "$test_root/data/deb/profiles/default/chromium/Default/Preferences"
   "$test_root/data/deb/profiles/default/firefox/prefs.js"
   "$test_root/cache/deb/profiles/default/chromium/Default/Cache/Cache_Data/index"

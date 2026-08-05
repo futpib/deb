@@ -14,7 +14,7 @@ diff --git a/toolkit/library/libxul.symbols b/toolkit/library/libxul.symbols
 index e63e3e7442..902d5ee39f 100644
 --- a/toolkit/library/libxul.symbols
 +++ b/toolkit/library/libxul.symbols
-@@ -1,4 +1,13 @@
+@@ -1,4 +1,16 @@
  XRE_GetBootstrap
 +firefox_cef_gecko_set_callbacks
 +firefox_cef_gecko_configure
@@ -24,6 +24,9 @@ index e63e3e7442..902d5ee39f 100644
 +firefox_cef_gecko_focus
 +firefox_cef_gecko_close
 +firefox_cef_gecko_post_task
++firefox_cef_gecko_visit_cookies
++firefox_cef_gecko_set_cookie
++firefox_cef_gecko_delete_cookie
 +firefox_cef_gecko_run
  uprofiler_get
  #ifdef XP_IOS
