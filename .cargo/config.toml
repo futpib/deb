@@ -1,3 +1,2 @@
 [env]
-CEF_PATH = { value = "../cef-runtime", relative = true }
-
+CEF_PATH = { value = "cef-runtime", relative = true }
