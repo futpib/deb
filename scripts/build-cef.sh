@@ -103,6 +103,8 @@ if ((needs_build)); then
   git apply "$patch_file"
   cp "$patch_file" "$applied_patch"
   python3 tools/translator.py --root-dir .
+  python3 "$project_root/scripts/check-cef-api-hash.py" \
+    "$chromium_cef_source" "$project_root/firefox-cef/src/lib.rs"
   popd >/dev/null
 
   env CEF_USE_GN=1 GN_DEFINES="$gn_defines" \
