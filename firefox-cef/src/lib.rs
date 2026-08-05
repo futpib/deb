@@ -19,7 +19,7 @@ use std::{
 use strings::cef_string_to_string;
 
 const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0";
-const API_HASH_EXPERIMENTAL_LINUX: &[u8] = b"a5d187477e0cbe23eb1043c2f1868582b7018260\0";
+const API_HASH_EXPERIMENTAL_LINUX: &[u8] = b"9c4f3ddc9baede09fb12229355d593dd60565bee\0";
 
 fn state_from<T: CefRefCounted>(raw: *mut T) -> Arc<BrowserState> {
     unsafe { RefObject::<T, Arc<BrowserState>>::get(raw).state.clone() }
