@@ -1,0 +1,355 @@
+diff --git a/include/cef_cookie.h b/include/cef_cookie.h
+index 40570d81b..ba66cfde9 100644
+--- a/include/cef_cookie.h
++++ b/include/cef_cookie.h
+@@ -42,10 +42,14 @@
+ 
+ #include "include/cef_base.h"
+ #include "include/cef_callback.h"
++#include "include/cef_registration.h"
+ 
+ class CefCookieVisitor;
+ class CefSetCookieCallback;
+ class CefDeleteCookiesCallback;
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++class CefCookieChangeObserver;
++#endif
+ 
+ ///
+ /// Class used for managing cookies. The methods of this class may be called on
+@@ -124,7 +128,36 @@ class CefCookieManager : public virtual CefBaseRefCounted {
+   ///
+   /*--cef(optional_param=callback)--*/
+   virtual bool FlushStore(CefRefPtr<CefCompletionCallback> callback) = 0;
++
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++  ///
++  /// Register |observer| to receive all changes to this cookie manager's
++  /// backing store. The observer will remain registered until the returned
++  /// CefRegistration object is destroyed. The observer methods will be called
++  /// on the UI thread. Returns NULL if |observer| is NULL or this method is not
++  /// called on the UI thread.
++  ///
++  /*--cef(added=experimental)--*/
++  virtual CefRefPtr<CefRegistration> AddChangeObserver(
++      CefRefPtr<CefCookieChangeObserver> observer) = 0;
++#endif
++};
++
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++///
++/// Interface to implement for receiving lossless cookie store changes.
++///
++/*--cef(source=client,added=experimental)--*/
++class CefCookieChangeObserver : public virtual CefBaseRefCounted {
++ public:
++  ///
++  /// Called when |cookie| is inserted, changed or removed for |cause|.
++  ///
++  /*--cef()--*/
++  virtual void OnCookieChanged(const CefCookie& cookie,
++                               cef_cookie_change_cause_t cause) = 0;
+ };
++#endif
+ 
+ ///
+ /// Interface to implement for visiting cookie values. The methods of this class
+diff --git a/include/internal/cef_types.h b/include/internal/cef_types.h
+index a2899cd44..c44d65cca 100644
+--- a/include/internal/cef_types.h
++++ b/include/internal/cef_types.h
+@@ -843,6 +843,24 @@ typedef enum {
+   CEF_COOKIE_SAME_SITE_NUM_VALUES,
+ } cef_cookie_same_site_t;
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++///
++/// Cookie change cause values. Keep in sync with net::CookieChangeCause.
++///
++typedef enum {
++  CEF_COOKIE_CHANGE_CAUSE_INSERTED,
++  CEF_COOKIE_CHANGE_CAUSE_EXPLICIT,
++  CEF_COOKIE_CHANGE_CAUSE_UNKNOWN_DELETION,
++  CEF_COOKIE_CHANGE_CAUSE_OVERWRITE,
++  CEF_COOKIE_CHANGE_CAUSE_EXPIRED,
++  CEF_COOKIE_CHANGE_CAUSE_EVICTED,
++  CEF_COOKIE_CHANGE_CAUSE_EXPIRED_OVERWRITE,
++  CEF_COOKIE_CHANGE_CAUSE_INSERTED_NO_CHANGE_OVERWRITE,
++  CEF_COOKIE_CHANGE_CAUSE_INSERTED_NO_VALUE_CHANGE_OVERWRITE,
++  CEF_COOKIE_CHANGE_CAUSE_NUM_VALUES,
++} cef_cookie_change_cause_t;
++#endif
++
+ ///
+ /// Cookie information.
+ ///
+@@ -912,6 +930,34 @@ typedef struct _cef_cookie_t {
+   /// Priority.
+   ///
+   cef_cookie_priority_t priority;
++
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++  ///
++  /// The cookie last update date. This is automatically populated by the
++  /// system when a cookie is created or overwritten.
++  ///
++  cef_basetime_t last_update;
++
++  ///
++  /// True if this cookie is partitioned. Partitioned cookies are uniquely
++  /// identified by this value together with |partition_key_top_level_site| and
++  /// |partition_key_has_cross_site_ancestor| in addition to name, domain and
++  /// path.
++  ///
++  int has_partition_key;
++
++  ///
++  /// Serialized schemeful top-level site for the cookie partition key. This
++  /// value will be empty for opaque or nonce-based partition keys that cannot
++  /// be serialized or recreated outside the originating engine session.
++  ///
++  cef_string_t partition_key_top_level_site;
++
++  ///
++  /// True if the partition key's ancestor chain contains a cross-site frame.
++  ///
++  int partition_key_has_cross_site_ancestor;
++#endif
+ } cef_cookie_t;
+ 
+ ///
+diff --git a/include/internal/cef_types_wrappers.h b/include/internal/cef_types_wrappers.h
+index 9aaca31ab..aa24692a2 100644
+--- a/include/internal/cef_types_wrappers.h
++++ b/include/internal/cef_types_wrappers.h
+@@ -652,6 +652,11 @@ struct CefCookieTraits {
+     cef_string_clear(&s->value);
+     cef_string_clear(&s->domain);
+     cef_string_clear(&s->path);
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++    if (CEF_MEMBER_EXISTS(s, partition_key_top_level_site)) {
++      cef_string_clear(&s->partition_key_top_level_site);
++    }
++#endif
+   }
+ 
+   static inline void set(const struct_type* src,
+@@ -669,6 +674,23 @@ struct CefCookieTraits {
+     target->expires = src->expires;
+     target->same_site = src->same_site;
+     target->priority = src->priority;
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++    if (CEF_MEMBER_EXISTS(src, last_update)) {
++      target->last_update = src->last_update;
++    }
++    if (CEF_MEMBER_EXISTS(src, has_partition_key)) {
++      target->has_partition_key = src->has_partition_key;
++    }
++    if (CEF_MEMBER_EXISTS(src, partition_key_top_level_site)) {
++      cef_string_set(src->partition_key_top_level_site.str,
++                     src->partition_key_top_level_site.length,
++                     &target->partition_key_top_level_site, copy);
++    }
++    if (CEF_MEMBER_EXISTS(src, partition_key_has_cross_site_ancestor)) {
++      target->partition_key_has_cross_site_ancestor =
++          src->partition_key_has_cross_site_ancestor;
++    }
++#endif
+   }
+ };
+ 
+diff --git a/libcef/browser/net_service/cookie_manager_impl.cc b/libcef/browser/net_service/cookie_manager_impl.cc
+index 79fcd2be7..7cde31785 100644
+--- a/libcef/browser/net_service/cookie_manager_impl.cc
++++ b/libcef/browser/net_service/cookie_manager_impl.cc
+@@ -10,6 +10,8 @@
+ #include "cef/libcef/common/time_util.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/storage_partition.h"
++#include "mojo/public/cpp/bindings/receiver.h"
++#include "net/cookies/cookie_partition_key.h"
+ #include "services/network/public/mojom/cookie_manager.mojom.h"
+ #include "url/gurl.h"
+ 
+@@ -34,6 +36,68 @@ CookieManager* GetCookieManager(CefBrowserContext* browser_context) {
+       ->GetCookieManagerForBrowserProcess();
+ }
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++cef_cookie_change_cause_t MakeCefCookieChangeCause(
++    net::CookieChangeCause cause) {
++  switch (cause) {
++    case net::CookieChangeCause::INSERTED:
++      return CEF_COOKIE_CHANGE_CAUSE_INSERTED;
++    case net::CookieChangeCause::EXPLICIT:
++      return CEF_COOKIE_CHANGE_CAUSE_EXPLICIT;
++    case net::CookieChangeCause::UNKNOWN_DELETION:
++      return CEF_COOKIE_CHANGE_CAUSE_UNKNOWN_DELETION;
++    case net::CookieChangeCause::OVERWRITE:
++      return CEF_COOKIE_CHANGE_CAUSE_OVERWRITE;
++    case net::CookieChangeCause::EXPIRED:
++      return CEF_COOKIE_CHANGE_CAUSE_EXPIRED;
++    case net::CookieChangeCause::EVICTED:
++      return CEF_COOKIE_CHANGE_CAUSE_EVICTED;
++    case net::CookieChangeCause::EXPIRED_OVERWRITE:
++      return CEF_COOKIE_CHANGE_CAUSE_EXPIRED_OVERWRITE;
++    case net::CookieChangeCause::INSERTED_NO_CHANGE_OVERWRITE:
++      return CEF_COOKIE_CHANGE_CAUSE_INSERTED_NO_CHANGE_OVERWRITE;
++    case net::CookieChangeCause::INSERTED_NO_VALUE_CHANGE_OVERWRITE:
++      return CEF_COOKIE_CHANGE_CAUSE_INSERTED_NO_VALUE_CHANGE_OVERWRITE;
++  }
++  NOTREACHED();
++  return CEF_COOKIE_CHANGE_CAUSE_UNKNOWN_DELETION;
++}
++
++class CefCookieChangeRegistration final
++    : public CefRegistration,
++      public network::mojom::CookieChangeListener {
++ public:
++  explicit CefCookieChangeRegistration(
++      CefRefPtr<CefCookieChangeObserver> observer)
++      : observer_(observer), receiver_(this) {
++    CEF_REQUIRE_UIT();
++  }
++
++  void Initialize(CefBrowserContext::Getter browser_context_getter) {
++    CEF_REQUIRE_UIT();
++    auto browser_context = GetBrowserContext(browser_context_getter);
++    if (!browser_context) {
++      return;
++    }
++    GetCookieManager(browser_context)
++        ->AddGlobalChangeListener(receiver_.BindNewPipeAndPassRemote());
++  }
++
++  void OnCookieChange(const net::CookieChangeInfo& change) override {
++    CEF_REQUIRE_UIT();
++    CefCookie cookie;
++    net_service::MakeCefCookie(change.cookie, cookie);
++    observer_->OnCookieChanged(cookie, MakeCefCookieChangeCause(change.cause));
++  }
++
++ private:
++  CefRefPtr<CefCookieChangeObserver> observer_;
++  mojo::Receiver<network::mojom::CookieChangeListener> receiver_;
++
++  IMPLEMENT_REFCOUNTING_DELETE_ON_UIT(CefCookieChangeRegistration);
++};
++#endif
++
+ // Always execute the callback asynchronously.
+ void RunAsyncCompletionOnUIThread(CefRefPtr<CefCompletionCallback> callback) {
+   if (!callback.get()) {
+@@ -232,6 +296,20 @@ bool CefCookieManagerImpl::FlushStore(
+   return FlushStoreInternal(callback);
+ }
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++CefRefPtr<CefRegistration> CefCookieManagerImpl::AddChangeObserver(
++    CefRefPtr<CefCookieChangeObserver> observer) {
++  if (!observer || !ValidContext()) {
++    return nullptr;
++  }
++
++  CefRefPtr<CefCookieChangeRegistration> registration =
++      new CefCookieChangeRegistration(observer);
++  registration->Initialize(browser_context_getter_);
++  return registration;
++}
++#endif
++
+ bool CefCookieManagerImpl::VisitAllCookiesInternal(
+     CefRefPtr<CefCookieVisitor> visitor) {
+   DCHECK(ValidContext());
+@@ -269,7 +347,8 @@ bool CefCookieManagerImpl::VisitUrlCookiesInternal(
+   }
+ 
+   GetCookieManager(browser_context)
+-      ->GetCookieList(url, options, net::CookiePartitionKeyCollection(),
++      ->GetCookieList(url, options,
++                      net::CookiePartitionKeyCollection::ContainsAll(),
+                       base::BindOnce(&GetCookiesCallbackImpl, visitor,
+                                      browser_context_getter_));
+   return true;
+@@ -297,12 +376,31 @@ bool CefCookieManagerImpl::SetCookieInternal(
+   net::CookiePriority priority =
+       net_service::MakeCookiePriority(cookie.priority);
+ 
++  std::optional<net::CookiePartitionKey> partition_key;
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++  if (CEF_MEMBER_EXISTS(&cookie, has_partition_key) &&
++      cookie.has_partition_key) {
++    auto parsed_partition_key = net::CookiePartitionKey::FromUntrustedInput(
++        CefString(&cookie.partition_key_top_level_site).ToString(),
++        cookie.partition_key_has_cross_site_ancestor != 0);
++    if (!parsed_partition_key.has_value()) {
++      net::CookieInclusionStatus status;
++      status.AddExclusionReason(
++          net::CookieInclusionStatus::ExclusionReason::EXCLUDE_UNKNOWN_ERROR);
++      SetCookieCallbackImpl(callback,
++                            net::CookieAccessResult(std::move(status)));
++      return true;
++    }
++    partition_key = std::move(parsed_partition_key.value());
++  }
++#endif
++
+   auto canonical_cookie = net::CanonicalCookie::CreateSanitizedCookie(
+       url, name, value, domain, path,
+       /*creation_time=*/base::Time(), expiration_time,
+       /*last_access_time=*/base::Time(), cookie.secure ? true : false,
+       cookie.httponly ? true : false, same_site, priority,
+-      /*partition_key=*/std::nullopt, /*status=*/nullptr);
++      std::move(partition_key), /*status=*/nullptr);
+ 
+   if (!canonical_cookie) {
+     net::CookieInclusionStatus status;
+diff --git a/libcef/browser/net_service/cookie_manager_impl.h b/libcef/browser/net_service/cookie_manager_impl.h
+index 7c6597f3e..a4f46ba04 100644
+--- a/libcef/browser/net_service/cookie_manager_impl.h
++++ b/libcef/browser/net_service/cookie_manager_impl.h
+@@ -36,6 +36,10 @@ class CefCookieManagerImpl : public CefCookieManager {
+                      const CefString& cookie_name,
+                      CefRefPtr<CefDeleteCookiesCallback> callback) override;
+   bool FlushStore(CefRefPtr<CefCompletionCallback> callback) override;
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++  CefRefPtr<CefRegistration> AddChangeObserver(
++      CefRefPtr<CefCookieChangeObserver> observer) override;
++#endif
+ 
+  private:
+   bool VisitAllCookiesInternal(CefRefPtr<CefCookieVisitor> visitor);
+diff --git a/libcef/common/net_service/net_service_util.cc b/libcef/common/net_service/net_service_util.cc
+index 2be690b99..cc8837a52 100644
+--- a/libcef/common/net_service/net_service_util.cc
++++ b/libcef/common/net_service/net_service_util.cc
+@@ -12,6 +12,7 @@
+ #include "cef/include/internal/cef_time_wrappers.h"
+ #include "cef/libcef/common/time_util.h"
+ #include "net/cookies/canonical_cookie.h"
++#include "net/cookies/cookie_partition_key.h"
+ #include "net/cookies/cookie_util.h"
+ #include "net/cookies/parsed_cookie.h"
+ #include "net/http/http_request_headers.h"
+@@ -244,6 +245,21 @@ bool MakeCefCookie(const net::CanonicalCookie& cc, CefCookie& cookie) {
+   cookie.same_site = MakeCefCookieSameSite(cc.SameSite());
+   cookie.priority = MakeCefCookiePriority(cc.Priority());
+ 
++#if CEF_API_ADDED(CEF_EXPERIMENTAL)
++  cookie.last_update = CefBaseTime(cc.LastUpdateDate());
++  if (cc.PartitionKey()) {
++    cookie.has_partition_key = true;
++    const auto serialized =
++        net::CookiePartitionKey::Serialize(*cc.PartitionKey());
++    if (serialized.has_value()) {
++      CefString(&cookie.partition_key_top_level_site)
++          .FromString(serialized->TopLevelSite());
++      cookie.partition_key_has_cross_site_ancestor =
++          serialized->has_cross_site_ancestor();
++    }
++  }
++#endif
++
+   return true;
+ }
+ 

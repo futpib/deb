@@ -1,3 +1,7 @@
 [submodule "firefox"]
 	path = firefox
 	url = https://github.com/mozilla-firefox/firefox.git
+[submodule "cef"]
+	path = cef
+	url = https://github.com/chromiumembedded/cef.git
+	branch = 7871
