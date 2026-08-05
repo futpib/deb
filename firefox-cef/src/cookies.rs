@@ -266,18 +266,17 @@ unsafe extern "C" fn finish_snapshot(context: *mut c_void, success: u8) {
                     )
                 })
             };
-            if delete_cookie != 0 {
-                if let Some(gecko_cookie) =
+            if delete_cookie != 0
+                && let Some(gecko_cookie) =
                     unsafe { GeckoCookieStorage::from_cef(ptr::from_ref(&cookie.raw).cast()) }
-                {
-                    let _ = unsafe {
-                        runtime::delete_cookie(
-                            ptr::from_ref(&gecko_cookie.raw),
-                            Some(ignore_completion),
-                            ptr::null_mut(),
-                        )
-                    };
-                }
+            {
+                let _ = unsafe {
+                    runtime::delete_cookie(
+                        ptr::from_ref(&gecko_cookie.raw),
+                        Some(ignore_completion),
+                        ptr::null_mut(),
+                    )
+                };
             }
             if keep_going == 0 {
                 break;

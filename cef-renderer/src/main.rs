@@ -991,12 +991,9 @@ mod tests {
         is_deb_internal_url, validate_cef_api_hash,
     };
     use shell_protocol::wire;
-    use std::ffi::CStr;
-
     #[test]
     fn rejects_an_unpatched_cef_api_hash() {
-        let stock =
-            CStr::from_bytes_with_nul(b"a5d187477e0cbe23eb1043c2f1868582b7018260\0").unwrap();
+        let stock = c"a5d187477e0cbe23eb1043c2f1868582b7018260";
         let error = validate_cef_api_hash(stock).unwrap_err();
         assert!(error.contains("expected 9c4f3ddc9baede09fb12229355d593dd60565bee"));
     }

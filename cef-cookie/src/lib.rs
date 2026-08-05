@@ -112,6 +112,11 @@ impl<T, S> RefCounted<T, S> {
         }))
     }
 
+    /// # Safety
+    ///
+    /// `object` must point to the `cef_object` field of a live `RefCounted<T,
+    /// S>` allocated by [`RefCounted::new`]. The allocation must remain valid
+    /// for the returned reference's lifetime.
     pub unsafe fn from_cef<'a>(object: *mut T) -> &'a Self {
         unsafe { &*object.cast() }
     }
@@ -142,6 +147,11 @@ unsafe extern "C" fn has_at_least_one_ref<T, S>(base: *mut cef_base_ref_counted_
     c_int::from(object.references.load(Ordering::Acquire) != 0)
 }
 
+/// # Safety
+///
+/// `manager` and `observer` must be null or point to live objects implementing
+/// the patched CEF cookie manager and observer ABIs. The caller must hold their
+/// references for the duration of the call.
 pub unsafe fn add_change_observer(
     manager: *mut _cef_cookie_manager_t,
     observer: *mut CefCookieChangeObserver,
@@ -155,6 +165,11 @@ pub unsafe fn add_change_observer(
         .map(ptr::NonNull::as_ptr)
 }
 
+/// # Safety
+///
+/// `manager`, `visitor`, and `callback` must be null or point to live objects
+/// implementing their patched CEF ABIs. The caller must hold their references
+/// for the duration of the call.
 pub unsafe fn visit_all_cookies_with_completion(
     manager: *mut _cef_cookie_manager_t,
     visitor: *mut _cef_cookie_visitor_t,
@@ -172,6 +187,11 @@ pub unsafe fn visit_all_cookies_with_completion(
     unsafe { visit(ptr::from_ref(&manager.base).cast_mut(), visitor, callback) != 0 }
 }
 
+/// # Safety
+///
+/// `registration` must be null or a live CEF registration for which the caller
+/// owns one reference. That reference must not be released again after this
+/// call.
 pub unsafe fn release_registration(registration: *mut _cef_registration_t) {
     let Some(registration) = (unsafe { registration.as_ref() }) else {
         return;
@@ -181,6 +201,11 @@ pub unsafe fn release_registration(registration: *mut _cef_registration_t) {
     }
 }
 
+/// # Safety
+///
+/// `cookie` must be null or point to readable CEF cookie storage that remains
+/// valid for the returned reference's lifetime. Its `size` field must describe
+/// the allocation accurately.
 pub unsafe fn cookie_from_ptr<'a>(cookie: *const _cef_cookie_t) -> Option<&'a CefCookie> {
     let stock = unsafe { cookie.as_ref()? };
     if stock.size < mem::size_of::<CefCookie>() {
@@ -189,6 +214,10 @@ pub unsafe fn cookie_from_ptr<'a>(cookie: *const _cef_cookie_t) -> Option<&'a Ce
     unsafe { cookie.cast::<CefCookie>().as_ref() }
 }
 
+/// # Safety
+///
+/// A non-null `value.str_` must point to `value.length` readable UTF-16 code
+/// units for the duration of this call.
 pub unsafe fn cef_string(value: &cef_string_t) -> String {
     if value.str_.is_null() || value.length == 0 {
         return String::new();
