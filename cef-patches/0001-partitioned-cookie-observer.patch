@@ -454,3 +454,47 @@ index 2be690b99..cc8837a52 100644
    return true;
  }
  
+diff --git a/patch/patch.cfg b/patch/patch.cfg
+--- a/patch/patch.cfg
++++ b/patch/patch.cfg
+@@ -893,5 +893,10 @@ patches = [
+     # Fix crash during shutdown in TaskManagerImpl::OnReceivedMemoryDump with
+     # multi-threaded-message-loop.
+     'name': 'chrome_browser_task_manager',
++  },
++  {
++    # Keep browser-process navigation hints aligned with CEF's UA metadata.
++    'name': 'deb_google_chrome_brand',
++    'path': 'components/embedder_support',
+   }
+ ]
+diff --git a/patch/patches/deb_google_chrome_brand.patch b/patch/patches/deb_google_chrome_brand.patch
+new file mode 100644
+--- /dev/null
++++ b/patch/patches/deb_google_chrome_brand.patch
+@@ -0,0 +1,25 @@
++diff --git user_agent_utils.cc user_agent_utils.cc
++--- user_agent_utils.cc
+++++ user_agent_utils.cc
++@@ -653,2 +653,8 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
++-  metadata.brand_version_list =
++-      GetUserAgentBrandMajorVersionListInternal(std::nullopt);
+++#if BUILDFLAG(ENABLE_CEF)
+++  metadata.brand_version_list = GetUserAgentBrandMajorVersionListInternal(
+++      blink::UserAgentBrandVersion{
+++          "Google Chrome", version_info::GetMajorVersionNumber()});
+++#else
+++  metadata.brand_version_list =
+++      GetUserAgentBrandMajorVersionListInternal(std::nullopt);
+++#endif
++@@ -676,2 +682,8 @@ blink::UserAgentMetadata GetUserAgentMetadata(bool only_low_entropy_ch) {
++-  metadata.brand_full_version_list =
++-      GetUserAgentBrandFullVersionListInternal(std::nullopt);
+++#if BUILDFLAG(ENABLE_CEF)
+++  metadata.brand_full_version_list = GetUserAgentBrandFullVersionListInternal(
+++      blink::UserAgentBrandVersion{
+++          "Google Chrome", std::string(version_info::GetVersionNumber())});
+++#else
+++  metadata.brand_full_version_list =
+++      GetUserAgentBrandFullVersionListInternal(std::nullopt);
+++#endif
