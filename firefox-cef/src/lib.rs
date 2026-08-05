@@ -19,7 +19,6 @@ use std::{
 use strings::cef_string_to_string;
 
 const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0";
-const API_HASH_EXPERIMENTAL_LINUX: &[u8] = b"9c4f3ddc9baede09fb12229355d593dd60565bee\0";
 
 fn state_from<T: CefRefCounted>(raw: *mut T) -> Arc<BrowserState> {
     unsafe { RefObject::<T, Arc<BrowserState>>::get(raw).state.clone() }
@@ -188,7 +187,9 @@ pub extern "C" fn cef_api_hash(version: c_int, entry: c_int) -> *const c_char {
     }
     match version {
         15000 | 999998 => API_HASH_15000_LINUX.as_ptr().cast(),
-        999999 => API_HASH_EXPERIMENTAL_LINUX.as_ptr().cast(),
+        cef_cookie::CEF_API_VERSION_EXPERIMENTAL => {
+            cef_cookie::CEF_API_HASH_EXPERIMENTAL_LINUX.as_ptr().cast()
+        }
         _ => ptr::null(),
     }
 }
@@ -419,6 +420,16 @@ mod tests {
         assert_eq!(
             unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap(),
             "210767725a6feb2e4becd3956b648cab6a006712"
+        );
+    }
+
+    #[test]
+    fn exposes_the_patched_experimental_linux_api_hash() {
+        let value = cef_api_hash(cef_cookie::CEF_API_VERSION_EXPERIMENTAL, 0);
+        assert!(!value.is_null());
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes_with_nul(),
+            cef_cookie::CEF_API_HASH_EXPERIMENTAL_LINUX
         );
     }
 }

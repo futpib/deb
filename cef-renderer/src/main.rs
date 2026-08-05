@@ -8,6 +8,7 @@ use shell_protocol::{
 };
 use std::{
     error::Error,
+    ffi::CStr,
     os::fd::RawFd,
     path::PathBuf,
     sync::{
@@ -21,6 +22,28 @@ use std::{
 const DEB_SCHEME: &str = "deb";
 const DEB_NEW_TAB_HOST: &str = "new-tab";
 const DEB_NEW_TAB_PAGE: &[u8] = include_bytes!("../../internal-pages/new-tab.html");
+
+fn validate_cef_api_hash(hash: &CStr) -> Result<(), String> {
+    if hash.to_bytes_with_nul() == cef_cookie::CEF_API_HASH_EXPERIMENTAL_LINUX {
+        return Ok(());
+    }
+    Err(format!(
+        "libcef.so has experimental API hash {}, expected {}",
+        hash.to_string_lossy(),
+        CStr::from_bytes_with_nul(cef_cookie::CEF_API_HASH_EXPERIMENTAL_LINUX)
+            .expect("the compiled CEF API hash must be NUL-terminated")
+            .to_string_lossy()
+    ))
+}
+
+fn configure_cef_api() -> Result<(), Box<dyn Error>> {
+    let hash = api_hash(cef_cookie::CEF_API_VERSION_EXPERIMENTAL, 0);
+    if hash.is_null() {
+        return Err("libcef.so does not support the experimental CEF API".into());
+    }
+    validate_cef_api_hash(unsafe { CStr::from_ptr(hash) })?;
+    Ok(())
+}
 
 fn is_deb_internal_url(url: &str) -> bool {
     let Some(remainder) = url.strip_prefix("deb://new-tab") else {
@@ -617,7 +640,7 @@ fn negotiate_protocol(transport: &Transport, engine: Engine) -> Result<(), Box<d
                 Engine::Gecko => "Gecko through FirefoxCEF".to_owned(),
                 Engine::Unspecified => String::new(),
             },
-            cef_api_version: sys::CEF_API_VERSION_LAST as u32,
+            cef_api_version: cef_cookie::CEF_API_VERSION_EXPERIMENTAL as u32,
             maximum_packet_bytes: MAX_PACKET_BYTES as u32,
             capabilities: advertised_capabilities(),
         })),
@@ -695,7 +718,7 @@ fn absolute_profile_path(value: &str, description: &str) -> Result<PathBuf, Box<
 }
 
 fn run() -> Result<i32, Box<dyn Error>> {
-    let _ = api_hash(sys::CEF_API_VERSION_LAST, 0);
+    configure_cef_api()?;
     let cef_args = Args::new();
     let context_ready = Arc::new(AtomicBool::new(false));
     let mut app = BrowserApp::new(context_ready.clone());
@@ -965,9 +988,18 @@ fn main() {
 mod tests {
     use super::{
         ControlCommand, absolute_profile_path, bounds_from_viewport, control_command,
-        is_deb_internal_url,
+        is_deb_internal_url, validate_cef_api_hash,
     };
     use shell_protocol::wire;
+    use std::ffi::CStr;
+
+    #[test]
+    fn rejects_an_unpatched_cef_api_hash() {
+        let stock =
+            CStr::from_bytes_with_nul(b"a5d187477e0cbe23eb1043c2f1868582b7018260\0").unwrap();
+        let error = validate_cef_api_hash(stock).unwrap_err();
+        assert!(error.contains("expected 9c4f3ddc9baede09fb12229355d593dd60565bee"));
+    }
 
     #[test]
     fn parses_native_viewport() {

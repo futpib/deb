@@ -9,10 +9,10 @@ import sys
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Verify that the Gecko adapter exports the patched CEF API hash."
+        description="Verify the Rust ABI constant against the patched CEF API hash."
     )
     parser.add_argument("cef_root", type=pathlib.Path)
-    parser.add_argument("adapter_source", type=pathlib.Path)
+    parser.add_argument("abi_source", type=pathlib.Path)
     args = parser.parse_args()
 
     tools = args.cef_root / "tools"
@@ -28,19 +28,20 @@ def main() -> int:
         module.EXP_VERSION, []
     )
     generated = hashes["linux"]
-    source = args.adapter_source.read_text(encoding="utf-8")
+    source = args.abi_source.read_text(encoding="utf-8")
     match = re.search(
-        r'API_HASH_EXPERIMENTAL_LINUX: &\[u8\] = b"([0-9a-f]{40})\\0";',
+        r'CEF_API_HASH_EXPERIMENTAL_LINUX: &\[u8\] =\s*'
+        r'b"([0-9a-f]{40})\\0";',
         source,
     )
     if match is None:
         raise RuntimeError(
-            f"cannot find API_HASH_EXPERIMENTAL_LINUX in {args.adapter_source}"
+            f"cannot find CEF_API_HASH_EXPERIMENTAL_LINUX in {args.abi_source}"
         )
-    adapter = match.group(1)
-    if adapter != generated:
+    configured = match.group(1)
+    if configured != generated:
         raise RuntimeError(
-            f"Gecko adapter API hash {adapter} does not match patched CEF {generated}"
+            f"Rust CEF API hash {configured} does not match patched CEF {generated}"
         )
     print(f"CEF experimental Linux API hash verified: {generated}")
     return 0

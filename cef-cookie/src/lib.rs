@@ -10,6 +10,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering, fence},
 };
 
+pub const CEF_API_VERSION_EXPERIMENTAL: c_int = 999_999;
+pub const CEF_API_HASH_EXPERIMENTAL_LINUX: &[u8] = b"9c4f3ddc9baede09fb12229355d593dd60565bee\0";
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CefCookie {
