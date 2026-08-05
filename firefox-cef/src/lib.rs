@@ -14,11 +14,17 @@ use refcount::{CefRefCounted, RefObject, add_ref_raw, release_raw};
 use runtime::{BrowserState, shutdown_all};
 use std::{
     ptr,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
 };
 use strings::cef_string_to_string;
 
 const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0";
+const CEF_COMMIT_HASH: &[u8] = b"7c1aa68455db1f1fad159c2b83070ad318212b3d\0";
+const CEF_SANDBOX_COMPAT_HASH: &[u8] = b"\0";
+static CONFIGURED_API_VERSION: AtomicI32 = AtomicI32::new(0);
 
 fn state_from<T: CefRefCounted>(raw: *mut T) -> Arc<BrowserState> {
     unsafe { RefObject::<T, Arc<BrowserState>>::get(raw).state.clone() }
@@ -182,21 +188,30 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_api_hash(version: c_int, entry: c_int) -> *const c_char {
-    if entry > 1 {
-        return ptr::null();
-    }
-    match version {
+    let hash: *const c_char = match version {
         15000 | 999998 => API_HASH_15000_LINUX.as_ptr().cast(),
         cef_cookie::CEF_API_VERSION_EXPERIMENTAL => {
             cef_cookie::CEF_API_HASH_EXPERIMENTAL_LINUX.as_ptr().cast()
         }
+        _ => return ptr::null(),
+    };
+    if CONFIGURED_API_VERSION
+        .compare_exchange(0, version, Ordering::AcqRel, Ordering::Acquire)
+        .is_err_and(|configured| configured != version)
+    {
+        return ptr::null();
+    }
+    match entry {
+        0 | 1 => hash,
+        2 => CEF_COMMIT_HASH.as_ptr().cast(),
+        3 => CEF_SANDBOX_COMPAT_HASH.as_ptr().cast(),
         _ => ptr::null(),
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cef_api_version() -> c_int {
-    15000
+    CONFIGURED_API_VERSION.load(Ordering::Acquire)
 }
 
 #[unsafe(no_mangle)]
@@ -414,22 +429,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exposes_the_cef_150_linux_api_hash() {
-        let value = cef_api_hash(15000, 0);
-        assert!(!value.is_null());
-        assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(value) }.to_str().unwrap(),
-            "210767725a6feb2e4becd3956b648cab6a006712"
-        );
-    }
-
-    #[test]
-    fn exposes_the_patched_experimental_linux_api_hash() {
+    fn configures_the_patched_experimental_linux_api_once() {
         let value = cef_api_hash(cef_cookie::CEF_API_VERSION_EXPERIMENTAL, 0);
         assert!(!value.is_null());
         assert_eq!(
             unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes_with_nul(),
             cef_cookie::CEF_API_HASH_EXPERIMENTAL_LINUX
+        );
+        assert_eq!(cef_api_version(), cef_cookie::CEF_API_VERSION_EXPERIMENTAL);
+        assert!(cef_api_hash(15000, 0).is_null());
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(cef_api_hash(999999, 2)) }
+                .to_str()
+                .unwrap(),
+            "7c1aa68455db1f1fad159c2b83070ad318212b3d"
         );
     }
 }
