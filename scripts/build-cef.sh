@@ -144,6 +144,9 @@ python3 "$project_root/scripts/check-cef-api-hash.py" \
   "$chromium_cef_source" "$project_root/cef-cookie/src/lib.rs"
 
 pushd "$project_root" >/dev/null
+if ((needs_build)); then
+  cargo clean -p cef-dll-sys
+fi
 cargo build --workspace
 popd >/dev/null
 
