@@ -4,7 +4,7 @@
 
 | Pane | `cef-renderer` resolves `libcef.so` to | Engine |
 | --- | --- | --- |
-| Chromium | Arch CEF | Chromium |
+| Chromium | the project-built, patched CEF runtime | Chromium from CEF's pinned Chromium checkout |
 | Firefox | the private `firefox-cef` adapter | Gecko from the pinned Firefox source tree |
 
 The Firefox side is not automation of a separately installed Firefox. Its private helper loads the project-built CEF adapter, the adapter loads `libxul.so`, and a small component compiled into that Firefox runtime provides the bridge between CEF operations and Gecko. The patched GTK widget creates the `FirefoxCEF` surface as a direct X11 child of the Qt host.
@@ -19,7 +19,7 @@ Qt/Rust application process
                                           │                          │
 Chromium cef-renderer process             │  Firefox cef-renderer process
   helper main/control threads             │    main thread: CEF loop -> XRE_main
-  Arch libcef.so                          │    private libcef.so (Rust adapter)
+  project-built patched libcef.so         │    private libcef.so (Rust adapter)
   Chromium CEF UI thread                  │      -> libxul.so bridge
   Chromium child processes                │    FirefoxCEF GTK child ─────────┘
     renderer / GPU / network ─────────────┘    Gecko child processes
@@ -37,34 +37,36 @@ Linux Firefox links its allocator glue into the launcher rather than shipping it
 - Linux desktop with an X11 display server
 - Rust with Edition 2024 support
 - Qt 6 Base and Qt 6 Declarative development files
-- CEF matching `cef = 150.2.1`
+- Enough disk and memory for a full Chromium/CEF build
 - Firefox build prerequisites and enough space for a full Firefox object tree
 - `pkg-config`, protobuf, a C/C++ toolchain, Python, Node.js, and the Firefox-provided build toolchains
 
 On Arch Linux, the core host packages can be installed with:
 
 ```sh
-paru -S --needed base-devel cef pkgconf protobuf qt6-base qt6-declarative xorg-server-xvfb
+paru -S --needed base-devel pkgconf protobuf qt6-base qt6-declarative xorg-server-xvfb
 ```
 
 If Firefox's build reports another missing prerequisite, run `./mach bootstrap` in the pinned `firefox` submodule and select the desktop Firefox build environment.
 
 ## Build and run
 
-Initialize the pinned Firefox source and stage Arch's CEF runtime:
+Initialize both pinned engine source trees:
 
 ```sh
-git submodule update --init firefox
-scripts/setup-arch-cef.sh
+git submodule update --init cef firefox
 ```
 
-Build the patched Firefox runtime, the Gecko-backed adapter, the shared helper, and the Qt shell:
+Build and stage the partition-aware Chromium CEF runtime, then build the patched Firefox runtime, Gecko-backed adapter, shared helper, and Qt shell:
 
 ```sh
+scripts/build-cef.sh
 scripts/build-firefox-cef.sh
 ```
 
-The first Firefox build is large. Later runs reuse `target/firefox-source` and `target/firefox-obj`; when the pinned Firefox commit, mozconfig, patch, overlay, and packaged internal page are unchanged, the script skips `mach` entirely and only rebuilds/restages Rust. Pass `--force` to force the Gecko build or `--no-smoke` to skip the otherwise automatic browser smoke test. The script refuses a Firefox worktree that is not at the submodule's pinned commit, applies `firefox-patches/0001-firefox-cef-runtime.patch`, overlays the maintained bridge sources, and stages the result under `target/debug/firefox-cef-runtime`.
+The first CEF and Firefox builds are both large. The CEF script makes an official X11-only build with Chromium's matching PGO profile, applies `cef-patches/0001-partitioned-cookie-observer.patch`, verifies that Chromium and the Gecko adapter advertise the same generated API hash, and stages the result in `cef-runtime`. Unchanged CEF source, patch, build script, and GN settings skip that engine build; pass `--force` to rebuild it.
+
+Firefox rebuilds reuse `target/firefox-source` and `target/firefox-obj`; when the pinned Firefox commit, mozconfig, patch, overlay, and packaged internal page are unchanged, the script skips `mach` entirely and only rebuilds/restages Rust. Its script refuses a Firefox worktree that is not at the submodule's pinned commit, applies `firefox-patches/0001-firefox-cef-runtime.patch`, overlays the maintained bridge sources, and stages the result under `target/debug/firefox-cef-runtime`. Both build scripts run the browser smoke test by default; pass `--no-smoke` while chaining the two builds and run `scripts/smoke-test.sh --no-build` once at the end.
 
 Run the application:
 
@@ -82,6 +84,7 @@ Each deb profile maps to two independent native stores:
 
 ```text
 $XDG_DATA_HOME/deb/profiles/<profile-id>/
+  cookies.sqlite3
   chromium/
   firefox/
 
@@ -90,7 +93,7 @@ $XDG_CACHE_HOME/deb/profiles/<profile-id>/
   firefox/
 ```
 
-Chromium receives an explicit persistent CEF `cache_path`; its disk cache is redirected to the XDG cache directory. Gecko runs with the Firefox data directory as its native `--profile` and redirects `cache2` through `browser.cache.disk.parent_directory`. Cookies, local storage, IndexedDB, service workers, permissions, and other profile state remain engine-native and are never shared as raw files.
+Chromium receives an explicit persistent CEF `cache_path`; its disk cache is redirected to the XDG cache directory. Gecko runs with the Firefox data directory as its native `--profile` and redirects `cache2` through `browser.cache.disk.parent_directory`. Each engine keeps its native cookie database, while `deb` reconciles both through the profile's WAL-protected `cookies.sqlite3` canonical store and mirrors live changes in both directions. Cookie identity includes domain, path, and the complete serializable partition key. Opaque/nonce partition keys remain engine-local because the other engine cannot recreate them. Local storage, IndexedDB, service workers, permissions, caches, and other state remain engine-native and are never shared as raw files.
 
 Each profile workspace owns a Chromium helper and a Firefox helper. Opening another profile tab starts another isolated pair and previously opened profile pairs remain alive while the application is running. This gives complete cookie/storage separation and avoids attempting to switch Gecko's process-global Firefox profile in place.
 
@@ -113,13 +116,14 @@ The implemented slice covers:
 - life-span, loading-state, and load-error callbacks
 - navigation, reload, focus, resize, native-window lookup, and close
 - registration of the build-owned `deb://new-tab/` internal page
+- global cookie snapshots, exact set/delete operations, live change observation, timestamps, and serializable partition keys
 
 The Qt shell has no Firefox-specific navigation API. Extending Gecko support means implementing another coherent CEF behavior slice in `firefox-cef` and its Firefox bridge.
 
 ## Current limitations
 
 - Each helper supports one browser surface and one profile. Multiple profiles are implemented with isolated helper pairs; multiple CEF request contexts inside one helper are not implemented.
-- Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, arbitrary application-defined custom schemes, CEF cookie/request-context APIs, and request interception are outside the current CEF slice.
+- Popups, downloads, extensions, accessibility integration, off-screen rendering, devtools, arbitrary application-defined custom schemes, per-request-context cookie managers, and request interception are outside the current CEF slice.
 - X11 native child windows are the sole presentation backend.
 
 ## Verification
@@ -149,7 +153,7 @@ For the normal inner loop after changing Rust, QML, or the adapter, run:
 scripts/smoke-test.sh
 ```
 
-This performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches `deb` with isolated temporary XDG directories under `xvfb-run`. The application waits for both initial pages, navigates both engines to the offline `deb://new-tab/` page, requires complete loading cycles, samples each native X11 surface to reject blank rendering, shuts down, and returns a real pass/fail exit status. It also checks that both engine-native profile and cache trees were created. On the current development machine the runtime portion takes roughly five to ten seconds.
+This performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches `deb` with isolated temporary XDG directories under `xvfb-run`. The application waits for both initial pages, navigates both engines to the offline `deb://new-tab/` page, requires complete loading cycles, samples each native X11 surface to reject blank rendering, writes a cookie through Chromium, and requires the matching live event from Gecko. It then shuts down and returns a real pass/fail exit status. The wrapper also checks that both engine-native profile/cache trees and the canonical SQLite cookie store were created. On the current development machine the runtime portion takes roughly five to ten seconds.
 
 `scripts/build-firefox-cef.sh` runs the same smoke test automatically after either a full Gecko build or a cached Rust-only rebuild. `scripts/smoke-test.sh --no-build` is available when the binaries and staged runtime are already current.
 
