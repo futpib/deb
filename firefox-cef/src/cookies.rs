@@ -24,6 +24,7 @@ use crate::{
 };
 
 const WINDOWS_EPOCH_MICROSECONDS: i64 = 11_644_473_600_000_000;
+const SESSION_EXPIRY_MILLISECONDS: i64 = 9_007_199_254_740_991;
 
 struct ManagerState {
     observers: Mutex<BTreeMap<u64, usize>>,
@@ -110,6 +111,14 @@ fn windows_time(unix_microseconds: i64) -> cef_basetime_t {
 
 fn unix_time(time: cef_basetime_t) -> i64 {
     time.val.saturating_sub(WINDOWS_EPOCH_MICROSECONDS)
+}
+
+fn gecko_expiry_milliseconds(has_expires: c_int, expires: cef_basetime_t) -> i64 {
+    if has_expires != 0 {
+        unix_time(expires).div_euclid(1_000)
+    } else {
+        SESSION_EXPIRY_MILLISECONDS
+    }
 }
 
 fn c_string(value: *const libc::c_char) -> String {
@@ -204,7 +213,7 @@ impl GeckoCookieStorage {
                 partition_key_has_cross_site_ancestor: u8::from(
                     cookie.partition_key_has_cross_site_ancestor != 0,
                 ),
-                expires_milliseconds: unix_time(cookie.expires).div_euclid(1_000),
+                expires_milliseconds: gecko_expiry_milliseconds(cookie.has_expires, cookie.expires),
                 creation_microseconds: unix_time(cookie.creation),
                 last_access_microseconds: unix_time(cookie.last_access),
                 update_microseconds: unix_time(cookie.last_update),
@@ -543,6 +552,15 @@ mod tests {
         for value in [-1, 0, 1, 1_700_000_000_123_456] {
             assert_eq!(unix_time(windows_time(value)), value);
         }
+    }
+
+    #[test]
+    fn session_cookies_get_a_future_gecko_expiry() {
+        assert_eq!(
+            gecko_expiry_milliseconds(0, cef_basetime_t { val: 0 }),
+            SESSION_EXPIRY_MILLISECONDS
+        );
+        assert_eq!(gecko_expiry_milliseconds(1, windows_time(1_234_000)), 1_234);
     }
 
     #[test]
