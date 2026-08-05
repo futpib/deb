@@ -110,7 +110,7 @@ if ((needs_build)); then
     --no-update \
     --force-build \
     --force-distrib \
-    --build-target=cef \
+    --build-target=libcef \
     --no-debug-build \
     --minimal-distrib-only \
     --no-distrib-symbols \
