@@ -160,7 +160,9 @@ nsresult CookieUri(const FirefoxCefCookie* aCookie, nsIURI** aUri) {
     host.Insert('[', 0);
     host.Append(']');
   }
-  nsAutoCString spec(aCookie->secure ? "https://" : "http://");
+  // The bridge carries cookie state, not the URL that originally set it. Use a
+  // secure source context without changing the cookie's Secure attribute.
+  nsAutoCString spec("https://");
   spec.Append(host);
   spec.Append(aCookie->path ? aCookie->path : "/");
   return NS_NewURI(aUri, spec);
@@ -480,8 +482,7 @@ extern "C" NS_EXPORT int firefox_cef_gecko_set_cookie(
       CookieOriginAttributes(aCookie, attributes);
   if (success) {
     nsCOMPtr<nsICookieValidation> validation;
-    nsICookie::schemeType scheme =
-        aCookie->secure ? nsICookie::SCHEME_HTTPS : nsICookie::SCHEME_HTTP;
+    nsICookie::schemeType scheme = nsICookie::SCHEME_HTTPS;
     success = NS_SUCCEEDED(manager->AddNative(
         cookieUri, nsDependentCString(aCookie->domain),
         nsDependentCString(aCookie->path), nsDependentCString(aCookie->name),

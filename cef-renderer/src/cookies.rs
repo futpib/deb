@@ -372,8 +372,10 @@ impl OwnedCookie {
         } else {
             host.to_owned()
         };
-        let scheme = if cookie.secure { "https" } else { "http" };
-        let source_url = format!("{scheme}://{host}{}", key.path);
+        // The protocol carries cookie state, not the URL that originally set it. Use a
+        // secure source context so non-Secure cookies set by HTTPS sites do not lose
+        // overwrite privileges when synchronized into Chromium.
+        let source_url = format!("https://{host}{}", key.path);
         let name = CefStringStorage::new(&key.name);
         let value = CefStringStorage::new(if delete { "" } else { &cookie.value });
         let domain = CefStringStorage::new(&key.domain);
@@ -474,6 +476,15 @@ mod tests {
         assert_eq!(cookie.raw.partition_key_has_cross_site_ancestor, 1);
         assert_eq!(cookie.raw.has_expires, 1);
         assert_eq!(cookie.raw.expires.val, 30);
+    }
+
+    #[test]
+    fn uses_a_secure_source_context_for_non_secure_cookies() {
+        let mut input = cookie();
+        input.secure = false;
+        let cookie = OwnedCookie::new(input, false).unwrap();
+        assert_eq!(cookie.source_url, "https://example.com/account");
+        assert_eq!(cookie.raw.secure, 0);
     }
 
     #[test]
