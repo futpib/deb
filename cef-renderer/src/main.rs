@@ -7,6 +7,7 @@ use shell_protocol::{
     wire::{self, Capability, Engine},
 };
 use std::{
+    collections::{HashMap, HashSet},
     error::Error,
     ffi::CStr,
     os::fd::RawFd,
@@ -105,7 +106,8 @@ enum ControlCommand {
     Resize(Bounds),
     Focus(bool),
     Reload,
-    Quit(bool),
+    Close(bool),
+    Visibility(bool),
     ReadCookies,
     SetCookie(wire::Cookie),
     DeleteCookie(wire::Cookie),
@@ -119,7 +121,10 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         )),
         wire::request::Operation::SetFocus(command) => Ok(ControlCommand::Focus(command.focused)),
         wire::request::Operation::Reload(_) => Ok(ControlCommand::Reload),
-        wire::request::Operation::Close(command) => Ok(ControlCommand::Quit(command.force)),
+        wire::request::Operation::Close(command) => Ok(ControlCommand::Close(command.force)),
+        wire::request::Operation::SetVisibility(command) => {
+            Ok(ControlCommand::Visibility(command.visible))
+        }
         wire::request::Operation::ReadCookies(_) => Ok(ControlCommand::ReadCookies),
         wire::request::Operation::SetCookie(command) => Ok(ControlCommand::SetCookie(
             command.cookie.ok_or("SetCookie cookie is required")?,
@@ -127,7 +132,7 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         wire::request::Operation::DeleteCookie(command) => Ok(ControlCommand::DeleteCookie(
             command.cookie.ok_or("DeleteCookie cookie is required")?,
         )),
-        wire::request::Operation::CreateBrowser(_) => {
+        wire::request::Operation::CreateBrowser(_) | wire::request::Operation::Shutdown(_) => {
             Err("a browser already exists in this helper".into())
         }
     }
@@ -152,11 +157,19 @@ struct ProtocolEmitter {
 }
 
 impl ProtocolEmitter {
-    fn new(transport: Transport, browser_id: u64) -> Self {
+    fn new(transport: Transport) -> Self {
         Self {
             transport: Arc::new(Mutex::new(transport)),
-            browser_id,
+            browser_id: 0,
             next_sequence: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    fn for_browser(&self, browser_id: u64) -> Self {
+        Self {
+            transport: self.transport.clone(),
+            browser_id,
+            next_sequence: self.next_sequence.clone(),
         }
     }
 
@@ -227,10 +240,105 @@ fn error_packet(request_id: u64, code: &str, message: impl Into<String>) -> wire
     )
 }
 
+#[derive(Default)]
+struct BrowserRegistry {
+    browsers: Mutex<HashMap<u64, Browser>>,
+    pending: Mutex<HashSet<u64>>,
+    shutting_down: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl BrowserRegistry {
+    fn reserve(&self, browser_id: u64) -> Result<(), String> {
+        if browser_id == 0 {
+            return Err("browser ID must be nonzero".to_owned());
+        }
+        if self
+            .browsers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&browser_id)
+            || !self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(browser_id)
+        {
+            return Err(format!("browser {browser_id} already exists"));
+        }
+        Ok(())
+    }
+
+    fn cancel_reservation(&self, browser_id: u64) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&browser_id);
+    }
+
+    fn created(&self, browser_id: u64, browser: Browser) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&browser_id);
+        self.browsers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(browser_id, browser);
+        self.changed.notify_all();
+    }
+
+    fn get(&self, browser_id: u64) -> Option<Browser> {
+        self.browsers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&browser_id)
+            .cloned()
+    }
+
+    fn remove(&self, browser_id: u64) {
+        self.browsers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&browser_id);
+        self.changed.notify_all();
+    }
+
+    fn all(&self) -> Vec<Browser> {
+        self.browsers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn begin_shutdown(&self) {
+        *self
+            .shutting_down
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    fn wait_for_shutdown(&self) {
+        let mut shutting_down = self
+            .shutting_down
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while !*shutting_down {
+            shutting_down = self
+                .changed
+                .wait(shutting_down)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+
 wrap_life_span_handler! {
     struct BrowserLifeSpanHandler {
-        browser: Arc<(Mutex<Option<Browser>>, Condvar)>,
-        closed: Arc<(Mutex<bool>, Condvar)>,
+        browser_id: u64,
+        registry: Arc<BrowserRegistry>,
         emitter: ProtocolEmitter,
         cookie_bridge: CookieBridge,
     }
@@ -251,12 +359,7 @@ wrap_life_span_handler! {
             if let Err(error) = self.cookie_bridge.ensure_observer() {
                 eprintln!("cef-renderer: cookie observer setup failed: {error}");
             }
-            *self
-                .browser
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = Some(browser.clone());
-            self.browser.1.notify_all();
+            self.registry.created(self.browser_id, browser.clone());
             self.emitter.event(wire::event::Value::SurfaceReady(
                 wire::SurfaceReady {
                     x11: Some(wire::X11Surface {
@@ -268,17 +371,7 @@ wrap_life_span_handler! {
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
-            self.browser
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            *self
-                .closed
-                .0
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = true;
-            self.closed.1.notify_all();
+            self.registry.remove(self.browser_id);
             self.emitter
                 .event(wire::event::Value::BrowserClosed(wire::BrowserClosed {}));
         }
@@ -332,6 +425,71 @@ wrap_load_handler! {
                 error_text, failed_url,
             );
         }
+
+        fn on_load_start(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _transition_type: TransitionType,
+        ) {
+            let Some(frame) = frame else {
+                return;
+            };
+            if frame.is_main() == 0 {
+                return;
+            }
+            let url = frame.url();
+            self.emitter.event(wire::event::Value::NavigationCommitted(
+                wire::NavigationCommitted {
+                    url: CefString::from(&url).to_string(),
+                },
+            ));
+        }
+    }
+}
+
+wrap_display_handler! {
+    struct BrowserDisplayHandler {
+        emitter: ProtocolEmitter,
+    }
+
+    impl DisplayHandler {
+        fn on_title_change(&self, _browser: Option<&mut Browser>, title: Option<&CefString>) {
+            self.emitter.event(wire::event::Value::TitleChanged(
+                wire::TitleChanged {
+                    title: title.map(CefString::to_string).unwrap_or_default(),
+                },
+            ));
+        }
+    }
+}
+
+wrap_request_handler! {
+    struct BrowserRequestHandler {
+        emitter: ProtocolEmitter,
+    }
+
+    impl RequestHandler {
+        fn on_render_process_terminated(
+            &self,
+            _browser: Option<&mut Browser>,
+            status: TerminationStatus,
+            error_code: i32,
+            error_string: Option<&CefString>,
+        ) {
+            let details = error_string.map(CefString::to_string).unwrap_or_default();
+            let reason = if details.is_empty() {
+                format!("renderer terminated: status={} code={error_code}", status.get_raw())
+            } else {
+                format!(
+                    "renderer terminated: status={} code={error_code}: {details}",
+                    status.get_raw()
+                )
+            };
+            self.emitter.event(wire::event::Value::BrowserCrashed(
+                wire::BrowserCrashed { reason },
+            ));
+        }
     }
 }
 
@@ -339,6 +497,8 @@ wrap_client! {
     struct BrowserClient {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
+        display_handler: DisplayHandler,
+        request_handler: RequestHandler,
     }
 
     impl Client {
@@ -348,6 +508,14 @@ wrap_client! {
 
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.load_handler.clone())
+        }
+
+        fn display_handler(&self) -> Option<DisplayHandler> {
+            Some(self.display_handler.clone())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request_handler.clone())
         }
     }
 }
@@ -556,7 +724,7 @@ wrap_task! {
                     self.browser.reload();
                     Ok(())
                 }
-                ControlCommand::Quit(force) => {
+                ControlCommand::Close(force) => {
                     if self.request_id != 0 {
                         self.emitter.success(self.request_id);
                     }
@@ -566,6 +734,17 @@ wrap_task! {
                         quit_message_loop();
                     }
                     return;
+                }
+                ControlCommand::Visibility(visible) => {
+                    if let Some(host) = self.browser.host() {
+                        host.was_hidden(i32::from(!visible));
+                        if *visible {
+                            host.set_focus(1);
+                        }
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
                 }
                 ControlCommand::ReadCookies => match self.cookie_bridge.read_all(self.request_id) {
                     Ok(()) => return,
@@ -594,6 +773,82 @@ wrap_task! {
     }
 }
 
+wrap_task! {
+    struct ShutdownTask {
+        registry: Arc<BrowserRegistry>,
+        single_threaded: bool,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            self.registry.begin_shutdown();
+            for browser in self.registry.all() {
+                if let Some(host) = browser.host() {
+                    host.close_browser(1);
+                }
+            }
+            if self.single_threaded {
+                quit_message_loop();
+            }
+        }
+    }
+}
+
+fn create_browser(
+    browser_config: &BrowserConfig,
+    registry: Arc<BrowserRegistry>,
+    emitter: &ProtocolEmitter,
+    cookie_bridge: CookieBridge,
+) -> Result<(), Box<dyn Error>> {
+    registry
+        .reserve(browser_config.browser_id)
+        .map_err(|error| -> Box<dyn Error> { error.into() })?;
+    let browser_emitter = emitter.for_browser(browser_config.browser_id);
+    let life_span_handler = BrowserLifeSpanHandler::new(
+        browser_config.browser_id,
+        registry.clone(),
+        browser_emitter.clone(),
+        cookie_bridge,
+    );
+    let load_handler = BrowserLoadHandler::new(browser_emitter.clone());
+    let display_handler = BrowserDisplayHandler::new(browser_emitter.clone());
+    let request_handler = BrowserRequestHandler::new(browser_emitter);
+    let mut client = BrowserClient::new(
+        life_span_handler,
+        load_handler,
+        display_handler,
+        request_handler,
+    );
+    let cef_bounds = Rect {
+        x: browser_config.bounds.x,
+        y: browser_config.bounds.y,
+        width: browser_config.bounds.width as i32,
+        height: browser_config.bounds.height as i32,
+    };
+    let window_info = WindowInfo {
+        runtime_style: RuntimeStyle::ALLOY,
+        ..WindowInfo::default().set_as_child(browser_config.parent as _, &cef_bounds)
+    };
+    let browser_settings = BrowserSettings {
+        background_color: 0xffff_ffff,
+        ..Default::default()
+    };
+    let initial_url = CefString::from(browser_config.url.as_str());
+    if browser_host_create_browser(
+        Some(&window_info),
+        Some(&mut client),
+        Some(&initial_url),
+        Some(&browser_settings),
+        None,
+        None,
+    ) != 1
+    {
+        registry.cancel_reservation(browser_config.browser_id);
+        return Err("CEF did not accept asynchronous browser creation".into());
+    }
+    Ok(())
+}
+
 fn resize_browser(browser: &Browser) -> Result<(), Box<dyn Error>> {
     let host = browser.host().ok_or("CEF browser has no host")?;
     if host.window_handle() == 0 {
@@ -612,6 +867,9 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::LoadingEvents,
         Capability::NativeX11Surface,
         Capability::CookieSync,
+        Capability::MultipleBrowsers,
+        Capability::Visibility,
+        Capability::RendererCrashEvents,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -659,43 +917,7 @@ fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dy
             Some(wire::packet::Body::Request(request)) => request,
             _ => return Err("second shell protocol packet must be a request".into()),
         };
-        if request.browser_id == 0 {
-            return Err("browser ID must be nonzero".into());
-        }
-        let create = match request.operation {
-            Some(wire::request::Operation::CreateBrowser(create)) => create,
-            _ => return Err("first shell request must be CreateBrowser".into()),
-        };
-        let x11 = create.x11.ok_or("CreateBrowser X11 target is required")?;
-        if x11.parent_window == 0 {
-            return Err("X11 parent window must be nonzero".into());
-        }
-        if !is_valid_profile_id(&create.profile_id) {
-            return Err(format!("invalid profile ID {:?}", create.profile_id).into());
-        }
-        let profile_data_path =
-            absolute_profile_path(&create.profile_data_path, "CreateBrowser profile data path")?;
-        let profile_cache_path = absolute_profile_path(
-            &create.profile_cache_path,
-            "CreateBrowser profile cache path",
-        )?;
-        if profile_data_path == profile_cache_path {
-            return Err("profile data and cache paths must be different".into());
-        }
-        Ok(BrowserConfig {
-            request_id,
-            browser_id: request.browser_id,
-            url: if create.initial_url.is_empty() {
-                "about:blank".to_owned()
-            } else {
-                create.initial_url
-            },
-            parent: x11.parent_window,
-            bounds: bounds_from_viewport(x11.viewport)?,
-            profile_id: create.profile_id,
-            profile_data_path,
-            profile_cache_path,
-        })
+        browser_config_from_request(request_id, request)
     })();
     if let Err(error) = &parsed
         && request_id != 0
@@ -707,6 +929,52 @@ fn receive_browser_config(transport: &Transport) -> Result<BrowserConfig, Box<dy
         ))?;
     }
     parsed
+}
+
+fn browser_config_from_request(
+    request_id: u64,
+    request: wire::Request,
+) -> Result<BrowserConfig, Box<dyn Error>> {
+    if request_id == 0 {
+        return Err("CreateBrowser request ID must be nonzero".into());
+    }
+    if request.browser_id == 0 {
+        return Err("browser ID must be nonzero".into());
+    }
+    let create = match request.operation {
+        Some(wire::request::Operation::CreateBrowser(create)) => create,
+        _ => return Err("request is not CreateBrowser".into()),
+    };
+    let x11 = create.x11.ok_or("CreateBrowser X11 target is required")?;
+    if x11.parent_window == 0 {
+        return Err("X11 parent window must be nonzero".into());
+    }
+    if !is_valid_profile_id(&create.profile_id) {
+        return Err(format!("invalid profile ID {:?}", create.profile_id).into());
+    }
+    let profile_data_path =
+        absolute_profile_path(&create.profile_data_path, "CreateBrowser profile data path")?;
+    let profile_cache_path = absolute_profile_path(
+        &create.profile_cache_path,
+        "CreateBrowser profile cache path",
+    )?;
+    if profile_data_path == profile_cache_path {
+        return Err("profile data and cache paths must be different".into());
+    }
+    Ok(BrowserConfig {
+        request_id,
+        browser_id: request.browser_id,
+        url: if create.initial_url.is_empty() {
+            "about:blank".to_owned()
+        } else {
+            create.initial_url
+        },
+        parent: x11.parent_window,
+        bounds: bounds_from_viewport(x11.viewport)?,
+        profile_id: create.profile_id,
+        profile_data_path,
+        profile_cache_path,
+    })
 }
 
 fn absolute_profile_path(value: &str, description: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -742,7 +1010,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
     negotiate_protocol(&transport, engine)?;
     let browser_config = receive_browser_config(&transport)?;
     let command_transport = transport.try_clone()?;
-    let emitter = ProtocolEmitter::new(transport, browser_config.browser_id);
+    let emitter = ProtocolEmitter::new(transport);
     let runtime_path = std::env::current_exe()?
         .parent()
         .ok_or("CEF executable has no parent directory")?
@@ -822,66 +1090,31 @@ fn run() -> Result<i32, Box<dyn Error>> {
         return Err("CEF rejected the deb:// scheme handler".into());
     }
 
-    let browser_slot = Arc::new((Mutex::new(None), Condvar::new()));
-    let browser_closed = Arc::new((Mutex::new(false), Condvar::new()));
-    let cookie_bridge = CookieBridge::new(emitter.clone());
-    let life_span_handler = BrowserLifeSpanHandler::new(
-        browser_slot.clone(),
-        browser_closed.clone(),
-        emitter.clone(),
+    let registry = Arc::new(BrowserRegistry::default());
+    let cookie_bridge = CookieBridge::new(emitter.for_browser(browser_config.browser_id));
+    if let Err(error) = create_browser(
+        &browser_config,
+        registry.clone(),
+        &emitter,
         cookie_bridge.clone(),
-    );
-    let load_handler = BrowserLoadHandler::new(emitter.clone());
-    let mut client = BrowserClient::new(life_span_handler, load_handler);
-    let cef_bounds = Rect {
-        x: browser_config.bounds.x,
-        y: browser_config.bounds.y,
-        width: browser_config.bounds.width as i32,
-        height: browser_config.bounds.height as i32,
-    };
-    let window_info = WindowInfo {
-        runtime_style: RuntimeStyle::ALLOY,
-        ..WindowInfo::default().set_as_child(browser_config.parent as _, &cef_bounds)
-    };
-    let browser_settings = BrowserSettings {
-        background_color: 0xffff_ffff,
-        ..Default::default()
-    };
-    let initial_url = CefString::from(browser_config.url.as_str());
-    if browser_host_create_browser(
-        Some(&window_info),
-        Some(&mut client),
-        Some(&initial_url),
-        Some(&browser_settings),
-        None,
-        None,
-    ) != 1
-    {
+    ) {
         emitter.error(
             browser_config.request_id,
             "CREATE_REJECTED",
-            "CEF did not accept asynchronous browser creation",
+            error.to_string(),
         );
         shutdown();
-        return Err("CEF did not accept asynchronous browser creation".into());
+        return Err(error);
     }
     emitter.success(browser_config.request_id);
 
-    let command_browser = browser_slot.clone();
+    let command_registry = registry.clone();
     let command_emitter = emitter.clone();
     let command_cookie_bridge = cookie_bridge.clone();
-    let browser_id = browser_config.browser_id;
+    let profile_id = browser_config.profile_id.clone();
+    let profile_data_path = browser_config.profile_data_path.clone();
+    let profile_cache_path = browser_config.profile_cache_path.clone();
     std::thread::spawn(move || {
-        let command_browser = {
-            let (browser, ready) = &*command_browser;
-            let mut browser = browser.lock().unwrap_or_else(|error| error.into_inner());
-            while browser.is_none() {
-                browser = ready
-                    .wait(browser)
-                    .unwrap_or_else(|error| error.into_inner());
-            }
-            browser.as_ref().unwrap().clone()
-        };
         loop {
             let received = match command_transport.receive() {
                 Ok(received) => received,
@@ -906,14 +1139,76 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 command_emitter.error(0, "INVALID_REQUEST_ID", "request ID must be nonzero");
                 continue;
             }
-            if request.browser_id != browser_id {
+            if matches!(
+                request.operation.as_ref(),
+                Some(wire::request::Operation::CreateBrowser(_))
+            ) {
+                let config = match browser_config_from_request(request_id, request) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        command_emitter.error(
+                            request_id,
+                            "INVALID_CREATE_BROWSER",
+                            error.to_string(),
+                        );
+                        continue;
+                    }
+                };
+                if config.profile_id != profile_id
+                    || config.profile_data_path != profile_data_path
+                    || config.profile_cache_path != profile_cache_path
+                {
+                    command_emitter.error(
+                        request_id,
+                        "PROFILE_MISMATCH",
+                        "all browsers in a helper must use the initialized profile",
+                    );
+                    continue;
+                }
+                match create_browser(
+                    &config,
+                    command_registry.clone(),
+                    &command_emitter,
+                    command_cookie_bridge.clone(),
+                ) {
+                    Ok(()) => command_emitter.success(request_id),
+                    Err(error) => {
+                        command_emitter.error(request_id, "CREATE_REJECTED", error.to_string())
+                    }
+                }
+                continue;
+            }
+            if matches!(
+                request.operation.as_ref(),
+                Some(wire::request::Operation::Shutdown(_))
+            ) {
+                if request.browser_id != 0 {
+                    command_emitter.error(
+                        request_id,
+                        "INVALID_BROWSER_ID",
+                        "Shutdown requires browser ID zero",
+                    );
+                    continue;
+                }
+                command_emitter.success(request_id);
+                let mut task = ShutdownTask::new(command_registry.clone(), single_threaded);
+                if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+                    command_registry.begin_shutdown();
+                    if single_threaded {
+                        quit_message_loop();
+                    }
+                }
+                return;
+            }
+            let browser_id = request.browser_id;
+            let Some(command_browser) = command_registry.get(browser_id) else {
                 command_emitter.error(
                     request_id,
                     "UNKNOWN_BROWSER",
-                    format!("browser {} does not exist", request.browser_id),
+                    format!("browser {browser_id} does not exist or is not ready"),
                 );
                 continue;
-            }
+            };
             let command = match control_command(request) {
                 Ok(command) => command,
                 Err(error) => {
@@ -921,12 +1216,11 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     continue;
                 }
             };
-            let quit = matches!(command, ControlCommand::Quit(_));
             let mut task = BrowserCommandTask::new(
-                command_browser.clone(),
+                command_browser,
                 command,
                 request_id,
-                command_emitter.clone(),
+                command_emitter.for_browser(browser_id),
                 command_cookie_bridge.clone(),
             );
             if post_task(ThreadId::UI, Some(&mut task)) != 1 {
@@ -937,38 +1231,21 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 );
                 break;
             }
-            if quit {
-                return;
-            }
         }
-        let mut task = BrowserCommandTask::new(
-            command_browser,
-            ControlCommand::Quit(true),
-            0,
-            command_emitter,
-            command_cookie_bridge,
-        );
+        let mut task = ShutdownTask::new(command_registry.clone(), single_threaded);
         let _ = post_task(ThreadId::UI, Some(&mut task));
     });
 
     if single_threaded {
         run_message_loop();
     } else {
-        let (closed, wakeup) = &*browser_closed;
-        let mut closed = closed.lock().unwrap_or_else(|error| error.into_inner());
-        while !*closed {
-            closed = wakeup
-                .wait(closed)
-                .unwrap_or_else(|error| error.into_inner());
+        registry.wait_for_shutdown();
+        let close_deadline = Instant::now() + Duration::from_secs(3);
+        while !registry.all().is_empty() && Instant::now() < close_deadline {
+            sleep(Duration::from_millis(10));
         }
     }
 
-    browser_slot
-        .0
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .take();
-    drop(client);
     cookie_bridge.shutdown();
     shutdown();
     Ok(0)

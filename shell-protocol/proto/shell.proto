@@ -17,6 +17,9 @@ enum Capability {
   CAPABILITY_LOADING_EVENTS = 5;
   CAPABILITY_NATIVE_X11_SURFACE = 6;
   CAPABILITY_COOKIE_SYNC = 7;
+  CAPABILITY_MULTIPLE_BROWSERS = 8;
+  CAPABILITY_VISIBILITY = 9;
+  CAPABILITY_RENDERER_CRASH_EVENTS = 10;
 }
 
 message Packet {
@@ -57,6 +60,8 @@ message Request {
     ReadCookies read_cookies = 16;
     SetCookie set_cookie = 17;
     DeleteCookie delete_cookie = 18;
+    SetVisibility set_visibility = 19;
+    Shutdown shutdown = 20;
   }
 }
 
@@ -108,6 +113,12 @@ message SetCookie {
 message DeleteCookie {
   Cookie cookie = 1;
 }
+
+message SetVisibility {
+  bool visible = 1;
+}
+
+message Shutdown {}
 
 message Response {
   oneof result {
