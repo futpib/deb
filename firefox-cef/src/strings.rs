@@ -1,4 +1,6 @@
-use cef_dll_sys::{cef_string_utf8_t, cef_string_utf16_t, char16_t};
+use cef_dll_sys::{
+    cef_string_list_t, cef_string_t, cef_string_utf8_t, cef_string_utf16_t, char16_t,
+};
 use libc::{c_char, c_void};
 use std::{mem::size_of, ptr, slice};
 
@@ -155,6 +157,76 @@ pub unsafe fn cef_string_to_string(value: *const cef_string_utf16_t) -> Option<S
     String::from_utf16(unsafe { slice::from_raw_parts(value.str_, value.length) }).ok()
 }
 
+type StringList = Vec<Vec<char16_t>>;
+
+unsafe fn string_list<'a>(list: cef_string_list_t) -> Option<&'a mut StringList> {
+    unsafe { list.cast::<StringList>().as_mut() }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_string_list_alloc() -> cef_string_list_t {
+    Box::into_raw(Box::new(StringList::new())).cast()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cef_string_list_size(list: cef_string_list_t) -> usize {
+    unsafe { string_list(list) }.map_or(0, |list| list.len())
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cef_string_list_value(
+    list: cef_string_list_t,
+    index: usize,
+    value: *mut cef_string_t,
+) -> i32 {
+    let Some(entry) = (unsafe { string_list(list) }).and_then(|list| list.get(index)) else {
+        return 0;
+    };
+    unsafe { cef_string_utf16_set(entry.as_ptr(), entry.len(), value, 1) }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cef_string_list_append(
+    list: cef_string_list_t,
+    value: *const cef_string_t,
+) {
+    let Some(list) = (unsafe { string_list(list) }) else {
+        return;
+    };
+    let Some(value) = (unsafe { value.as_ref() }) else {
+        return;
+    };
+    if value.str_.is_null() {
+        if value.length == 0 {
+            list.push(Vec::new());
+        }
+        return;
+    }
+    list.push(unsafe { slice::from_raw_parts(value.str_, value.length) }.to_vec());
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cef_string_list_clear(list: cef_string_list_t) {
+    if let Some(list) = unsafe { string_list(list) } {
+        list.clear();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cef_string_list_free(list: cef_string_list_t) {
+    if !list.is_null() {
+        drop(unsafe { Box::from_raw(list.cast::<StringList>()) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn cef_string_list_copy(list: cef_string_list_t) -> cef_string_list_t {
+    let Some(list) = (unsafe { string_list(list) }) else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(list.clone())).cast()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +276,33 @@ mod tests {
             assert!(borrowed.dtor.is_none());
             cef_string_utf16_clear(&mut copied);
             cef_string_utf16_clear(&mut borrowed);
+        }
+    }
+
+    #[test]
+    fn owns_and_copies_string_lists() {
+        unsafe {
+            let list = cef_string_list_alloc();
+            let encoded = "first".encode_utf16().collect::<Vec<_>>();
+            let value = cef_string_t {
+                str_: encoded.as_ptr().cast_mut(),
+                length: encoded.len(),
+                dtor: None,
+            };
+            cef_string_list_append(list, &value);
+            assert_eq!(cef_string_list_size(list), 1);
+
+            let copy = cef_string_list_copy(list);
+            cef_string_list_clear(list);
+            assert_eq!(cef_string_list_size(list), 0);
+            assert_eq!(cef_string_list_size(copy), 1);
+
+            let mut output = std::mem::zeroed::<cef_string_t>();
+            assert_eq!(cef_string_list_value(copy, 0, &mut output), 1);
+            assert_eq!(cef_string_to_string(&output).as_deref(), Some("first"));
+            cef_string_utf16_clear(&mut output);
+            cef_string_list_free(copy);
+            cef_string_list_free(list);
         }
     }
 }

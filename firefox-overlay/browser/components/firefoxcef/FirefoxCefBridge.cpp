@@ -7,8 +7,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <strings.h>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "XREChildData.h"
 #include "mozilla/Bootstrap.h"
@@ -61,10 +64,14 @@ struct FirefoxCefCallbacks {
   void* context;
   void (*onAfterCreated)(void* context, int32_t browserId,
                          uint64_t nativeWindow);
+  void (*onAddressChange)(void* context, int32_t browserId, const char* url);
+  void (*onTitleChange)(void* context, int32_t browserId, const char* title);
   void (*onLoadingStateChange)(void* context, int32_t browserId,
                                uint8_t loading);
   void (*onLoadError)(void* context, int32_t browserId, int32_t errorCode,
                       const char* errorText, const char* failedUrl);
+  void (*onBrowserCrashed)(void* context, int32_t browserId,
+                           const char* reason);
   void (*onBeforeClose)(void* context, int32_t browserId);
   void (*onCookieChanged)(void* context, const FirefoxCefCookie* cookie,
                           uint8_t action);
@@ -75,12 +82,15 @@ FirefoxCefCallbacks sCallbacks;
 uint32_t sBrowserId;
 uint32_t sInitialWidth = 2;
 uint32_t sInitialHeight = 2;
+uint64_t sParentWindow;
 uint64_t sNativeWindow;
 nsCString sInitialUrl;
 bool sRuntimeReady;
-bool sAfterCreated;
-bool sBeforeClose;
 bool sObservingCookies;
+std::map<uint32_t, nsCString> sConfiguredBrowsers;
+std::unordered_set<uint32_t> sReadyBrowsers;
+std::unordered_set<uint32_t> sAfterCreatedBrowsers;
+std::unordered_set<uint32_t> sBeforeCloseBrowsers;
 
 class CookieView {
  public:
@@ -200,31 +210,37 @@ void DispatchCookieCompletion(FirefoxCefCookieCompletion aCompletion,
       }));
 }
 
-FirefoxCefCallbacks Callbacks(uint32_t* aBrowserId = nullptr) {
+FirefoxCefCallbacks Callbacks() {
   mozilla::StaticMutexAutoLock lock(sMutex);
-  if (aBrowserId) {
-    *aBrowserId = sBrowserId;
-  }
   return sCallbacks;
 }
 
-void MaybeFireAfterCreated() {
+void MaybeFireAfterCreated(uint32_t aBrowserId) {
   FirefoxCefCallbacks callbacks;
-  uint32_t browserId;
   uint64_t nativeWindow;
   {
     mozilla::StaticMutexAutoLock lock(sMutex);
-    if (sAfterCreated || !sRuntimeReady || !sNativeWindow) {
+    if (sAfterCreatedBrowsers.find(aBrowserId) !=
+            sAfterCreatedBrowsers.end() ||
+        !sRuntimeReady || !sNativeWindow ||
+        sReadyBrowsers.find(aBrowserId) == sReadyBrowsers.end() ||
+        sConfiguredBrowsers.find(aBrowserId) == sConfiguredBrowsers.end()) {
       return;
     }
-    sAfterCreated = true;
+    sAfterCreatedBrowsers.insert(aBrowserId);
     callbacks = sCallbacks;
-    browserId = sBrowserId;
     nativeWindow = sNativeWindow;
   }
   if (callbacks.onAfterCreated) {
-    callbacks.onAfterCreated(callbacks.context, browserId, nativeWindow);
+    callbacks.onAfterCreated(callbacks.context, aBrowserId, nativeWindow);
   }
+}
+
+nsCString BrowserCommand(const char* aName, uint32_t aBrowserId) {
+  nsAutoCString command(aName);
+  command.Append('\t');
+  command.AppendInt(aBrowserId);
+  return command;
 }
 
 void NotifyCommand(nsCString aCommand) {
@@ -299,9 +315,15 @@ NS_IMETHODIMP FirefoxCefBridge::GetInitialHeight(uint32_t* aInitialHeight) {
 }
 
 NS_IMETHODIMP FirefoxCefBridge::RuntimeReady() {
+  std::vector<std::pair<uint32_t, nsCString>> pendingBrowsers;
   {
     StaticMutexAutoLock lock(sMutex);
     sRuntimeReady = true;
+    for (const auto& [browserId, url] : sConfiguredBrowsers) {
+      if (browserId != sBrowserId) {
+        pendingBrowsers.emplace_back(browserId, url);
+      }
+    }
   }
   nsCOMPtr<nsIObserverService> observerService =
       mozilla::services::GetObserverService();
@@ -311,7 +333,44 @@ NS_IMETHODIMP FirefoxCefBridge::RuntimeReady() {
       sObservingCookies = true;
     }
   }
-  MaybeFireAfterCreated();
+  for (const auto& [browserId, url] : pendingBrowsers) {
+    nsCString command = BrowserCommand("create", browserId);
+    command.Append('\t');
+    command.Append(url);
+    NotifyCommand(std::move(command));
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::BrowserReady(uint32_t aBrowserId) {
+  {
+    StaticMutexAutoLock lock(sMutex);
+    if (sConfiguredBrowsers.find(aBrowserId) == sConfiguredBrowsers.end()) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    sReadyBrowsers.insert(aBrowserId);
+  }
+  MaybeFireAfterCreated(aBrowserId);
+  return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::AddressChanged(uint32_t aBrowserId,
+                                               const nsACString& aUrl) {
+  FirefoxCefCallbacks callbacks = Callbacks();
+  if (callbacks.onAddressChange) {
+    callbacks.onAddressChange(callbacks.context, aBrowserId,
+                              PromiseFlatCString(aUrl).get());
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::TitleChanged(uint32_t aBrowserId,
+                                             const nsACString& aTitle) {
+  FirefoxCefCallbacks callbacks = Callbacks();
+  if (callbacks.onTitleChange) {
+    callbacks.onTitleChange(callbacks.context, aBrowserId,
+                            PromiseFlatCString(aTitle).get());
+  }
   return NS_OK;
 }
 
@@ -363,42 +422,50 @@ NS_IMETHODIMP FirefoxCefBridge::Observe(nsISupports* aSubject,
   return NS_OK;
 }
 
-NS_IMETHODIMP FirefoxCefBridge::LoadingStateChanged(bool aLoading) {
-  uint32_t browserId;
-  FirefoxCefCallbacks callbacks = Callbacks(&browserId);
+NS_IMETHODIMP FirefoxCefBridge::LoadingStateChanged(uint32_t aBrowserId,
+                                                    bool aLoading) {
+  FirefoxCefCallbacks callbacks = Callbacks();
   if (callbacks.onLoadingStateChange) {
-    callbacks.onLoadingStateChange(callbacks.context, browserId, aLoading);
+    callbacks.onLoadingStateChange(callbacks.context, aBrowserId, aLoading);
   }
   return NS_OK;
 }
 
-NS_IMETHODIMP FirefoxCefBridge::LoadError(int32_t aErrorCode,
+NS_IMETHODIMP FirefoxCefBridge::LoadError(uint32_t aBrowserId,
+                                          int32_t aErrorCode,
                                           const nsACString& aErrorText,
                                           const nsACString& aFailedUrl) {
-  uint32_t browserId;
-  FirefoxCefCallbacks callbacks = Callbacks(&browserId);
+  FirefoxCefCallbacks callbacks = Callbacks();
   if (callbacks.onLoadError) {
-    callbacks.onLoadError(callbacks.context, browserId, aErrorCode,
+    callbacks.onLoadError(callbacks.context, aBrowserId, aErrorCode,
                           PromiseFlatCString(aErrorText).get(),
                           PromiseFlatCString(aFailedUrl).get());
   }
   return NS_OK;
 }
 
-NS_IMETHODIMP FirefoxCefBridge::BeforeClose() {
+NS_IMETHODIMP FirefoxCefBridge::BrowserCrashed(uint32_t aBrowserId,
+                                               const nsACString& aReason) {
+  FirefoxCefCallbacks callbacks = Callbacks();
+  if (callbacks.onBrowserCrashed) {
+    callbacks.onBrowserCrashed(callbacks.context, aBrowserId,
+                               PromiseFlatCString(aReason).get());
+  }
+  return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::BeforeClose(uint32_t aBrowserId) {
   FirefoxCefCallbacks callbacks;
-  uint32_t browserId;
   {
     StaticMutexAutoLock lock(sMutex);
-    if (sBeforeClose) {
+    if (sBeforeCloseBrowsers.find(aBrowserId) != sBeforeCloseBrowsers.end()) {
       return NS_OK;
     }
-    sBeforeClose = true;
+    sBeforeCloseBrowsers.insert(aBrowserId);
     callbacks = sCallbacks;
-    browserId = sBrowserId;
   }
   if (callbacks.onBeforeClose) {
-    callbacks.onBeforeClose(callbacks.context, browserId);
+    callbacks.onBeforeClose(callbacks.context, aBrowserId);
   }
   return NS_OK;
 }
@@ -418,20 +485,42 @@ extern "C" NS_EXPORT void firefox_cef_gecko_set_callbacks(
 extern "C" NS_EXPORT int firefox_cef_gecko_configure(
     uint32_t aBrowserId, uint64_t aParentWindow, uint32_t aWidth,
     uint32_t aHeight, const char* aInitialUrl) {
+  bool initialBrowser;
+  bool runtimeReady;
+  nsAutoCString url(aInitialUrl ? aInitialUrl : "about:blank");
   {
     mozilla::StaticMutexAutoLock lock(sMutex);
-    sBrowserId = aBrowserId;
-    sInitialWidth = std::max(aWidth, 2U);
-    sInitialHeight = std::max(aHeight, 2U);
-    sInitialUrl.Assign(aInitialUrl ? aInitialUrl : "about:blank");
-    sNativeWindow = 0;
-    sRuntimeReady = false;
-    sAfterCreated = false;
-    sBeforeClose = false;
+    if (!aBrowserId ||
+        sConfiguredBrowsers.find(aBrowserId) != sConfiguredBrowsers.end()) {
+      return 0;
+    }
+    initialBrowser = sConfiguredBrowsers.empty();
+    if (!initialBrowser && aParentWindow != sParentWindow) {
+      return 0;
+    }
+    sConfiguredBrowsers.emplace(aBrowserId, url);
+    runtimeReady = sRuntimeReady;
+    if (initialBrowser) {
+      sBrowserId = aBrowserId;
+      sParentWindow = aParentWindow;
+      sInitialWidth = std::max(aWidth, 2U);
+      sInitialHeight = std::max(aHeight, 2U);
+      sInitialUrl = url;
+      sNativeWindow = 0;
+    }
   }
-  nsAutoCString parent;
-  parent.AppendInt(aParentWindow);
-  return setenv("FIREFOX_CEF_PARENT_XID", parent.get(), 1) == 0;
+  if (initialBrowser) {
+    nsAutoCString parent;
+    parent.AppendInt(aParentWindow);
+    return setenv("FIREFOX_CEF_PARENT_XID", parent.get(), 1) == 0;
+  }
+  if (runtimeReady) {
+    nsCString command = BrowserCommand("create", aBrowserId);
+    command.Append('\t');
+    command.Append(url);
+    NotifyCommand(std::move(command));
+  }
+  return 1;
 }
 
 extern "C" NS_EXPORT void firefox_cef_gecko_set_native_window(
@@ -440,7 +529,14 @@ extern "C" NS_EXPORT void firefox_cef_gecko_set_native_window(
     mozilla::StaticMutexAutoLock lock(sMutex);
     sNativeWindow = aNativeWindow;
   }
-  MaybeFireAfterCreated();
+  std::vector<uint32_t> readyBrowsers;
+  {
+    mozilla::StaticMutexAutoLock lock(sMutex);
+    readyBrowsers.assign(sReadyBrowsers.begin(), sReadyBrowsers.end());
+  }
+  for (uint32_t browserId : readyBrowsers) {
+    MaybeFireAfterCreated(browserId);
+  }
 }
 
 extern "C" NS_EXPORT int firefox_cef_gecko_visit_cookies(
@@ -516,28 +612,48 @@ extern "C" NS_EXPORT int firefox_cef_gecko_delete_cookie(
   return 1;
 }
 
-extern "C" NS_EXPORT int firefox_cef_gecko_navigate(const char* aUrl) {
+extern "C" NS_EXPORT int firefox_cef_gecko_navigate(uint32_t aBrowserId,
+                                                     const char* aUrl) {
   if (!aUrl) {
     return 0;
   }
-  nsAutoCString command("navigate\t");
+  nsCString command = BrowserCommand("navigate", aBrowserId);
+  command.Append('\t');
   command.Append(aUrl);
   NotifyCommand(std::move(command));
   return 1;
 }
 
-extern "C" NS_EXPORT int firefox_cef_gecko_reload() {
-  NotifyCommand(nsCString("reload"));
+extern "C" NS_EXPORT int firefox_cef_gecko_reload(uint32_t aBrowserId) {
+  NotifyCommand(BrowserCommand("reload", aBrowserId));
   return 1;
 }
 
-extern "C" NS_EXPORT int firefox_cef_gecko_focus() {
-  NotifyCommand(nsCString("focus"));
+extern "C" NS_EXPORT int firefox_cef_gecko_focus(uint32_t aBrowserId) {
+  NotifyCommand(BrowserCommand("focus", aBrowserId));
   return 1;
 }
 
-extern "C" NS_EXPORT int firefox_cef_gecko_close() {
-  NotifyCommand(nsCString("close"));
+extern "C" NS_EXPORT int firefox_cef_gecko_set_visibility(
+    uint32_t aBrowserId, uint8_t aVisible) {
+  nsCString command = BrowserCommand("visibility", aBrowserId);
+  command.Append('\t');
+  command.Append(aVisible ? '1' : '0');
+  NotifyCommand(std::move(command));
+  return 1;
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_close(uint32_t aBrowserId,
+                                                  uint8_t aForce) {
+  nsCString command = BrowserCommand("close", aBrowserId);
+  command.Append('\t');
+  command.Append(aForce ? '1' : '0');
+  NotifyCommand(std::move(command));
+  return 1;
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_shutdown() {
+  NotifyCommand(nsCString("shutdown\t0"));
   return 1;
 }
 

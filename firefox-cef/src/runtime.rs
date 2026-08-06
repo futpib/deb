@@ -1,6 +1,6 @@
 use cef_dll_sys::{
     _cef_browser_host_t, _cef_browser_t, _cef_client_t, _cef_frame_t, _cef_task_t, cef_errorcode_t,
-    cef_main_args_t, cef_string_t,
+    cef_main_args_t, cef_string_t, cef_termination_status_t, cef_transition_type_t,
 };
 use libc::{c_char, c_int, c_void};
 use std::{
@@ -29,9 +29,12 @@ struct FirefoxCefCallbacks {
     size: usize,
     context: *mut c_void,
     on_after_created: Option<unsafe extern "C" fn(*mut c_void, i32, u64)>,
+    on_address_change: Option<unsafe extern "C" fn(*mut c_void, i32, *const c_char)>,
+    on_title_change: Option<unsafe extern "C" fn(*mut c_void, i32, *const c_char)>,
     on_loading_state_change: Option<unsafe extern "C" fn(*mut c_void, i32, u8)>,
     on_load_error:
         Option<unsafe extern "C" fn(*mut c_void, i32, i32, *const c_char, *const c_char)>,
+    on_browser_crashed: Option<unsafe extern "C" fn(*mut c_void, i32, *const c_char)>,
     on_before_close: Option<unsafe extern "C" fn(*mut c_void, i32)>,
     on_cookie_changed: Option<unsafe extern "C" fn(*mut c_void, *const FirefoxCefCookie, u8)>,
 }
@@ -58,7 +61,9 @@ pub struct FirefoxCefCookie {
 type SetCallbacks = unsafe extern "C" fn(*const FirefoxCefCallbacks);
 type Configure = unsafe extern "C" fn(u32, u64, u32, u32, *const c_char) -> c_int;
 type Command = unsafe extern "C" fn() -> c_int;
-type StringCommand = unsafe extern "C" fn(*const c_char) -> c_int;
+type BrowserCommand = unsafe extern "C" fn(u32) -> c_int;
+type BrowserBoolCommand = unsafe extern "C" fn(u32, u8) -> c_int;
+type BrowserStringCommand = unsafe extern "C" fn(u32, *const c_char) -> c_int;
 type PostTask =
     unsafe extern "C" fn(Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void) -> c_int;
 pub type CookieVisitor = unsafe extern "C" fn(*mut c_void, *const FirefoxCefCookie);
@@ -73,10 +78,12 @@ struct GeckoApi {
     _libxul: usize,
     set_callbacks: SetCallbacks,
     configure: Configure,
-    navigate: StringCommand,
-    reload: Command,
-    focus: Command,
-    close: Command,
+    navigate: BrowserStringCommand,
+    reload: BrowserCommand,
+    focus: BrowserCommand,
+    set_visibility: BrowserBoolCommand,
+    close: BrowserBoolCommand,
+    shutdown: Command,
     post_task: PostTask,
     visit_cookies: VisitCookies,
     set_cookie: MutateCookie,
@@ -101,7 +108,9 @@ impl GeckoApi {
             navigate: unsafe { symbol(libxul, b"firefox_cef_gecko_navigate\0")? },
             reload: unsafe { symbol(libxul, b"firefox_cef_gecko_reload\0")? },
             focus: unsafe { symbol(libxul, b"firefox_cef_gecko_focus\0")? },
+            set_visibility: unsafe { symbol(libxul, b"firefox_cef_gecko_set_visibility\0")? },
             close: unsafe { symbol(libxul, b"firefox_cef_gecko_close\0")? },
+            shutdown: unsafe { symbol(libxul, b"firefox_cef_gecko_shutdown\0")? },
             post_task: unsafe { symbol(libxul, b"firefox_cef_gecko_post_task\0")? },
             visit_cookies: unsafe { symbol(libxul, b"firefox_cef_gecko_visit_cookies\0")? },
             set_cookie: unsafe { symbol(libxul, b"firefox_cef_gecko_set_cookie\0")? },
@@ -113,6 +122,18 @@ impl GeckoApi {
     fn command(&self, command: Command, name: &str) -> RuntimeResult<()> {
         if unsafe { command() } == 0 {
             return Err(format!("Gecko rejected {name}").into());
+        }
+        Ok(())
+    }
+
+    fn browser_command(
+        &self,
+        command: BrowserCommand,
+        browser_id: i32,
+        name: &str,
+    ) -> RuntimeResult<()> {
+        if unsafe { command(browser_id as u32) } == 0 {
+            return Err(format!("Gecko rejected {name} for browser {browser_id}").into());
         }
         Ok(())
     }
@@ -167,6 +188,12 @@ fn find_state(id: i32) -> Option<Arc<BrowserState>> {
         .iter()
         .find(|state| state.id == id)
         .cloned()
+}
+
+fn remove_state(id: i32) -> Option<Arc<BrowserState>> {
+    let mut states = states().lock().unwrap_or_else(|error| error.into_inner());
+    let position = states.iter().position(|state| state.id == id)?;
+    Some(states.remove(position))
 }
 
 fn app_ini_path() -> RuntimeResult<PathBuf> {
@@ -276,8 +303,11 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
         size: mem::size_of::<FirefoxCefCallbacks>(),
         context: ptr::null_mut(),
         on_after_created: Some(on_after_created),
+        on_address_change: Some(on_address_change),
+        on_title_change: Some(on_title_change),
         on_loading_state_change: Some(on_loading_state_change),
         on_load_error: Some(on_load_error),
+        on_browser_crashed: Some(on_browser_crashed),
         on_before_close: Some(on_before_close),
         on_cookie_changed: Some(on_cookie_changed),
     };
@@ -369,7 +399,7 @@ pub unsafe fn delete_cookie(
 
 pub fn quit_message_loop() {
     if let Ok(api) = gecko()
-        && let Err(error) = api.command(api.close, "message-loop quit")
+        && let Err(error) = api.command(api.shutdown, "message-loop quit")
     {
         eprintln!("firefox-cef: message-loop quit failed: {error}");
     }
@@ -436,7 +466,7 @@ impl BrowserState {
             return Err("browser is closed".into());
         }
         let url = CString::new(url)?;
-        if unsafe { (gecko()?.navigate)(url.as_ptr()) } == 0 {
+        if unsafe { (gecko()?.navigate)(self.id as u32, url.as_ptr()) } == 0 {
             return Err("Gecko rejected navigation".into());
         }
         *self
@@ -448,12 +478,19 @@ impl BrowserState {
 
     pub fn reload(&self) -> RuntimeResult<()> {
         let api = gecko()?;
-        api.command(api.reload, "reload")
+        api.browser_command(api.reload, self.id, "reload")
     }
 
     pub fn focus(&self) -> RuntimeResult<()> {
         let api = gecko()?;
-        api.command(api.focus, "focus")
+        api.browser_command(api.focus, self.id, "focus")
+    }
+
+    pub fn set_visible(&self, visible: bool) -> RuntimeResult<()> {
+        if unsafe { (gecko()?.set_visibility)(self.id as u32, u8::from(visible)) } == 0 {
+            return Err(format!("Gecko rejected visibility for browser {}", self.id).into());
+        }
+        Ok(())
     }
 
     pub fn sync_from_parent(&self, focus: bool) -> RuntimeResult<()> {
@@ -482,14 +519,15 @@ impl BrowserState {
         Ok(())
     }
 
-    pub fn close(&self) {
+    pub fn close(&self, force: bool) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        if let Ok(api) = gecko()
-            && let Err(error) = api.command(api.close, "close")
-        {
-            eprintln!("firefox-cef: close failed: {error}");
+        if let Ok(api) = gecko() {
+            let accepted = unsafe { (api.close)(self.id as u32, u8::from(force)) } != 0;
+            if !accepted {
+                eprintln!("firefox-cef: close failed for browser {}", self.id);
+            }
         }
     }
 
@@ -517,6 +555,111 @@ impl BrowserState {
             if let Some(callback) = (*handler).on_after_created {
                 add_ref_raw(browser);
                 callback(handler, browser);
+            }
+            release_raw(handler);
+        }
+    }
+
+    pub fn notify_address(&self, url: &str) {
+        *self
+            .current_url
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = url.to_owned();
+        let client = self.client.load(Ordering::Acquire);
+        let browser = self.browser.load(Ordering::Acquire);
+        let frame = self.frame.load(Ordering::Acquire);
+        if client.is_null() || browser.is_null() || frame.is_null() {
+            return;
+        }
+        let mut url = url.encode_utf16().collect::<Vec<_>>();
+        let url = cef_string_t {
+            str_: url.as_mut_ptr(),
+            length: url.len(),
+            dtor: None,
+        };
+        unsafe {
+            if let Some(get_handler) = (*client).get_load_handler {
+                let handler = get_handler(client);
+                if !handler.is_null() {
+                    if let Some(callback) = (*handler).on_load_start {
+                        add_ref_raw(browser);
+                        add_ref_raw(frame);
+                        callback(handler, browser, frame, cef_transition_type_t::TT_EXPLICIT);
+                    }
+                    release_raw(handler);
+                }
+            }
+            if let Some(get_handler) = (*client).get_display_handler {
+                let handler = get_handler(client);
+                if !handler.is_null() {
+                    if let Some(callback) = (*handler).on_address_change {
+                        add_ref_raw(browser);
+                        add_ref_raw(frame);
+                        callback(handler, browser, frame, &url);
+                    }
+                    release_raw(handler);
+                }
+            }
+        }
+    }
+
+    pub fn notify_title(&self, title: &str) {
+        let client = self.client.load(Ordering::Acquire);
+        let browser = self.browser.load(Ordering::Acquire);
+        if client.is_null() || browser.is_null() {
+            return;
+        }
+        let mut title = title.encode_utf16().collect::<Vec<_>>();
+        let title = cef_string_t {
+            str_: title.as_mut_ptr(),
+            length: title.len(),
+            dtor: None,
+        };
+        unsafe {
+            let Some(get_handler) = (*client).get_display_handler else {
+                return;
+            };
+            let handler = get_handler(client);
+            if handler.is_null() {
+                return;
+            }
+            if let Some(callback) = (*handler).on_title_change {
+                add_ref_raw(browser);
+                callback(handler, browser, &title);
+            }
+            release_raw(handler);
+        }
+    }
+
+    pub fn notify_crashed(&self, reason: &str) {
+        let client = self.client.load(Ordering::Acquire);
+        let browser = self.browser.load(Ordering::Acquire);
+        if client.is_null() || browser.is_null() {
+            return;
+        }
+        let mut reason = reason.encode_utf16().collect::<Vec<_>>();
+        let reason = cef_string_t {
+            str_: reason.as_mut_ptr(),
+            length: reason.len(),
+            dtor: None,
+        };
+        unsafe {
+            let Some(get_handler) = (*client).get_request_handler else {
+                return;
+            };
+            let handler = get_handler(client);
+            if handler.is_null() {
+                return;
+            }
+            if let Some(callback) = (*handler).on_render_process_terminated {
+                add_ref_raw(browser);
+                callback(
+                    handler,
+                    browser,
+                    cef_termination_status_t::TS_PROCESS_CRASHED,
+                    0,
+                    &reason,
+                );
             }
             release_raw(handler);
         }
@@ -641,6 +784,18 @@ unsafe extern "C" fn on_loading_state_change(_context: *mut c_void, id: i32, loa
     }
 }
 
+unsafe extern "C" fn on_address_change(_context: *mut c_void, id: i32, url: *const c_char) {
+    if let Some(state) = find_state(id) {
+        state.notify_address(&c_string(url));
+    }
+}
+
+unsafe extern "C" fn on_title_change(_context: *mut c_void, id: i32, title: *const c_char) {
+    if let Some(state) = find_state(id) {
+        state.notify_title(&c_string(title));
+    }
+}
+
 unsafe extern "C" fn on_load_error(
     _context: *mut c_void,
     id: i32,
@@ -651,26 +806,31 @@ unsafe extern "C" fn on_load_error(
     let Some(state) = find_state(id) else {
         return;
     };
-    let error_text = if error_text.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(error_text) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    let failed_url = if failed_url.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(failed_url) }
-            .to_string_lossy()
-            .into_owned()
-    };
+    let error_text = c_string(error_text);
+    let failed_url = c_string(failed_url);
     state.notify_load_error(&error_text, &failed_url);
 }
 
-unsafe extern "C" fn on_before_close(_context: *mut c_void, id: i32) {
+unsafe extern "C" fn on_browser_crashed(_context: *mut c_void, id: i32, reason: *const c_char) {
     if let Some(state) = find_state(id) {
+        state.notify_crashed(&c_string(reason));
+    }
+}
+
+fn c_string(value: *const c_char) -> String {
+    if value.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+unsafe extern "C" fn on_before_close(_context: *mut c_void, id: i32) {
+    if let Some(state) = remove_state(id) {
         state.notify_before_close();
+        state.release_objects();
     }
 }
 

@@ -85,12 +85,12 @@ unsafe extern "C" fn host_get_browser(host: *mut _cef_browser_host_t) -> *mut _c
     browser
 }
 
-unsafe extern "C" fn host_close_browser(host: *mut _cef_browser_host_t, _force: c_int) {
-    state_from(host).close();
+unsafe extern "C" fn host_close_browser(host: *mut _cef_browser_host_t, force: c_int) {
+    state_from(host).close(force != 0);
 }
 
 unsafe extern "C" fn host_try_close_browser(host: *mut _cef_browser_host_t) -> c_int {
-    state_from(host).close();
+    state_from(host).close(false);
     1
 }
 
@@ -119,6 +119,12 @@ unsafe extern "C" fn host_get_client(host: *mut _cef_browser_host_t) -> *mut _ce
 unsafe extern "C" fn host_notify_resize(host: *mut _cef_browser_host_t) {
     if let Err(error) = state_from(host).sync_from_parent(false) {
         eprintln!("firefox-cef: resize failed: {error}");
+    }
+}
+
+unsafe extern "C" fn host_was_hidden(host: *mut _cef_browser_host_t, hidden: c_int) {
+    if let Err(error) = state_from(host).set_visible(hidden == 0) {
+        eprintln!("firefox-cef: visibility update failed: {error}");
     }
 }
 
@@ -155,6 +161,7 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     host.get_window_handle = Some(host_get_window_handle);
     host.get_client = Some(host_get_client);
     host.notify_move_or_resize_started = Some(host_notify_resize);
+    host.was_hidden = Some(host_was_hidden);
     let host = RefObject::allocate(host, state.clone());
     state.host.store(host, Ordering::Release);
 

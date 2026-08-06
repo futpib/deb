@@ -6,28 +6,7 @@ const bridge = Cc[
   "@deb.local/firefox-cef-bridge;1"
 ].getService(Ci.nsIFirefoxCefBridge);
 
-const progressListener = {
-  QueryInterface: ChromeUtils.generateQI([
-    "nsIWebProgressListener",
-    "nsISupportsWeakReference",
-  ]),
-
-  onStateChange(webProgress, request, stateFlags, status) {
-    if (!(stateFlags & Ci.nsIWebProgressListener.STATE_IS_NETWORK)) {
-      return;
-    }
-    if (stateFlags & Ci.nsIWebProgressListener.STATE_START) {
-      bridge.loadingStateChanged(true);
-    }
-    if (stateFlags & Ci.nsIWebProgressListener.STATE_STOP) {
-      bridge.loadingStateChanged(false);
-      if (!Components.isSuccessCode(status) && status != Cr.NS_BINDING_ABORTED) {
-        const failedUrl = request?.URI?.spec ?? "";
-        bridge.loadError(status, Components.Exception("", status).name, failedUrl);
-      }
-    }
-  },
-};
+const browsers = new Map();
 
 function loadUrl(browser, url) {
   browser.loadURI(Services.io.newURI(url), {
@@ -35,36 +14,164 @@ function loadUrl(browser, url) {
   });
 }
 
-window.addEventListener("load", () => {
-  const browser = document.getElementById("content");
+function activateBrowser(browser) {
+  for (const entry of browsers.values()) {
+    const active = entry.browser == browser;
+    entry.browser.docShellIsActive = active;
+    entry.browser.hidden = !active;
+  }
+  document.getElementById("browsers").selectedPanel = browser;
+}
+
+function createBrowser(browserId, initialUrl) {
+  if (!browserId || browsers.has(browserId)) {
+    return;
+  }
+
+  const browser = document.createXULElement("browser");
+  browser.id = `content-${browserId}`;
+  browser.setAttribute("type", "content");
+  browser.setAttribute("primary", "true");
+  browser.setAttribute("remote", "true");
+  browser.setAttribute("remoteType", "web");
+  browser.setAttribute("maychangeremoteness", "true");
+  browser.setAttribute("flex", "1");
+
+  const progressListener = {
+    QueryInterface: ChromeUtils.generateQI([
+      "nsIWebProgressListener",
+      "nsISupportsWeakReference",
+    ]),
+
+    onLocationChange(webProgress, request, location) {
+      if (webProgress.isTopLevel && location) {
+        bridge.addressChanged(browserId, location.spec);
+      }
+    },
+
+    onStateChange(webProgress, request, stateFlags, status) {
+      if (!(stateFlags & Ci.nsIWebProgressListener.STATE_IS_NETWORK)) {
+        return;
+      }
+      if (stateFlags & Ci.nsIWebProgressListener.STATE_START) {
+        bridge.loadingStateChanged(browserId, true);
+      }
+      if (stateFlags & Ci.nsIWebProgressListener.STATE_STOP) {
+        bridge.loadingStateChanged(browserId, false);
+        if (!Components.isSuccessCode(status) && status != Cr.NS_BINDING_ABORTED) {
+          const failedUrl = request?.URI?.spec ?? "";
+          bridge.loadError(
+            browserId,
+            status,
+            Components.Exception("", status).name,
+            failedUrl
+          );
+        }
+      }
+    },
+  };
+
+  const titleListener = () => {
+    bridge.titleChanged(browserId, browser.contentTitle ?? "");
+  };
+  const crashListener = () => {
+    bridge.browserCrashed(browserId, "Gecko content process terminated");
+  };
+
+  document.getElementById("browsers").appendChild(browser);
   browser.webProgress.addProgressListener(
     progressListener,
-    Ci.nsIWebProgress.NOTIFY_STATE_NETWORK
+    Ci.nsIWebProgress.NOTIFY_LOCATION |
+      Ci.nsIWebProgress.NOTIFY_STATE_NETWORK
   );
+  browser.addEventListener("DOMTitleChanged", titleListener, true);
+  browser.addEventListener("oop-browser-crashed", crashListener);
+  browsers.set(browserId, {
+    browser,
+    crashListener,
+    progressListener,
+    titleListener,
+  });
 
+  activateBrowser(browser);
+  loadUrl(browser, initialUrl);
+  browser.focus();
+  bridge.browserReady(browserId);
+}
+
+function setBrowserVisibility(browserId, visible) {
+  const entry = browsers.get(browserId);
+  if (!entry) {
+    return;
+  }
+  if (visible) {
+    activateBrowser(entry.browser);
+    return;
+  }
+  entry.browser.docShellIsActive = false;
+  entry.browser.hidden = true;
+}
+
+function closeBrowser(browserId, force) {
+  const entry = browsers.get(browserId);
+  if (!entry) {
+    return;
+  }
+  if (!force && !entry.browser.permitUnload().permitUnload) {
+    return;
+  }
+  entry.browser.webProgress.removeProgressListener(entry.progressListener);
+  entry.browser.removeEventListener("DOMTitleChanged", entry.titleListener, true);
+  entry.browser.removeEventListener("oop-browser-crashed", entry.crashListener);
+  entry.browser.remove();
+  browsers.delete(browserId);
+  bridge.beforeClose(browserId);
+}
+
+window.addEventListener("load", () => {
   Services.obs.addObserver((subject, topic, command) => {
-    const [name, ...arguments_] = command.split("\t");
+    const [name, browserIdText, ...arguments_] = command.split("\t");
+    const browserId = Number.parseInt(browserIdText, 10);
+    const entry = browsers.get(browserId);
     switch (name) {
+      case "create":
+        createBrowser(browserId, arguments_.join("\t"));
+        break;
       case "navigate":
-        loadUrl(browser, arguments_.join("\t"));
-        browser.focus();
+        if (entry) {
+          loadUrl(entry.browser, arguments_.join("\t"));
+          activateBrowser(entry.browser);
+          entry.browser.focus();
+        }
         break;
       case "reload":
-        browser.reload();
+        entry?.browser.reload();
         break;
       case "focus":
-        window.focus();
-        browser.focus();
+        if (entry) {
+          window.focus();
+          activateBrowser(entry.browser);
+          entry.browser.focus();
+        }
+        break;
+      case "visibility":
+        setBrowserVisibility(browserId, arguments_[0] == "1");
         break;
       case "close":
+        closeBrowser(browserId, arguments_[0] == "1");
+        break;
+      case "shutdown":
         window.close();
         break;
     }
   }, "firefox-cef-command");
 
   bridge.runtimeReady();
-  loadUrl(browser, bridge.initialUrl);
-  browser.focus();
+  createBrowser(bridge.browserId, bridge.initialUrl);
 }, { once: true });
 
-window.addEventListener("unload", () => bridge.beforeClose(), { once: true });
+window.addEventListener("unload", () => {
+  for (const browserId of [...browsers.keys()]) {
+    closeBrowser(browserId, true);
+  }
+}, { once: true });

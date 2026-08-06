@@ -185,6 +185,22 @@ impl CefInstance {
         Ok(())
     }
 
+    fn send_process_request(
+        &mut self,
+        operation: wire::request::Operation,
+        description: &'static str,
+    ) -> NativeResult<()> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or("shell protocol request ID overflow")?;
+        self.transport
+            .send(&request_packet(request_id, 0, operation))?;
+        self.pending_requests.insert(request_id, description);
+        Ok(())
+    }
+
     fn navigate(&mut self, url: &str) -> NativeResult<()> {
         self.send_request(
             wire::request::Operation::Navigate(wire::Navigate {
@@ -380,6 +396,10 @@ impl CefInstance {
         let _ = self.send_request(
             wire::request::Operation::Close(wire::Close { force: true }),
             "close",
+        );
+        let _ = self.send_process_request(
+            wire::request::Operation::Shutdown(wire::Shutdown {}),
+            "shutdown",
         );
         stop_child(&mut self.child);
     }
