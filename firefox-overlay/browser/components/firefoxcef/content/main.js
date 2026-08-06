@@ -45,6 +45,10 @@ function createBrowser(browserId, initialUrl) {
 
     onLocationChange(webProgress, request, location) {
       if (webProgress.isTopLevel && location) {
+        const entry = browsers.get(browserId);
+        if (entry) {
+          entry.currentUrl = location.spec;
+        }
         bridge.addressChanged(browserId, location.spec);
       }
     },
@@ -75,6 +79,10 @@ function createBrowser(browserId, initialUrl) {
     bridge.titleChanged(browserId, browser.contentTitle ?? "");
   };
   const crashListener = () => {
+    const entry = browsers.get(browserId);
+    if (entry) {
+      entry.crashed = true;
+    }
     bridge.browserCrashed(browserId, "Gecko content process terminated");
   };
 
@@ -89,6 +97,8 @@ function createBrowser(browserId, initialUrl) {
   browsers.set(browserId, {
     browser,
     crashListener,
+    crashed: false,
+    currentUrl: initialUrl,
     progressListener,
     titleListener,
   });
@@ -97,6 +107,26 @@ function createBrowser(browserId, initialUrl) {
   loadUrl(browser, initialUrl);
   browser.focus();
   bridge.browserReady(browserId);
+}
+
+function removeBrowser(browserId, notifyClose) {
+  const entry = browsers.get(browserId);
+  if (!entry) {
+    return;
+  }
+  entry.browser.webProgress.removeProgressListener(entry.progressListener);
+  entry.browser.removeEventListener("DOMTitleChanged", entry.titleListener, true);
+  entry.browser.removeEventListener("oop-browser-crashed", entry.crashListener);
+  entry.browser.remove();
+  browsers.delete(browserId);
+  if (notifyClose) {
+    bridge.beforeClose(browserId);
+  }
+}
+
+function replaceCrashedBrowser(browserId, url) {
+  removeBrowser(browserId, false);
+  createBrowser(browserId, url);
 }
 
 function setBrowserVisibility(browserId, visible) {
@@ -120,12 +150,7 @@ function closeBrowser(browserId, force) {
   if (!force && !entry.browser.permitUnload().permitUnload) {
     return;
   }
-  entry.browser.webProgress.removeProgressListener(entry.progressListener);
-  entry.browser.removeEventListener("DOMTitleChanged", entry.titleListener, true);
-  entry.browser.removeEventListener("oop-browser-crashed", entry.crashListener);
-  entry.browser.remove();
-  browsers.delete(browserId);
-  bridge.beforeClose(browserId);
+  removeBrowser(browserId, true);
 }
 
 window.addEventListener("load", () => {
@@ -139,13 +164,22 @@ window.addEventListener("load", () => {
         break;
       case "navigate":
         if (entry) {
-          loadUrl(entry.browser, arguments_.join("\t"));
-          activateBrowser(entry.browser);
-          entry.browser.focus();
+          const url = arguments_.join("\t");
+          if (entry.crashed) {
+            replaceCrashedBrowser(browserId, url);
+          } else {
+            loadUrl(entry.browser, url);
+            activateBrowser(entry.browser);
+            entry.browser.focus();
+          }
         }
         break;
       case "reload":
-        entry?.browser.reload();
+        if (entry?.crashed) {
+          replaceCrashedBrowser(browserId, entry.currentUrl);
+        } else {
+          entry?.browser.reload();
+        }
         break;
       case "focus":
         if (entry) {

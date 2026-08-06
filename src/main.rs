@@ -1,11 +1,13 @@
 mod cookie_store;
 mod native;
 mod profile;
+mod tab_controller;
 
-use native::{ControllerCommand, Layout, NativeRect};
+use native::NativeRect;
 use profile::ProfileStore;
 use qtbridge::{QApp, QObjectHolder, qobject};
 use shell_protocol::is_valid_profile_id;
+use tab_controller::{TabCommand, TabController, TabEngine};
 
 const DEFAULT_URL: &str = "deb://new-tab/";
 
@@ -16,10 +18,11 @@ unsafe extern "C" {
 struct Backend {
     url: String,
     profile_id: String,
-    chromium_status: String,
-    firefox_status: String,
-    controller: Option<native::Controller>,
-    last_layout: Option<Layout>,
+    status: String,
+    tabs_json: String,
+    active_tab_id: String,
+    controller: Option<TabController>,
+    last_bounds: Option<NativeRect>,
 }
 
 impl Default for Backend {
@@ -27,10 +30,11 @@ impl Default for Backend {
         Self {
             url: std::env::var("DEB_URL").unwrap_or_else(|_| DEFAULT_URL.to_owned()),
             profile_id: "default".to_owned(),
-            chromium_status: "Waiting for Qt native host…".to_owned(),
-            firefox_status: "Waiting for Qt native host…".to_owned(),
+            status: "Waiting for Qt native host…".to_owned(),
+            tabs_json: "[]".to_owned(),
+            active_tab_id: String::new(),
             controller: None,
-            last_layout: None,
+            last_bounds: None,
         }
     }
 }
@@ -44,15 +48,12 @@ impl Backend {
         Write = set_profile_id,
         Notify = profile_id_changed
     );
+    qproperty!("status", Member = status, Notify = status_changed);
+    qproperty!("tabsJson", Member = tabs_json, Notify = tabs_json_changed);
     qproperty!(
-        "chromiumStatus",
-        Member = chromium_status,
-        Notify = chromium_status_changed
-    );
-    qproperty!(
-        "firefoxStatus",
-        Member = firefox_status,
-        Notify = firefox_status_changed
+        "activeTabId",
+        Member = active_tab_id,
+        Notify = active_tab_id_changed
     );
 
     fn set_url(&mut self, url: String) {
@@ -65,22 +66,22 @@ impl Backend {
             return;
         }
         if !is_valid_profile_id(&profile_id) {
-            self.chromium_status = format!("Invalid profile ID {profile_id:?}");
-            self.firefox_status = self.chromium_status.clone();
-            self.chromium_status_changed();
-            self.firefox_status_changed();
+            self.status = format!("Invalid profile ID {profile_id:?}");
+            self.status_changed();
             return;
         }
         if let Some(controller) = self.controller.take() {
             controller.stop();
         }
         self.profile_id = profile_id;
-        self.last_layout = None;
-        self.chromium_status = "Waiting for Qt native host…".to_owned();
-        self.firefox_status = "Waiting for Qt native host…".to_owned();
+        self.last_bounds = None;
+        self.status = "Waiting for Qt native host…".to_owned();
+        self.tabs_json = "[]".to_owned();
+        self.active_tab_id.clear();
         self.profile_id_changed();
-        self.chromium_status_changed();
-        self.firefox_status_changed();
+        self.status_changed();
+        self.tabs_json_changed();
+        self.active_tab_id_changed();
     }
 
     #[qsignal]
@@ -90,10 +91,13 @@ impl Backend {
     fn profile_id_changed(&mut self);
 
     #[qsignal]
-    fn chromium_status_changed(&mut self);
+    fn status_changed(&mut self);
 
     #[qsignal]
-    fn firefox_status_changed(&mut self);
+    fn tabs_json_changed(&mut self);
+
+    #[qsignal]
+    fn active_tab_id_changed(&mut self);
 
     #[qslot]
     fn navigate(&mut self) {
@@ -102,92 +106,114 @@ impl Backend {
         if self.controller.is_none() {
             return;
         }
-        self.chromium_status = "Navigating CEF / Chromium…".to_owned();
-        self.firefox_status = "Navigating Firefox / Gecko through CEF…".to_owned();
-        self.chromium_status_changed();
-        self.firefox_status_changed();
+        self.status = "Navigating…".to_owned();
+        self.status_changed();
         let send_failed = self
             .controller
             .as_ref()
-            .is_none_or(|controller| controller.send(ControllerCommand::Navigate(url)).is_err());
+            .is_none_or(|controller| controller.send(TabCommand::Navigate(url)).is_err());
         if send_failed {
-            self.chromium_status = "Native controller stopped".to_owned();
-            self.firefox_status = self.chromium_status.clone();
-            self.chromium_status_changed();
-            self.firefox_status_changed();
+            self.status = "Native controller stopped".to_owned();
+            self.status_changed();
         }
     }
 
     #[qslot]
-    fn sync_geometry(
-        &mut self,
-        chromium_host_id: String,
-        chromium_width: i32,
-        chromium_height: i32,
-        firefox_host_id: String,
-        firefox_width: i32,
-        firefox_height: i32,
-    ) {
-        let Ok(chromium_host_id) = chromium_host_id.parse::<u32>() else {
+    fn sync_geometry(&mut self, host_id: String, width: i32, height: i32) {
+        let Ok(host_id) = host_id.parse::<u32>() else {
             return;
         };
-        if chromium_host_id == 0 {
+        if host_id == 0 {
             return;
         }
-        let Ok(firefox_host_id) = firefox_host_id.parse::<u32>() else {
+        let Some(bounds) = NativeRect::new(0, 0, width, height) else {
             return;
         };
-        if firefox_host_id == 0 {
+        if self.last_bounds == Some(bounds) {
             return;
         }
-        let Some(chromium) = NativeRect::new(0, 0, chromium_width, chromium_height) else {
-            return;
-        };
-        let Some(firefox) = NativeRect::new(0, 0, firefox_width, firefox_height) else {
-            return;
-        };
-        let layout = Layout { chromium, firefox };
-        if self.last_layout == Some(layout) {
-            return;
-        }
-        self.last_layout = Some(layout);
+        self.last_bounds = Some(bounds);
 
         if let Some(controller) = &self.controller {
-            let _ = controller.send(ControllerCommand::Layout(layout));
+            let _ = controller.send(TabCommand::Layout(bounds));
             return;
         }
 
-        self.chromium_status = "Starting CEF inside its Qt host…".to_owned();
-        self.firefox_status = "Starting Firefox through the CEF ABI…".to_owned();
-        self.chromium_status_changed();
-        self.firefox_status_changed();
+        self.status = "Starting Chromium through CEF…".to_owned();
+        self.status_changed();
         let directories = match profile::profile_directories(&self.profile_id) {
             Ok(directories) => directories,
             Err(error) => {
-                self.chromium_status = format!("Profile storage failed: {error}");
-                self.firefox_status = self.chromium_status.clone();
-                self.chromium_status_changed();
-                self.firefox_status_changed();
+                self.status = format!("Profile storage failed: {error}");
+                self.status_changed();
                 return;
             }
         };
-        self.controller = Some(native::spawn_controller(
+        self.controller = Some(tab_controller::spawn(
             self.profile_id.clone(),
             directories,
             self.url.clone(),
-            chromium_host_id,
-            firefox_host_id,
-            layout,
+            host_id,
+            bounds,
             self.get_qml_method_invoker(),
         ));
     }
 
     #[qslot]
-    fn update_statuses(&mut self, chromium: String, firefox: String) {
-        self.chromium_status = chromium;
-        self.firefox_status = firefox;
-        self.chromium_status_changed();
-        self.firefox_status_changed();
+    fn reload(&mut self) {
+        if let Some(controller) = &self.controller {
+            let _ = controller.send(TabCommand::Reload);
+        }
+    }
+
+    #[qslot]
+    fn new_tab(&mut self, engine: String) {
+        if let (Some(controller), Some(engine)) = (&self.controller, TabEngine::parse(&engine)) {
+            let _ = controller.send(TabCommand::NewTab(engine));
+        }
+    }
+
+    #[qslot]
+    fn select_tab(&mut self, tab_id: String) {
+        if let (Some(controller), Ok(tab_id)) = (&self.controller, tab_id.parse::<u64>()) {
+            let _ = controller.send(TabCommand::Select(tab_id));
+        }
+    }
+
+    #[qslot]
+    fn close_tab(&mut self, tab_id: String) {
+        if let (Some(controller), Ok(tab_id)) = (&self.controller, tab_id.parse::<u64>()) {
+            let _ = controller.send(TabCommand::Close(tab_id));
+        }
+    }
+
+    #[qslot]
+    fn switch_engine(&mut self, tab_id: String, engine: String) {
+        if let (Some(controller), Ok(tab_id), Some(engine)) = (
+            &self.controller,
+            tab_id.parse::<u64>(),
+            TabEngine::parse(&engine),
+        ) {
+            let _ = controller.send(TabCommand::SwitchEngine(tab_id, engine));
+        }
+    }
+
+    #[qslot]
+    fn update_tab_state(
+        &mut self,
+        tabs_json: String,
+        active_tab_id: String,
+        url: String,
+        status: String,
+    ) {
+        self.tabs_json = tabs_json;
+        self.active_tab_id = active_tab_id;
+        self.url = url;
+        self.status = status;
+        self.tabs_json_changed();
+        self.active_tab_id_changed();
+        self.url_changed();
+        self.status_changed();
     }
 
     #[qslot]

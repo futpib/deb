@@ -126,23 +126,59 @@ ApplicationWindow {
         required property int index
         readonly property string profileId: profilesModel.get(index).profileId
         readonly property string profileName: profilesModel.get(index).profileName
+        property bool rebuildingTabs: false
 
-        property var chromiumHost: nativeWindows.createHost()
-        property var firefoxHost: nativeWindows.createHost()
+        property var browserHost: nativeWindows.createHost()
+
+        ListModel {
+            id: tabsModel
+        }
 
         Backend {
             id: backend
             profileId: workspace.profileId
         }
 
+        Connections {
+            target: backend
+
+            function onTabsJsonChanged() {
+                workspace.rebuildTabs()
+            }
+        }
+
+        function rebuildTabs() {
+            rebuildingTabs = true
+            tabsModel.clear()
+            const tabs = JSON.parse(backend.tabsJson)
+            let activeIndex = -1
+            for (let tabIndex = 0; tabIndex < tabs.length; ++tabIndex) {
+                const tab = tabs[tabIndex]
+                tabsModel.append({
+                    "tabId": tab.id,
+                    "engine": tab.engine,
+                    "tabUrl": tab.url,
+                    "tabTitle": tab.title,
+                    "tabStatus": tab.status,
+                    "loading": tab.loading,
+                    "crashed": tab.crashed
+                })
+                if (tab.id === backend.activeTabId) {
+                    activeIndex = tabIndex
+                }
+            }
+            if (activeIndex >= 0) {
+                browserTabs.currentIndex = activeIndex
+                enginePicker.currentIndex = tabsModel.get(activeIndex).engine === "firefox" ? 1 : 0
+            }
+            rebuildingTabs = false
+        }
+
         function syncNativeGeometry() {
             backend.sync_geometry(
-                nativeWindows.windowId(chromiumHost),
-                Math.round(chromiumPane.surface.width),
-                Math.round(chromiumPane.surface.height),
-                nativeWindows.windowId(firefoxHost),
-                Math.round(firefoxPane.surface.width),
-                Math.round(firefoxPane.surface.height)
+                nativeWindows.windowId(browserHost),
+                Math.round(nativeSurface.width),
+                Math.round(nativeSurface.height)
             )
         }
 
@@ -157,57 +193,127 @@ ApplicationWindow {
             ToolBar {
                 Layout.fillWidth: true
 
-                RowLayout {
+                ColumnLayout {
                     anchors.fill: parent
                     anchors.leftMargin: 10
                     anchors.rightMargin: 10
-                    spacing: 8
+                    spacing: 4
 
-                    Label {
-                        text: workspace.profileName
-                        font.bold: true
-                    }
-
-                    TextField {
-                        id: address
+                    RowLayout {
                         Layout.fillWidth: true
-                        text: backend.url
-                        selectByMouse: true
-                        onAccepted: {
-                            backend.url = text
-                            backend.navigate()
+                        spacing: 4
+
+                        TabBar {
+                            id: browserTabs
+                            Layout.fillWidth: true
+
+                            Repeater {
+                                model: tabsModel
+
+                                TabButton {
+                                    text: `${tabsModel.get(index).engine === "firefox" ? "🦊" : "◉"} ${tabsModel.get(index).tabTitle || tabsModel.get(index).tabUrl}`
+                                    width: Math.max(150, Math.min(260, implicitWidth))
+                                    ToolTip.visible: hovered
+                                    ToolTip.text: `${tabsModel.get(index).tabUrl}\n${tabsModel.get(index).tabStatus}`
+                                }
+                            }
+
+                            onCurrentIndexChanged: {
+                                if (!workspace.rebuildingTabs && currentIndex >= 0 && currentIndex < tabsModel.count) {
+                                    backend.select_tab(tabsModel.get(currentIndex).tabId)
+                                }
+                            }
+                        }
+
+                        Button {
+                            text: "+ Chromium"
+                            onClicked: backend.new_tab("chromium")
+                        }
+
+                        Button {
+                            text: "+ Firefox"
+                            onClicked: backend.new_tab("firefox")
                         }
                     }
 
-                    Button {
-                        text: "Navigate both"
-                        onClicked: {
-                            backend.url = address.text
-                            backend.navigate()
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Button {
+                            text: "↻"
+                            ToolTip.visible: hovered
+                            ToolTip.text: "Reload this tab"
+                            onClicked: backend.reload()
+                        }
+
+                        ComboBox {
+                            id: enginePicker
+                            model: ["Chromium", "Firefox"]
+                            Layout.preferredWidth: 125
+                            onActivated: {
+                                if (backend.activeTabId.length > 0) {
+                                    backend.switch_engine(
+                                        backend.activeTabId,
+                                        currentIndex === 1 ? "firefox" : "chromium"
+                                    )
+                                }
+                            }
+                        }
+
+                        TextField {
+                            id: address
+                            Layout.fillWidth: true
+                            text: backend.url
+                            selectByMouse: true
+                            onAccepted: {
+                                backend.url = text
+                                backend.navigate()
+                            }
+                        }
+
+                        Button {
+                            text: "Go"
+                            onClicked: {
+                                backend.url = address.text
+                                backend.navigate()
+                            }
+                        }
+
+                        Button {
+                            text: "Close tab"
+                            enabled: backend.activeTabId.length > 0
+                            onClicked: backend.close_tab(backend.activeTabId)
+                        }
+
+                        Label {
+                            text: backend.status
+                            elide: Text.ElideRight
+                            Layout.maximumWidth: 320
                         }
                     }
                 }
             }
 
-            SplitView {
+            Rectangle {
+                id: nativeSurface
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                orientation: Qt.Horizontal
+                color: "#202124"
+                border.color: palette.mid
 
-                EnginePane {
-                    id: chromiumPane
-                    SplitView.fillWidth: true
-                    title: "CEF / Chromium"
-                    status: backend.chromiumStatus
-                    hostedWindow: chromiumHost
+                Label {
+                    anchors.centerIn: parent
+                    text: "Mounting active browser tab…"
+                    color: "white"
+                    opacity: 0.7
                 }
 
-                EnginePane {
-                    id: firefoxPane
-                    SplitView.fillWidth: true
-                    title: "Firefox / Gecko · CEF ABI adapter"
-                    status: backend.firefoxStatus
-                    hostedWindow: firefoxHost
+                WindowContainer {
+                    anchors.fill: parent
+                    anchors.margins: 1
+                    window: browserHost
+                    visible: window !== null
+                    focus: true
                 }
             }
         }
@@ -226,52 +332,6 @@ ApplicationWindow {
         }
 
         Component.onDestruction: stop()
-    }
-
-    component EnginePane: Pane {
-        id: enginePane
-        required property string title
-        required property string status
-        required property var hostedWindow
-        property alias surface: nativeSurface
-
-        padding: 8
-
-        ColumnLayout {
-            anchors.fill: parent
-            spacing: 6
-
-            Label {
-                Layout.fillWidth: true
-                text: `${enginePane.title}  —  ${enginePane.status}`
-                font.bold: true
-                font.pixelSize: 15
-                elide: Text.ElideRight
-            }
-
-            Rectangle {
-                id: nativeSurface
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                color: "#202124"
-                border.color: palette.mid
-
-                Label {
-                    anchors.centerIn: parent
-                    text: "Mounting native browser window…"
-                    color: "white"
-                    opacity: 0.7
-                }
-
-                WindowContainer {
-                    anchors.fill: parent
-                    anchors.margins: 1
-                    window: enginePane.hostedWindow
-                    visible: window !== null
-                    focus: true
-                }
-            }
-        }
     }
 
     onClosing: {
