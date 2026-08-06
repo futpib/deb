@@ -10,7 +10,7 @@ export class FirefoxCefCommandLineHandler {
   QueryInterface = ChromeUtils.generateQI([Ci.nsICommandLineHandler]);
 
   handle(commandLine) {
-    if (!Services.env.exists("FIREFOX_CEF_PARENT_XID")) {
+    if (!commandLine.handleFlag("firefox-cef", false)) {
       return;
     }
 

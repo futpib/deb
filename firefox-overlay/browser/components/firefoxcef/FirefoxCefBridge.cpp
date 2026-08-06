@@ -5,13 +5,18 @@
 #include "FirefoxCefBridge.h"
 
 #include <algorithm>
-#include <cstdlib>
+#include <cstdint>
 #include <cstring>
 #include <map>
 #include <strings.h>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifdef MOZ_X11
+#  include <gdk/gdkx.h>
+#  include "X11UndefineNone.h"
+#endif
 
 #include "XREChildData.h"
 #include "mozilla/Bootstrap.h"
@@ -28,6 +33,8 @@
 #include "nsICookieNotification.h"
 #include "nsICookieValidation.h"
 #include "nsIObserverService.h"
+#include "nsIBaseWindow.h"
+#include "nsIWidget.h"
 #include "nsNetUtil.h"
 #include "nsServiceManagerUtils.h"
 #include "nsString.h"
@@ -79,15 +86,20 @@ struct FirefoxCefCallbacks {
 
 mozilla::StaticMutex sMutex;
 FirefoxCefCallbacks sCallbacks;
+struct BrowserConfig {
+  uint64_t parentWindow;
+  uint32_t width;
+  uint32_t height;
+  nsCString url;
+};
 uint32_t sBrowserId;
 uint32_t sInitialWidth = 2;
 uint32_t sInitialHeight = 2;
-uint64_t sParentWindow;
-uint64_t sNativeWindow;
 nsCString sInitialUrl;
 bool sRuntimeReady;
 bool sObservingCookies;
-std::map<uint32_t, nsCString> sConfiguredBrowsers;
+std::map<uint32_t, BrowserConfig> sConfiguredBrowsers;
+std::map<uint32_t, uint64_t> sNativeWindows;
 std::unordered_set<uint32_t> sReadyBrowsers;
 std::unordered_set<uint32_t> sAfterCreatedBrowsers;
 std::unordered_set<uint32_t> sBeforeCloseBrowsers;
@@ -220,16 +232,17 @@ void MaybeFireAfterCreated(uint32_t aBrowserId) {
   uint64_t nativeWindow;
   {
     mozilla::StaticMutexAutoLock lock(sMutex);
+    auto nativeWindowEntry = sNativeWindows.find(aBrowserId);
     if (sAfterCreatedBrowsers.find(aBrowserId) !=
             sAfterCreatedBrowsers.end() ||
-        !sRuntimeReady || !sNativeWindow ||
+        !sRuntimeReady || nativeWindowEntry == sNativeWindows.end() ||
         sReadyBrowsers.find(aBrowserId) == sReadyBrowsers.end() ||
         sConfiguredBrowsers.find(aBrowserId) == sConfiguredBrowsers.end()) {
       return;
     }
     sAfterCreatedBrowsers.insert(aBrowserId);
     callbacks = sCallbacks;
-    nativeWindow = sNativeWindow;
+    nativeWindow = nativeWindowEntry->second;
   }
   if (callbacks.onAfterCreated) {
     callbacks.onAfterCreated(callbacks.context, aBrowserId, nativeWindow);
@@ -319,9 +332,9 @@ NS_IMETHODIMP FirefoxCefBridge::RuntimeReady() {
   {
     StaticMutexAutoLock lock(sMutex);
     sRuntimeReady = true;
-    for (const auto& [browserId, url] : sConfiguredBrowsers) {
+    for (const auto& [browserId, config] : sConfiguredBrowsers) {
       if (browserId != sBrowserId) {
-        pendingBrowsers.emplace_back(browserId, url);
+        pendingBrowsers.emplace_back(browserId, config.url);
       }
     }
   }
@@ -340,6 +353,58 @@ NS_IMETHODIMP FirefoxCefBridge::RuntimeReady() {
     NotifyCommand(std::move(command));
   }
   return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::AttachWindow(uint32_t aBrowserId,
+                                             nsIBaseWindow* aBaseWindow) {
+  if (!aBaseWindow) {
+    return NS_ERROR_INVALID_ARG;
+  }
+  uint64_t parentWindow;
+  {
+    StaticMutexAutoLock lock(sMutex);
+    auto entry = sConfiguredBrowsers.find(aBrowserId);
+    if (entry == sConfiguredBrowsers.end()) {
+      return NS_ERROR_INVALID_ARG;
+    }
+    parentWindow = entry->second.parentWindow;
+  }
+  nsCOMPtr<nsIWidget> widget;
+  if (NS_FAILED(aBaseWindow->GetMainWidget(getter_AddRefs(widget))) ||
+      !widget) {
+    return NS_ERROR_FAILURE;
+  }
+#ifdef MOZ_X11
+  auto* contentWindow =
+      static_cast<GdkWindow*>(widget->GetNativeData(NS_NATIVE_WIDGET));
+  if (!contentWindow) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  GdkWindow* nativeGdkWindow = gdk_window_get_toplevel(contentWindow);
+  GdkDisplay* display = gdk_window_get_display(nativeGdkWindow);
+  if (!GDK_IS_X11_DISPLAY(display)) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  GdkWindow* parentGdkWindow = gdk_x11_window_foreign_new_for_display(
+      display, static_cast<::Window>(parentWindow));
+  if (!parentGdkWindow) {
+    return NS_ERROR_NOT_AVAILABLE;
+  }
+  auto nativeWindow = static_cast<uint64_t>(GDK_WINDOW_XID(nativeGdkWindow));
+  gdk_window_reparent(nativeGdkWindow, parentGdkWindow, 0, 0);
+  gdk_window_invalidate_rect(nativeGdkWindow, nullptr, TRUE);
+  gdk_window_process_updates(nativeGdkWindow, TRUE);
+  gdk_display_flush(display);
+  g_object_unref(parentGdkWindow);
+  {
+    StaticMutexAutoLock lock(sMutex);
+    sNativeWindows[aBrowserId] = nativeWindow;
+  }
+  MaybeFireAfterCreated(aBrowserId);
+  return NS_OK;
+#else
+  return NS_ERROR_NOT_AVAILABLE;
+#endif
 }
 
 NS_IMETHODIMP FirefoxCefBridge::BrowserReady(uint32_t aBrowserId) {
@@ -462,6 +527,9 @@ NS_IMETHODIMP FirefoxCefBridge::BeforeClose(uint32_t aBrowserId) {
       return NS_OK;
     }
     sBeforeCloseBrowsers.insert(aBrowserId);
+    sConfiguredBrowsers.erase(aBrowserId);
+    sReadyBrowsers.erase(aBrowserId);
+    sNativeWindows.erase(aBrowserId);
     callbacks = sCallbacks;
   }
   if (callbacks.onBeforeClose) {
@@ -495,24 +563,17 @@ extern "C" NS_EXPORT int firefox_cef_gecko_configure(
       return 0;
     }
     initialBrowser = sConfiguredBrowsers.empty();
-    if (!initialBrowser && aParentWindow != sParentWindow) {
-      return 0;
-    }
-    sConfiguredBrowsers.emplace(aBrowserId, url);
+    sConfiguredBrowsers.emplace(
+        aBrowserId,
+        BrowserConfig{aParentWindow, std::max(aWidth, 2U),
+                      std::max(aHeight, 2U), url});
     runtimeReady = sRuntimeReady;
     if (initialBrowser) {
       sBrowserId = aBrowserId;
-      sParentWindow = aParentWindow;
       sInitialWidth = std::max(aWidth, 2U);
       sInitialHeight = std::max(aHeight, 2U);
       sInitialUrl = url;
-      sNativeWindow = 0;
     }
-  }
-  if (initialBrowser) {
-    nsAutoCString parent;
-    parent.AppendInt(aParentWindow);
-    return setenv("FIREFOX_CEF_PARENT_XID", parent.get(), 1) == 0;
   }
   if (runtimeReady) {
     nsCString command = BrowserCommand("create", aBrowserId);
@@ -521,22 +582,6 @@ extern "C" NS_EXPORT int firefox_cef_gecko_configure(
     NotifyCommand(std::move(command));
   }
   return 1;
-}
-
-extern "C" NS_EXPORT void firefox_cef_gecko_set_native_window(
-    uint64_t aNativeWindow) {
-  {
-    mozilla::StaticMutexAutoLock lock(sMutex);
-    sNativeWindow = aNativeWindow;
-  }
-  std::vector<uint32_t> readyBrowsers;
-  {
-    mozilla::StaticMutexAutoLock lock(sMutex);
-    readyBrowsers.assign(sReadyBrowsers.begin(), sReadyBrowsers.end());
-  }
-  for (uint32_t browserId : readyBrowsers) {
-    MaybeFireAfterCreated(browserId);
-  }
 }
 
 extern "C" NS_EXPORT int firefox_cef_gecko_visit_cookies(

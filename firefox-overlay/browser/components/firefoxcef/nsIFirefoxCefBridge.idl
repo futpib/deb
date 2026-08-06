@@ -3,8 +3,9 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 #include "nsISupports.idl"
+#include "nsIBaseWindow.idl"
 
-[scriptable, uuid(583da0fb-329e-4de5-88e4-67b9f2577514)]
+[scriptable, uuid(69e18a45-3b22-4505-a57c-f23d5b272fbc)]
 interface nsIFirefoxCefBridge : nsISupports
 {
   readonly attribute unsigned long browserId;
@@ -13,6 +14,7 @@ interface nsIFirefoxCefBridge : nsISupports
   readonly attribute unsigned long initialHeight;
 
   void runtimeReady();
+  void attachWindow(in unsigned long browserId, in nsIBaseWindow baseWindow);
   void browserReady(in unsigned long browserId);
   void addressChanged(in unsigned long browserId, in AUTF8String url);
   void titleChanged(in unsigned long browserId, in AUTF8String title);

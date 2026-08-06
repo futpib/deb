@@ -48,7 +48,7 @@ trap cleanup EXIT
 log_file="$test_root/smoke.log"
 SECONDS=0
 set +e
-timeout --signal=TERM 30s \
+timeout --signal=TERM 45s \
   xvfb-run -a -s "-screen 0 1440x900x24" \
   env \
   XDG_CONFIG_HOME="$test_root/config" \

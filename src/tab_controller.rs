@@ -20,18 +20,29 @@ use std::{
     time::{Duration, Instant},
 };
 use x11rb::{
+    COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT,
     connection::Connection,
     protocol::{
         Event,
         xproto::{
-            ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, EventMask, InputFocus,
-            MapState, StackMode, Window,
+            ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, CreateWindowAux,
+            EventMask, InputFocus, MapState, StackMode, Window, WindowClass,
         },
     },
     rust_connection::RustConnection,
 };
 
 type TabResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+const MIN_RENDER_VARIANTS: usize = 8;
+
+fn embedded_bounds(bounds: NativeRect) -> NativeRect {
+    NativeRect {
+        x: 0,
+        y: 0,
+        width: bounds.width,
+        height: bounds.height,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -67,13 +78,27 @@ impl From<CefBackend> for TabEngine {
 }
 
 pub enum TabCommand {
-    Layout(NativeRect),
-    Navigate(String),
-    Reload,
-    NewTab(TabEngine),
-    Select(u64),
+    AddWindow {
+        id: u64,
+        parent: Window,
+        bounds: NativeRect,
+        label: String,
+        initial_url: String,
+    },
+    RemoveWindow(u64),
+    Layout(u64, NativeRect),
+    SetWindowState {
+        id: u64,
+        visible: bool,
+        focused: bool,
+    },
+    Navigate(u64, String),
+    Reload(u64),
+    NewTab(u64, TabEngine),
+    Select(u64, u64),
     Close(u64),
     SwitchEngine(u64, TabEngine),
+    Move(u64, u64),
     Stop,
 }
 
@@ -96,17 +121,14 @@ impl TabController {
 pub fn spawn(
     profile_id: String,
     directories: ProfileDirectories,
-    initial_url: String,
-    parent: Window,
-    bounds: NativeRect,
     invoker: QmlMethodInvoker,
 ) -> TabController {
     let (sender, receiver) = mpsc::channel();
     let invoker = Arc::new(Mutex::new(invoker));
     let thread = std::thread::spawn(move || {
         let failure_invoker = Arc::clone(&invoker);
-        let result = Runtime::new(profile_id, directories, parent, bounds, invoker, receiver)
-            .and_then(|mut runtime| runtime.run(initial_url));
+        let result =
+            Runtime::new(profile_id, directories, invoker, receiver).and_then(Runtime::run);
         if let Err(error) = result {
             eprintln!("deb: tab controller failed: {error}");
             if std::env::var("DEB_AUTOMATED_SMOKE_TEST").as_deref() == Ok("1") {
@@ -137,15 +159,42 @@ struct TabSnapshot<'a> {
     crashed: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WindowSnapshot<'a> {
+    id: String,
+    label: &'a str,
+    active_tab_id: String,
+    tabs: Vec<TabSnapshot<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileSnapshot<'a> {
+    windows: Vec<WindowSnapshot<'a>>,
+}
+
 struct Tab {
     id: u64,
+    window_id: u64,
     engine: TabEngine,
     browser_id: Option<u64>,
+    container: Option<Window>,
     url: String,
     title: String,
     status: String,
     loading: bool,
     crashed: bool,
+}
+
+struct BrowserWindow {
+    id: u64,
+    parent: Window,
+    bounds: NativeRect,
+    label: String,
+    active_tab: u64,
+    visible: bool,
+    focused: bool,
 }
 
 impl Tab {
@@ -343,17 +392,16 @@ fn reconcile_mutation(
 struct Runtime {
     profile_id: String,
     directories: ProfileDirectories,
-    parent: Window,
-    bounds: NativeRect,
     invoker: Arc<Mutex<QmlMethodInvoker>>,
     receiver: Receiver<TabCommand>,
     connection: RustConnection,
+    windows: HashMap<u64, BrowserWindow>,
     tabs: Vec<Tab>,
-    active_tab: u64,
     next_tab_id: u64,
     next_browser_id: u64,
     chromium: Option<EngineRuntime>,
     firefox: Option<EngineRuntime>,
+    retired_containers: HashMap<u64, (CefBackend, Window)>,
     cookie_sync: CookieSync,
     automation: Option<Automation>,
     dirty: bool,
@@ -372,6 +420,11 @@ enum AutomationPhase {
     WaitChromiumRecovery,
     WaitFirefoxCrash,
     WaitFirefoxRecovery,
+    PrepareChromiumMove { deadline: Instant, attempts: u8 },
+    PrepareFirefoxMove { deadline: Instant, attempts: u8 },
+    WaitWindowMoves,
+    CaptureMovedChromium { deadline: Instant, attempts: u8 },
+    CaptureMovedFirefox { deadline: Instant, attempts: u8 },
     WaitEngineSwitch,
     CaptureSwitched { deadline: Instant, attempts: u8 },
 }
@@ -395,6 +448,9 @@ struct Automation {
     crashed_tabs: HashSet<u64>,
     chromium_process: Option<u32>,
     firefox_process: Option<u32>,
+    second_window: Option<u64>,
+    moved_chromium_variants: Option<usize>,
+    moved_firefox_variants: Option<usize>,
 }
 
 impl Automation {
@@ -421,6 +477,9 @@ impl Automation {
             crashed_tabs: HashSet::new(),
             chromium_process: None,
             firefox_process: None,
+            second_window: None,
+            moved_chromium_variants: None,
+            moved_firefox_variants: None,
         })
     }
 }
@@ -429,8 +488,6 @@ impl Runtime {
     fn new(
         profile_id: String,
         directories: ProfileDirectories,
-        parent: Window,
-        bounds: NativeRect,
         invoker: Arc<Mutex<QmlMethodInvoker>>,
         receiver: Receiver<TabCommand>,
     ) -> TabResult<Self> {
@@ -439,41 +496,49 @@ impl Runtime {
         Ok(Self {
             profile_id,
             directories,
-            parent,
-            bounds,
             invoker,
             receiver,
             connection,
+            windows: HashMap::new(),
             tabs: Vec::new(),
-            active_tab: 0,
             next_tab_id: 1,
             next_browser_id: 1,
             chromium: None,
             firefox: None,
+            retired_containers: HashMap::new(),
             cookie_sync,
             automation: None,
-            dirty: true,
+            dirty: false,
         })
     }
 
-    fn run(&mut self, initial_url: String) -> TabResult<()> {
-        self.automation = Automation::from_environment(initial_url.clone());
-        let tab_id = self.add_tab(TabEngine::Chromium, initial_url);
-        self.active_tab = tab_id;
-        self.attach_tab(tab_id)?;
-        self.refresh_visibility()?;
-        self.publish();
-
+    fn run(mut self) -> TabResult<()> {
         loop {
             match self.receiver.recv_timeout(Duration::from_millis(25)) {
-                Ok(TabCommand::Layout(bounds)) => self.layout(bounds)?,
-                Ok(TabCommand::Navigate(url)) => self.navigate(&url)?,
-                Ok(TabCommand::Reload) => self.reload()?,
-                Ok(TabCommand::NewTab(engine)) => self.new_tab(engine)?,
-                Ok(TabCommand::Select(tab_id)) => self.select(tab_id)?,
+                Ok(TabCommand::AddWindow {
+                    id,
+                    parent,
+                    bounds,
+                    label,
+                    initial_url,
+                }) => self.add_window(id, parent, bounds, label, initial_url)?,
+                Ok(TabCommand::RemoveWindow(id)) => self.remove_window(id)?,
+                Ok(TabCommand::Layout(id, bounds)) => self.layout(id, bounds)?,
+                Ok(TabCommand::SetWindowState {
+                    id,
+                    visible,
+                    focused,
+                }) => self.set_window_state(id, visible, focused)?,
+                Ok(TabCommand::Navigate(window_id, url)) => self.navigate(window_id, &url)?,
+                Ok(TabCommand::Reload(window_id)) => self.reload(window_id)?,
+                Ok(TabCommand::NewTab(window_id, engine)) => self.new_tab(window_id, engine)?,
+                Ok(TabCommand::Select(window_id, tab_id)) => self.select(window_id, tab_id)?,
                 Ok(TabCommand::Close(tab_id)) => self.close_tab(tab_id)?,
                 Ok(TabCommand::SwitchEngine(tab_id, engine)) => {
                     self.switch_engine(tab_id, engine)?
+                }
+                Ok(TabCommand::Move(tab_id, target_window)) => {
+                    self.move_tab(tab_id, target_window)?
                 }
                 Ok(TabCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -509,13 +574,70 @@ impl Runtime {
         Ok(())
     }
 
-    fn add_tab(&mut self, engine: TabEngine, url: String) -> u64 {
+    fn add_window(
+        &mut self,
+        id: u64,
+        parent: Window,
+        bounds: NativeRect,
+        label: String,
+        initial_url: String,
+    ) -> TabResult<()> {
+        if self.windows.contains_key(&id) {
+            return Err(format!("window {id} is already registered").into());
+        }
+        if self.automation.is_none() {
+            self.automation = Automation::from_environment(initial_url.clone());
+        }
+        self.windows.insert(
+            id,
+            BrowserWindow {
+                id,
+                parent,
+                bounds,
+                label,
+                active_tab: 0,
+                visible: true,
+                focused: false,
+            },
+        );
+        let tab_id = self.add_tab(id, TabEngine::Chromium, initial_url);
+        self.windows
+            .get_mut(&id)
+            .expect("window was inserted")
+            .active_tab = tab_id;
+        self.attach_tab(tab_id)?;
+        self.refresh_visibility()?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn remove_window(&mut self, id: u64) -> TabResult<()> {
+        if self.windows.remove(&id).is_none() {
+            return Ok(());
+        }
+        let tab_ids = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.window_id == id)
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+        for tab_id in tab_ids {
+            self.close_tab(tab_id)?;
+        }
+        self.refresh_visibility()?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn add_tab(&mut self, window_id: u64, engine: TabEngine, url: String) -> u64 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.tabs.push(Tab {
             id,
+            window_id,
             engine,
             browser_id: None,
+            container: None,
             url,
             title: "New tab".to_owned(),
             status: "Starting engine…".to_owned(),
@@ -526,31 +648,63 @@ impl Runtime {
         id
     }
 
-    fn new_tab(&mut self, engine: TabEngine) -> TabResult<()> {
-        let id = self.add_tab(engine, "deb://new-tab/".to_owned());
-        self.active_tab = id;
+    fn new_tab(&mut self, window_id: u64, engine: TabEngine) -> TabResult<()> {
+        self.window(window_id)?;
+        let id = self.add_tab(window_id, engine, "deb://new-tab/".to_owned());
+        self.window_mut(window_id)?.active_tab = id;
         self.attach_tab(id)?;
         self.refresh_visibility()
+    }
+
+    fn create_tab_container(&self, parent: Window, bounds: NativeRect) -> TabResult<Window> {
+        let container = self.connection.generate_id()?;
+        self.connection.create_window(
+            COPY_DEPTH_FROM_PARENT,
+            container,
+            parent,
+            i16::try_from(bounds.x)?,
+            i16::try_from(bounds.y)?,
+            u16::try_from(bounds.width)?,
+            u16::try_from(bounds.height)?,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            COPY_FROM_PARENT,
+            &CreateWindowAux::new(),
+        )?;
+        self.connection.map_window(container)?;
+        self.connection.flush()?;
+        Ok(container)
     }
 
     fn attach_tab(&mut self, tab_id: u64) -> TabResult<()> {
         let browser_id = self.next_browser_id;
         self.next_browser_id += 1;
-        let (backend, url) = {
+        let (backend, url, window_id) = {
             let tab = self.tab_mut(tab_id)?;
             tab.browser_id = Some(browser_id);
             tab.status = format!("Starting {}…", tab.engine.backend().label());
             tab.loading = true;
             tab.crashed = false;
-            (tab.engine.backend(), tab.url.clone())
+            (tab.engine.backend(), tab.url.clone(), tab.window_id)
+        };
+        let (host, bounds) = {
+            let window = self.window(window_id)?;
+            (window.parent, window.bounds)
+        };
+        let parent = if let Some(container) = self.tab(tab_id)?.container {
+            container
+        } else {
+            let container = self.create_tab_container(host, bounds)?;
+            self.tab_mut(tab_id)?.container = Some(container);
+            container
         };
         let profile_id = self.profile_id.clone();
         let directories = backend.directories(&self.directories).clone();
         if self.engine(backend).is_none() {
             match spawn_cef_browser(
                 &self.connection,
-                self.parent,
-                self.bounds,
+                parent,
+                bounds,
                 &url,
                 &profile_id,
                 &directories,
@@ -558,6 +712,21 @@ impl Runtime {
                 browser_id,
             ) {
                 Ok(process) => {
+                    let surface = process.initial_window();
+                    let actual_parent = self.connection.query_tree(surface)?.reply()?.parent;
+                    if actual_parent != parent {
+                        process.shutdown();
+                        return Err(format!(
+                            "{} returned a window outside its tab container",
+                            backend.label()
+                        )
+                        .into());
+                    }
+                    self.connection.change_window_attributes(
+                        surface,
+                        &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS),
+                    )?;
+                    configure_native_window(&self.connection, surface, embedded_bounds(bounds))?;
                     let mut runtime = EngineRuntime::initial(process);
                     self.cookie_sync.begin(backend);
                     runtime
@@ -570,15 +739,15 @@ impl Runtime {
                     self.tab_mut(tab_id)?.status = format!("Live · {}", backend.label());
                 }
                 Err(error) => {
+                    self.connection.destroy_window(parent)?;
                     let tab = self.tab_mut(tab_id)?;
                     tab.browser_id = None;
+                    tab.container = None;
                     tab.loading = false;
                     tab.status = format!("{} failed: {error}", backend.label());
                 }
             }
         } else {
-            let parent = self.parent;
-            let bounds = self.bounds;
             self.engine_mut(backend)
                 .as_mut()
                 .expect("engine presence was checked")
@@ -589,8 +758,8 @@ impl Runtime {
         Ok(())
     }
 
-    fn navigate(&mut self, url: &str) -> TabResult<()> {
-        let tab_id = self.active_tab;
+    fn navigate(&mut self, window_id: u64, url: &str) -> TabResult<()> {
+        let tab_id = self.window(window_id)?.active_tab;
         let (backend, browser_id) = {
             let tab = self.tab_mut(tab_id)?;
             tab.url = url.to_owned();
@@ -610,14 +779,17 @@ impl Runtime {
         Ok(())
     }
 
-    fn reload(&mut self) -> TabResult<()> {
-        let url = self.tab(self.active_tab)?.url.clone();
-        self.navigate(&url)
+    fn reload(&mut self, window_id: u64) -> TabResult<()> {
+        let tab_id = self.window(window_id)?.active_tab;
+        let url = self.tab(tab_id)?.url.clone();
+        self.navigate(window_id, &url)
     }
 
-    fn select(&mut self, tab_id: u64) -> TabResult<()> {
-        self.tab(tab_id)?;
-        self.active_tab = tab_id;
+    fn select(&mut self, window_id: u64, tab_id: u64) -> TabResult<()> {
+        if self.tab(tab_id)?.window_id != window_id {
+            return Err(format!("tab {tab_id} does not belong to window {window_id}").into());
+        }
+        self.window_mut(window_id)?.active_tab = tab_id;
         if self.tab(tab_id)?.browser_id.is_none() {
             self.attach_tab(tab_id)?;
         }
@@ -633,19 +805,44 @@ impl Runtime {
             .position(|tab| tab.id == tab_id)
             .ok_or_else(|| format!("tab {tab_id} does not exist"))?;
         let tab = self.tabs.remove(index);
-        if let Some(browser_id) = tab.browser_id
-            && let Some(engine) = self.engine_mut(tab.engine.backend())
-        {
-            engine.surfaces.remove(&browser_id);
-            engine.process.close_browser(browser_id, true)?;
+        if let Some(container) = tab.container {
+            let _ = self.connection.unmap_window(container);
+            if let Some(browser_id) = tab.browser_id {
+                self.retired_containers
+                    .insert(browser_id, (tab.engine.backend(), container));
+            } else {
+                self.connection.destroy_window(container)?;
+            }
         }
-        if self.tabs.is_empty() {
-            let id = self.add_tab(TabEngine::Chromium, "deb://new-tab/".to_owned());
-            self.active_tab = id;
+        if let Some(browser_id) = tab.browser_id {
+            if let Some(engine) = self.engine_mut(tab.engine.backend()) {
+                engine.surfaces.remove(&browser_id);
+                engine.process.close_browser(browser_id, true)?;
+            } else if let Some((_, container)) = self.retired_containers.remove(&browser_id) {
+                self.connection.destroy_window(container)?;
+            }
+        }
+        let remaining = self
+            .tabs
+            .iter()
+            .filter(|candidate| candidate.window_id == tab.window_id)
+            .map(|candidate| candidate.id)
+            .collect::<Vec<_>>();
+        if self.windows.contains_key(&tab.window_id) && remaining.is_empty() {
+            let id = self.add_tab(
+                tab.window_id,
+                TabEngine::Chromium,
+                "deb://new-tab/".to_owned(),
+            );
+            self.window_mut(tab.window_id)?.active_tab = id;
             self.attach_tab(id)?;
-        } else if self.active_tab == tab_id {
-            let next_index = index.min(self.tabs.len() - 1);
-            self.active_tab = self.tabs[next_index].id;
+        } else if self
+            .windows
+            .get(&tab.window_id)
+            .is_some_and(|window| window.active_tab == tab_id)
+            && let Some(next) = remaining.get(index.min(remaining.len().saturating_sub(1)))
+        {
+            self.window_mut(tab.window_id)?.active_tab = *next;
         }
         self.refresh_visibility()?;
         self.dirty = true;
@@ -682,25 +879,109 @@ impl Runtime {
         Ok(())
     }
 
-    fn layout(&mut self, bounds: NativeRect) -> TabResult<()> {
-        self.bounds = bounds;
-        for backend in [CefBackend::Chromium, CefBackend::Firefox] {
-            let browser_ids = self
-                .tabs
-                .iter()
-                .filter(|tab| tab.engine.backend() == backend)
-                .filter_map(|tab| tab.browser_id)
-                .collect::<Vec<_>>();
+    fn move_tab(&mut self, tab_id: u64, target_window: u64) -> TabResult<()> {
+        let (source_window, backend, browser_id, container) = {
+            let tab = self.tab(tab_id)?;
+            (
+                tab.window_id,
+                tab.engine.backend(),
+                tab.browser_id,
+                tab.container,
+            )
+        };
+        if source_window == target_window {
+            return Ok(());
+        }
+        let (target_parent, target_bounds) = {
+            let window = self.window(target_window)?;
+            (window.parent, window.bounds)
+        };
+        if let Some(container) = container {
+            self.connection
+                .reparent_window(container, target_parent, 0, 0)?;
+            configure_native_window(&self.connection, container, target_bounds)?;
+        }
+        if let Some(browser_id) = browser_id {
+            let surface = self
+                .engine(backend)
+                .and_then(|engine| engine.surfaces.get(&browser_id))
+                .copied()
+                .ok_or("moving tab has no native surface")?;
+            if self.connection.query_tree(surface)?.reply()?.parent
+                != container.ok_or("moving tab has no native container")?
+            {
+                return Err("moving tab escaped its native container".into());
+            }
+            configure_native_window(&self.connection, surface, embedded_bounds(target_bounds))?;
             if let Some(engine) = self.engine_mut(backend) {
-                for browser_id in browser_ids {
-                    engine.process.resize_browser(browser_id, bounds)?;
-                }
-                for window in engine.surfaces.values().copied().collect::<HashSet<_>>() {
-                    configure_native_window(&self.connection, window, bounds)?;
-                }
+                engine.process.resize_browser(browser_id, target_bounds)?;
+            }
+        }
+        self.tab_mut(tab_id)?.window_id = target_window;
+        self.window_mut(target_window)?.active_tab = tab_id;
+
+        let source_tabs = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.window_id == source_window)
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+        if source_tabs.is_empty() {
+            let replacement = self.add_tab(
+                source_window,
+                TabEngine::Chromium,
+                "deb://new-tab/".to_owned(),
+            );
+            self.window_mut(source_window)?.active_tab = replacement;
+            self.attach_tab(replacement)?;
+        } else if self.window(source_window)?.active_tab == tab_id {
+            self.window_mut(source_window)?.active_tab = source_tabs[0];
+        }
+        self.refresh_visibility()?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn layout(&mut self, window_id: u64, bounds: NativeRect) -> TabResult<()> {
+        self.window_mut(window_id)?.bounds = bounds;
+        let tab_states = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.window_id == window_id)
+            .map(|tab| {
+                (
+                    tab.engine.backend(),
+                    tab.browser_id,
+                    tab.container,
+                    tab.browser_id.and_then(|browser_id| {
+                        self.engine(tab.engine.backend())
+                            .and_then(|engine| engine.surfaces.get(&browser_id))
+                            .copied()
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (backend, browser_id, container, surface) in tab_states {
+            if let Some(container) = container {
+                configure_native_window(&self.connection, container, bounds)?;
+            }
+            if let Some(surface) = surface {
+                configure_native_window(&self.connection, surface, embedded_bounds(bounds))?;
+            }
+            if let Some(browser_id) = browser_id
+                && let Some(engine) = self.engine_mut(backend)
+            {
+                engine.process.resize_browser(browser_id, bounds)?;
             }
         }
         Ok(())
+    }
+
+    fn set_window_state(&mut self, id: u64, visible: bool, focused: bool) -> TabResult<()> {
+        let window = self.window_mut(id)?;
+        window.visible = visible;
+        window.focused = focused;
+        self.refresh_visibility()
     }
 
     fn poll_engine(&mut self, backend: CefBackend) -> TabResult<()> {
@@ -727,9 +1008,23 @@ impl Runtime {
         match notice.value {
             ProtocolNotice::SurfaceReady(raw_window) => {
                 let window = u32::try_from(raw_window)?;
-                if self.connection.query_tree(window)?.reply()?.parent != self.parent {
+                let (expected_parent, bounds) = self
+                    .tabs
+                    .iter()
+                    .find(|tab| {
+                        tab.engine.backend() == backend && tab.browser_id == Some(browser_id)
+                    })
+                    .map(|tab| {
+                        let bounds = self.windows.get(&tab.window_id).map(|entry| entry.bounds);
+                        (tab.container, bounds)
+                    })
+                    .ok_or("surface event targets an unknown tab")?;
+                let expected_parent = expected_parent.ok_or("tab has no native container")?;
+                let bounds = bounds.ok_or("surface event targets an unknown window")?;
+                let actual_parent = self.connection.query_tree(window)?.reply()?.parent;
+                if actual_parent != expected_parent {
                     return Err(format!(
-                        "{} returned a window outside the Qt host",
+                        "{} returned a window outside its tab container",
                         backend.label()
                     )
                     .into());
@@ -738,7 +1033,7 @@ impl Runtime {
                     window,
                     &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS),
                 )?;
-                configure_native_window(&self.connection, window, self.bounds)?;
+                configure_native_window(&self.connection, window, embedded_bounds(bounds))?;
                 self.engine_mut(backend)
                     .as_mut()
                     .expect("surface event requires an engine")
@@ -787,6 +1082,9 @@ impl Runtime {
                 }
             }
             ProtocolNotice::Closed => {
+                if let Some((_, container)) = self.retired_containers.remove(&browser_id) {
+                    self.connection.destroy_window(container)?;
+                }
                 if let Some(tab) = self.tab_for_browser_mut(backend, browser_id) {
                     tab.browser_id = None;
                     tab.loading = false;
@@ -815,6 +1113,17 @@ impl Runtime {
         let reason = exit.unwrap_or_else(|| "protocol connection closed".to_owned());
         if let Some(engine) = self.engine_mut(backend).take() {
             engine.process.shutdown();
+        }
+        let retired = self
+            .retired_containers
+            .iter()
+            .filter_map(|(browser_id, (retired_backend, container))| {
+                (*retired_backend == backend).then_some((*browser_id, *container))
+            })
+            .collect::<Vec<_>>();
+        for (browser_id, container) in retired {
+            self.retired_containers.remove(&browser_id);
+            self.connection.destroy_window(container)?;
         }
         let affected = self
             .tabs
@@ -899,10 +1208,10 @@ impl Runtime {
         let Some(automation) = self.automation.clone() else {
             return Ok(None);
         };
-        if automation.started.elapsed() > Duration::from_secs(25) {
+        if automation.started.elapsed() > Duration::from_secs(35) {
             return Ok(Some((
                 "FAIL".to_owned(),
-                "tab-aware smoke test did not complete within 25 seconds".to_owned(),
+                "multi-window tab smoke test did not complete within 35 seconds".to_owned(),
             )));
         }
         let phase = automation.phase.clone();
@@ -911,8 +1220,9 @@ impl Runtime {
                 let chromium_tab = automation.chromium_tab;
                 if self.tab_ready(chromium_tab) {
                     let initial_url = automation.initial_url.clone();
-                    let firefox_tab = self.add_tab(TabEngine::Firefox, initial_url);
-                    self.active_tab = firefox_tab;
+                    let window_id = self.tab(chromium_tab)?.window_id;
+                    let firefox_tab = self.add_tab(window_id, TabEngine::Firefox, initial_url);
+                    self.window_mut(window_id)?.active_tab = firefox_tab;
                     self.attach_tab(firefox_tab)?;
                     self.refresh_visibility()?;
                     let automation = self.automation.as_mut().expect("automation is active");
@@ -943,9 +1253,14 @@ impl Runtime {
             AutomationPhase::WaitCookies => {
                 if automation.chromium_cookie_seen && automation.firefox_cookie_seen {
                     let initial_url = automation.initial_url.clone();
-                    let chromium_sibling = self.add_tab(TabEngine::Chromium, initial_url.clone());
+                    let window_id = self.tab(automation.chromium_tab)?.window_id;
+                    let chromium_sibling =
+                        self.add_tab(window_id, TabEngine::Chromium, initial_url.clone());
+                    self.window_mut(window_id)?.active_tab = chromium_sibling;
                     self.attach_tab(chromium_sibling)?;
-                    let firefox_sibling = self.add_tab(TabEngine::Firefox, initial_url);
+                    self.refresh_visibility()?;
+                    let firefox_sibling = self.add_tab(window_id, TabEngine::Firefox, initial_url);
+                    self.window_mut(window_id)?.active_tab = firefox_sibling;
                     self.attach_tab(firefox_sibling)?;
                     self.refresh_visibility()?;
                     let automation = self.automation.as_mut().expect("automation is active");
@@ -970,6 +1285,19 @@ impl Runtime {
                     let target_url = automation.target_url.clone();
                     self.navigate_tab_to(chromium_tab, &target_url)?;
                     self.navigate_tab_to(firefox_tab, &target_url)?;
+                    self.navigate_tab_to(chromium_sibling, &target_url)?;
+                    self.navigate_tab_to(firefox_sibling, &target_url)?;
+                    let source_window = self.tab(chromium_tab)?.window_id;
+                    if let Some(second_window_chromium) = self
+                        .tabs
+                        .iter()
+                        .find(|tab| {
+                            tab.window_id != source_window && tab.engine == TabEngine::Chromium
+                        })
+                        .map(|tab| tab.id)
+                    {
+                        self.navigate_tab_to(second_window_chromium, &target_url)?;
+                    }
                     let automation = self.automation.as_mut().expect("automation is active");
                     automation.navigation_started.clear();
                     automation.navigation_settled.clear();
@@ -982,10 +1310,19 @@ impl Runtime {
             AutomationPhase::WaitNavigations => {
                 let chromium_tab = automation.chromium_tab;
                 let firefox_tab = automation.firefox_tab.expect("Firefox tab was created");
+                let chromium_sibling = automation
+                    .chromium_sibling
+                    .expect("Chromium sibling was created");
+                let firefox_sibling = automation
+                    .firefox_sibling
+                    .expect("Firefox sibling was created");
                 if automation.navigation_settled.contains(&chromium_tab)
                     && automation.navigation_settled.contains(&firefox_tab)
+                    && automation.navigation_settled.contains(&chromium_sibling)
+                    && automation.navigation_settled.contains(&firefox_sibling)
                 {
-                    self.select(chromium_tab)?;
+                    let window_id = self.tab(chromium_tab)?.window_id;
+                    self.select(window_id, chromium_tab)?;
                     self.automation
                         .as_mut()
                         .expect("automation is active")
@@ -998,10 +1335,11 @@ impl Runtime {
             AutomationPhase::CaptureChromium { deadline, attempts }
                 if Instant::now() >= deadline =>
             {
-                match self.capture_active() {
-                    Ok(variants) if variants >= 8 => {
+                match self.capture_tab(automation.chromium_tab) {
+                    Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let firefox_tab = automation.firefox_tab.expect("Firefox tab was created");
-                        self.select(firefox_tab)?;
+                        let window_id = self.tab(firefox_tab)?.window_id;
+                        self.select(window_id, firefox_tab)?;
                         let automation = self.automation.as_mut().expect("automation is active");
                         automation.chromium_variants = Some(variants);
                         automation.phase = AutomationPhase::CaptureFirefox {
@@ -1030,8 +1368,8 @@ impl Runtime {
             AutomationPhase::CaptureFirefox { deadline, attempts }
                 if Instant::now() >= deadline =>
             {
-                match self.capture_active() {
-                    Ok(variants) if variants >= 8 => {
+                match self.capture_tab(automation.firefox_tab.expect("Firefox tab was created")) {
+                    Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let chromium_process = self
                             .chromium
                             .as_ref()
@@ -1184,12 +1522,233 @@ impl Runtime {
                                 .to_owned(),
                         )));
                     }
-                    let chromium_tab = automation.chromium_tab;
-                    self.switch_engine(chromium_tab, TabEngine::Firefox)?;
+                    let source_window = self.tab(automation.chromium_tab)?.window_id;
+                    if let Some(target_window) = self
+                        .windows
+                        .keys()
+                        .copied()
+                        .find(|window_id| *window_id != source_window)
+                    {
+                        let chromium_sibling = automation
+                            .chromium_sibling
+                            .expect("Chromium sibling was created");
+                        self.select(source_window, chromium_sibling)?;
+                        let automation = self.automation.as_mut().expect("automation is active");
+                        automation.second_window = Some(target_window);
+                        automation.phase = AutomationPhase::PrepareChromiumMove {
+                            deadline: Instant::now() + Duration::from_millis(400),
+                            attempts: 0,
+                        };
+                    }
+                }
+            }
+            AutomationPhase::PrepareChromiumMove { deadline, attempts }
+                if Instant::now() >= deadline =>
+            {
+                let chromium_sibling = automation
+                    .chromium_sibling
+                    .expect("Chromium sibling was created");
+                match self.capture_tab(chromium_sibling) {
+                    Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
+                        let source_window = self.tab(chromium_sibling)?.window_id;
+                        let target_window = automation
+                            .second_window
+                            .ok_or("automation lost the second window")?;
+                        let firefox_sibling = automation
+                            .firefox_sibling
+                            .expect("Firefox sibling was created");
+                        self.move_tab(chromium_sibling, target_window)?;
+                        self.select(source_window, firefox_sibling)?;
+                        self.automation
+                            .as_mut()
+                            .expect("automation is active")
+                            .phase = AutomationPhase::PrepareFirefoxMove {
+                            deadline: Instant::now() + Duration::from_millis(400),
+                            attempts: 0,
+                        };
+                    }
+                    result if attempts < 8 => {
+                        eprintln!("deb-smoke: source Chromium capture retry: {result:?}");
+                        self.automation
+                            .as_mut()
+                            .expect("automation is active")
+                            .phase = AutomationPhase::PrepareChromiumMove {
+                            deadline: Instant::now() + Duration::from_millis(250),
+                            attempts: attempts + 1,
+                        };
+                    }
+                    result => {
+                        return Ok(Some((
+                            "FAIL".to_owned(),
+                            format!("source Chromium tab did not render before moving: {result:?}"),
+                        )));
+                    }
+                }
+            }
+            AutomationPhase::PrepareFirefoxMove { deadline, attempts }
+                if Instant::now() >= deadline =>
+            {
+                let firefox_sibling = automation
+                    .firefox_sibling
+                    .expect("Firefox sibling was created");
+                match self.capture_tab(firefox_sibling) {
+                    Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
+                        let target_window = automation
+                            .second_window
+                            .ok_or("automation lost the second window")?;
+                        self.move_tab(firefox_sibling, target_window)?;
+                        self.automation
+                            .as_mut()
+                            .expect("automation is active")
+                            .phase = AutomationPhase::WaitWindowMoves;
+                        eprintln!(
+                            "deb-smoke: moved live Chromium and Gecko tabs into the second Qt window"
+                        );
+                    }
+                    result if attempts < 8 => {
+                        eprintln!("deb-smoke: source Gecko capture retry: {result:?}");
+                        self.automation
+                            .as_mut()
+                            .expect("automation is active")
+                            .phase = AutomationPhase::PrepareFirefoxMove {
+                            deadline: Instant::now() + Duration::from_millis(250),
+                            attempts: attempts + 1,
+                        };
+                    }
+                    result => {
+                        return Ok(Some((
+                            "FAIL".to_owned(),
+                            format!("source Gecko tab did not render before moving: {result:?}"),
+                        )));
+                    }
+                }
+            }
+            AutomationPhase::WaitWindowMoves => {
+                if self
+                    .chromium
+                    .as_ref()
+                    .map(|engine| engine.process.process_id())
+                    != automation.chromium_process
+                    || self
+                        .firefox
+                        .as_ref()
+                        .map(|engine| engine.process.process_id())
+                        != automation.firefox_process
+                {
+                    return Ok(Some((
+                        "FAIL".to_owned(),
+                        "moving a tab replaced a shared profile helper".to_owned(),
+                    )));
+                }
+                let target_window = automation
+                    .second_window
+                    .ok_or("automation did not record the second window")?;
+                let target_parent = self.window(target_window)?.parent;
+                let chromium_sibling = automation
+                    .chromium_sibling
+                    .expect("Chromium sibling was created");
+                let firefox_sibling = automation
+                    .firefox_sibling
+                    .expect("Firefox sibling was created");
+                let moved_tabs = [chromium_sibling, firefox_sibling];
+                let mut correctly_reparented = true;
+                for tab_id in moved_tabs {
+                    let tab = self.tab(tab_id)?;
+                    let browser_id = tab.browser_id.ok_or("moved tab has no browser")?;
+                    let container = tab.container.ok_or("moved tab has no native container")?;
+                    let surface = self
+                        .engine(tab.engine.backend())
+                        .and_then(|engine| engine.surfaces.get(&browser_id))
+                        .copied()
+                        .ok_or("moved tab has no native surface")?;
+                    correctly_reparented &= tab.window_id == target_window
+                        && self.connection.query_tree(container)?.reply()?.parent == target_parent
+                        && self.connection.query_tree(surface)?.reply()?.parent == container;
+                }
+                if correctly_reparented
+                    && self.tab_ready(chromium_sibling)
+                    && self.tab_ready(firefox_sibling)
+                {
+                    self.select(target_window, chromium_sibling)?;
                     self.automation
                         .as_mut()
                         .expect("automation is active")
-                        .phase = AutomationPhase::WaitEngineSwitch;
+                        .phase = AutomationPhase::CaptureMovedChromium {
+                        deadline: Instant::now() + Duration::from_millis(400),
+                        attempts: 0,
+                    };
+                }
+            }
+            AutomationPhase::CaptureMovedChromium { deadline, attempts }
+                if Instant::now() >= deadline =>
+            {
+                let chromium_sibling = automation
+                    .chromium_sibling
+                    .expect("Chromium sibling was created");
+                match self.capture_tab(chromium_sibling) {
+                    Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
+                        let target_window = automation
+                            .second_window
+                            .ok_or("automation lost the second window")?;
+                        let firefox_sibling = automation
+                            .firefox_sibling
+                            .expect("Firefox sibling was created");
+                        self.select(target_window, firefox_sibling)?;
+                        let automation = self.automation.as_mut().expect("automation is active");
+                        automation.moved_chromium_variants = Some(variants);
+                        automation.phase = AutomationPhase::CaptureMovedFirefox {
+                            deadline: Instant::now() + Duration::from_millis(400),
+                            attempts: 0,
+                        };
+                    }
+                    result if attempts < 4 => {
+                        eprintln!("deb-smoke: moved Chromium capture retry: {result:?}");
+                        self.automation
+                            .as_mut()
+                            .expect("automation is active")
+                            .phase = AutomationPhase::CaptureMovedChromium {
+                            deadline: Instant::now() + Duration::from_millis(200),
+                            attempts: attempts + 1,
+                        };
+                    }
+                    result => {
+                        return Ok(Some((
+                            "FAIL".to_owned(),
+                            format!("moved Chromium tab did not render: {result:?}"),
+                        )));
+                    }
+                }
+            }
+            AutomationPhase::CaptureMovedFirefox { deadline, attempts }
+                if Instant::now() >= deadline =>
+            {
+                let firefox_sibling = automation
+                    .firefox_sibling
+                    .expect("Firefox sibling was created");
+                match self.capture_tab(firefox_sibling) {
+                    Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
+                        let chromium_tab = automation.chromium_tab;
+                        self.switch_engine(chromium_tab, TabEngine::Firefox)?;
+                        let automation = self.automation.as_mut().expect("automation is active");
+                        automation.moved_firefox_variants = Some(variants);
+                        automation.phase = AutomationPhase::WaitEngineSwitch;
+                    }
+                    result if attempts < 4 => {
+                        eprintln!("deb-smoke: moved Gecko capture retry: {result:?}");
+                        self.automation
+                            .as_mut()
+                            .expect("automation is active")
+                            .phase = AutomationPhase::CaptureMovedFirefox {
+                            deadline: Instant::now() + Duration::from_millis(200),
+                            attempts: attempts + 1,
+                        };
+                    }
+                    result => {
+                        return Ok(Some((
+                            "FAIL".to_owned(),
+                            format!("moved Gecko tab did not render: {result:?}"),
+                        )));
+                    }
                 }
             }
             AutomationPhase::WaitEngineSwitch => {
@@ -1211,18 +1770,21 @@ impl Runtime {
                         .filter(|tab| tab.engine == TabEngine::Firefox)
                         .filter_map(|tab| tab.browser_id)
                         .collect::<HashSet<_>>();
-                    if firefox_browser_ids.len() != 3
-                        || !firefox_browser_ids
-                            .iter()
-                            .all(|browser_id| firefox.surfaces.contains_key(browser_id))
-                    {
+                    if firefox_browser_ids.len() != 3 {
                         return Ok(Some((
                             "FAIL".to_owned(),
                             "engine switch did not create three Gecko browsers in one helper"
                                 .to_owned(),
                         )));
                     }
-                    self.select(switched_tab)?;
+                    if !firefox_browser_ids
+                        .iter()
+                        .all(|browser_id| firefox.surfaces.contains_key(browser_id))
+                    {
+                        return Ok(None);
+                    }
+                    let window_id = self.tab(switched_tab)?.window_id;
+                    self.select(window_id, switched_tab)?;
                     self.automation
                         .as_mut()
                         .expect("automation is active")
@@ -1235,14 +1797,16 @@ impl Runtime {
             AutomationPhase::CaptureSwitched { deadline, attempts }
                 if Instant::now() >= deadline =>
             {
-                match self.capture_active() {
-                    Ok(switched_variants) if switched_variants >= 8 => {
+                match self.capture_tab(automation.chromium_tab) {
+                    Ok(switched_variants) if switched_variants >= MIN_RENDER_VARIANTS => {
                         return Ok(Some((
                             "PASS".to_owned(),
                             format!(
-                                "four concurrent tabs rendered in two profile helpers and synchronized a cookie; Chromium renderer and Gecko content crashes stayed isolated from same-engine siblings and recovered without replacing either helper; Chromium->Firefox switching then created a third Gecko browser in the same helper (Chromium {}, Gecko {}, switched Gecko {switched_variants} sampled colors)",
+                                "two Qt windows shared one helper per profile-engine; live Chromium and Gecko tabs retained their browser instances while moving between X11 hosts; renderer/content crashes stayed isolated and recovered; Chromium->Firefox switching created a third Gecko browser (Chromium {}, Gecko {}, moved Chromium {}, moved Gecko {}, switched Gecko {switched_variants} sampled colors)",
                                 automation.chromium_variants.unwrap_or_default(),
                                 automation.firefox_variants.unwrap_or_default(),
+                                automation.moved_chromium_variants.unwrap_or_default(),
+                                automation.moved_firefox_variants.unwrap_or_default(),
                             ),
                         )));
                     }
@@ -1294,16 +1858,26 @@ impl Runtime {
         Ok(())
     }
 
-    fn capture_active(&mut self) -> TabResult<usize> {
-        self.refresh_visibility()?;
-        let active = self.tab(self.active_tab)?;
+    fn capture_tab(&mut self, tab_id: u64) -> TabResult<usize> {
+        let window_id = self.tab(tab_id)?.window_id;
+        if self.window(window_id)?.active_tab != tab_id {
+            self.select(window_id, tab_id)?;
+        } else {
+            self.refresh_visibility()?;
+        }
+        let active = self.tab(tab_id)?;
         let browser_id = active.browser_id.ok_or("active tab has no browser")?;
         let window = self
             .engine(active.engine.backend())
             .and_then(|engine| engine.surfaces.get(&browser_id))
             .copied()
             .ok_or("active tab has no native surface")?;
-        sampled_pixel_variants(&self.connection, window)
+        let variants = sampled_pixel_variants(&self.connection, window)?;
+        eprintln!(
+            "deb-smoke: sampled tab {tab_id} browser {browser_id} ({:?}, {:?}): {variants} colors",
+            active.url, active.title
+        );
+        Ok(variants)
     }
 
     fn apply_cookie_actions(&mut self, actions: Vec<CookieAction>) -> TabResult<()> {
@@ -1327,52 +1901,92 @@ impl Runtime {
     }
 
     fn refresh_visibility(&mut self) -> TabResult<()> {
-        let active = self.tab(self.active_tab)?;
-        let active_backend = active.engine.backend();
-        let active_browser = active.browser_id;
-        let active_window = active_browser.and_then(|browser_id| {
-            self.engine(active_backend)
-                .and_then(|engine| engine.surfaces.get(&browser_id).copied())
-        });
         let browser_states = self
             .tabs
             .iter()
             .filter_map(|tab| {
-                tab.browser_id
-                    .map(|browser_id| (tab.engine.backend(), browser_id, tab.id == self.active_tab))
+                let window = self.windows.get(&tab.window_id)?;
+                tab.browser_id.map(|browser_id| {
+                    let visible = window.visible && window.active_tab == tab.id;
+                    (
+                        tab.engine.backend(),
+                        browser_id,
+                        visible,
+                        visible && window.focused,
+                        window.parent,
+                        window.bounds,
+                        tab.container,
+                    )
+                })
             })
             .collect::<Vec<_>>();
-        for (backend, browser_id, visible) in browser_states {
-            if let Some(engine) = self.engine_mut(backend) {
-                engine.process.set_browser_visible(browser_id, visible)?;
-                engine.process.focus_browser(browser_id, visible)?;
-            }
-        }
-        let windows = [self.chromium.as_ref(), self.firefox.as_ref()]
-            .into_iter()
-            .flatten()
-            .flat_map(|engine| engine.surfaces.values().copied())
-            .collect::<HashSet<_>>();
-        for window in windows {
-            if Some(window) == active_window {
-                configure_native_window(&self.connection, window, self.bounds)?;
-                if self
-                    .connection
-                    .get_window_attributes(window)?
-                    .reply()?
-                    .map_state
-                    == MapState::UNMAPPED
-                {
-                    self.connection.map_window(window)?;
+        for (backend, browser_id, visible, focused, parent, bounds, container) in browser_states {
+            let surface = self
+                .engine(backend)
+                .and_then(|engine| engine.surfaces.get(&browser_id))
+                .copied();
+            let mut revealed = false;
+            if let Some(container) = container {
+                if self.connection.query_tree(container)?.reply()?.parent != parent {
+                    self.connection.reparent_window(container, parent, 0, 0)?;
                 }
-                self.connection.configure_window(
-                    window,
-                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-                )?;
-                self.connection
-                    .set_input_focus(InputFocus::PARENT, window, x11rb::CURRENT_TIME)?;
-            } else {
-                let _ = self.connection.unmap_window(window);
+                if visible {
+                    configure_native_window(&self.connection, container, bounds)?;
+                    revealed = self
+                        .connection
+                        .get_window_attributes(container)?
+                        .reply()?
+                        .map_state
+                        == MapState::UNMAPPED;
+                    if revealed {
+                        self.connection.map_window(container)?;
+                    }
+                    self.connection.configure_window(
+                        container,
+                        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                    )?;
+                } else {
+                    let _ = self.connection.unmap_window(container);
+                }
+            }
+            if let Some(surface) = surface {
+                if self.connection.query_tree(surface)?.reply()?.parent
+                    != container.ok_or("browser surface has no tab container")?
+                {
+                    return Err("browser surface escaped its tab container".into());
+                }
+                if visible {
+                    configure_native_window(&self.connection, surface, embedded_bounds(bounds))?;
+                    if self
+                        .connection
+                        .get_window_attributes(surface)?
+                        .reply()?
+                        .map_state
+                        == MapState::UNMAPPED
+                    {
+                        self.connection.map_window(surface)?;
+                    }
+                    self.connection.configure_window(
+                        surface,
+                        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                    )?;
+                    if focused {
+                        self.connection.set_input_focus(
+                            InputFocus::PARENT,
+                            surface,
+                            x11rb::CURRENT_TIME,
+                        )?;
+                    }
+                    if revealed && backend == CefBackend::Chromium {
+                        self.connection.clear_area(true, surface, 0, 0, 0, 0)?;
+                    }
+                }
+                self.connection.flush()?;
+            }
+            if let Some(engine) = self.engine_mut(backend) {
+                engine.process.resize_browser(browser_id, bounds)?;
+                engine.process.set_browser_visible(browser_id, visible)?;
+                engine.process.focus_browser(browser_id, focused)?;
             }
         }
         self.connection.flush()?;
@@ -1382,13 +1996,15 @@ impl Runtime {
     fn handle_x11_events(&mut self) -> TabResult<()> {
         while let Some(event) = self.connection.poll_for_event()? {
             if let Event::ButtonPress(event) = event {
-                let active = self.tab(self.active_tab)?;
-                if let Some(browser_id) = active.browser_id
-                    && self
-                        .engine(active.engine.backend())
+                let target = self.tabs.iter().find_map(|tab| {
+                    let browser_id = tab.browser_id?;
+                    self.engine(tab.engine.backend())
                         .and_then(|engine| engine.surfaces.get(&browser_id))
                         .is_some_and(|window| *window == event.event)
-                    && let Some(engine) = self.engine_mut(active.engine.backend())
+                        .then_some((tab.engine.backend(), browser_id))
+                });
+                if let Some((backend, browser_id)) = target
+                    && let Some(engine) = self.engine_mut(backend)
                 {
                     engine.process.focus_browser(browser_id, true)?;
                 }
@@ -1398,27 +2014,31 @@ impl Runtime {
     }
 
     fn publish(&mut self) {
-        let active = match self.tab(self.active_tab) {
-            Ok(tab) => tab,
-            Err(error) => {
-                eprintln!("deb: cannot publish active tab: {error}");
-                return;
-            }
+        let mut windows = self.windows.values().collect::<Vec<_>>();
+        windows.sort_by_key(|window| window.id);
+        let snapshot = ProfileSnapshot {
+            windows: windows
+                .into_iter()
+                .map(|window| WindowSnapshot {
+                    id: window.id.to_string(),
+                    label: &window.label,
+                    active_tab_id: window.active_tab.to_string(),
+                    tabs: self
+                        .tabs
+                        .iter()
+                        .filter(|tab| tab.window_id == window.id)
+                        .map(Tab::snapshot)
+                        .collect(),
+                })
+                .collect(),
         };
-        let json = serde_json::to_string(&self.tabs.iter().map(Tab::snapshot).collect::<Vec<_>>())
-            .unwrap_or_else(|_| "[]".to_owned());
+        let json =
+            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{\"windows\":[]}".to_owned());
         let invoker = self
             .invoker
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        invoke_method!(
-            &*invoker,
-            "update_tab_state",
-            json,
-            active.id.to_string(),
-            active.url.clone(),
-            active.status.clone()
-        );
+        invoke_method!(&*invoker, "update_window_state", json);
         self.dirty = false;
     }
 
@@ -1434,6 +2054,18 @@ impl Runtime {
             CefBackend::Chromium => &mut self.chromium,
             CefBackend::Firefox => &mut self.firefox,
         }
+    }
+
+    fn window(&self, id: u64) -> TabResult<&BrowserWindow> {
+        self.windows
+            .get(&id)
+            .ok_or_else(|| format!("window {id} does not exist").into())
+    }
+
+    fn window_mut(&mut self, id: u64) -> TabResult<&mut BrowserWindow> {
+        self.windows
+            .get_mut(&id)
+            .ok_or_else(|| format!("window {id} does not exist").into())
     }
 
     fn tab(&self, tab_id: u64) -> TabResult<&Tab> {

@@ -1,34 +1,35 @@
 # deb
 
-`deb` is a Linux/X11 desktop browser shell whose tabs can run in Chromium or Gecko inside one Qt Quick window. The Rust/Qt shell uses Qt Bridges, and the active tab is a native child surface controlled through the same CEF-facing `cef-renderer` executable for either engine.
+`deb` is a Linux/X11 desktop browser shell whose tabs can run in Chromium or Gecko across multiple Qt Quick windows. The Rust/Qt shell uses Qt Bridges, and each visible window's active tab is a native child surface controlled through the same CEF-facing `cef-renderer` executable for either engine.
 
 | Tab engine | `cef-renderer` resolves `libcef.so` to | Engine |
 | --- | --- | --- |
 | Chromium | the project-built, patched CEF runtime | Chromium from CEF's pinned Chromium checkout |
 | Firefox | the private `firefox-cef` adapter | Gecko from the pinned Firefox source tree |
 
-The Firefox side is not automation of a separately installed Firefox. Its private helper loads the project-built CEF adapter, the adapter loads `libxul.so`, and a small component compiled into that Firefox runtime provides the bridge between CEF operations and Gecko. The patched GTK widget creates the `FirefoxCEF` surface as a direct X11 child of the Qt host.
+The Firefox side is not automation of a separately installed Firefox. Its private helper loads the project-built CEF adapter, the adapter loads `libxul.so`, and a small component compiled into that Firefox runtime provides the bridge between CEF operations and Gecko. Each loaded Gecko browser window reports its stable top-level XID through that component and remains parented to one app-owned tab container; activation reasserts that same parent to keep GTK/X11 presentation healthy after sibling crashes.
 
 ## Architecture
 
 ```text
 Qt/Rust application process
   Qt GUI thread
-    active-tab host QWidget (X11 parent)
-      ├── selected Chromium browser child ─────────┐
-      └── FirefoxCEF GTK child ────────────────────┼───────────────┐
-                                                   │               │
+    one host QWidget per Qt browser window (X11 parents)
+      └── selected app-owned tab container XID (moves between hosts)
+          └── engine surface XID (keeps the same direct parent)
+
 Per-profile Chromium cef-renderer process   Per-profile Firefox cef-renderer process
   helper main/control threads                 main thread: CEF loop -> XRE_main
   project-built patched libcef.so             private libcef.so (Rust adapter)
   one CEF browser per Chromium tab            -> libxul.so bridge
-  Chromium child processes                    one remote browser per Firefox tab
-    renderer / GPU / network                  FirefoxCEF GTK child ───────────┘
-                                              Gecko child processes
+  native browser child XIDs ─────────────┐     FirefoxCEF XUL window XIDs ─────┐
+  Chromium child processes              │     one remote browser per tab       │
+    renderer / GPU / network            │     Gecko child processes           │
+                                        └──── app-owned containers ────────────┘
                                                 web content / socket / RDD
 ```
 
-Both helpers have the same `DT_NEEDED: libcef.so` dependency and execute the same CEF calls. Loader isolation selects the implementation. A profile starts at most one helper per engine, and every tab of that engine is a separate browser inside the helper. The Chromium helper enables CEF's multi-threaded loop; the Gecko helper runs the CEF loop and XRE on its process main thread. Standard Chromium renderer and Gecko content-process isolation remains in place behind those browser processes.
+Both helpers have the same `DT_NEEDED: libcef.so` dependency and execute the same CEF calls. Loader isolation selects the implementation. A profile starts at most one helper per engine, and every tab of that engine is a separate browser inside the helper. Each tab owns a stable X11 container; moving it reparents that container to another Qt host while the engine surface remains attached to the same parent for its whole lifetime. The browser, page, and helper are not recreated. The Chromium helper enables CEF's multi-threaded loop; the Gecko helper runs the CEF loop and XRE on its process main thread. Standard Chromium renderer and Gecko content-process isolation remains in place behind those browser processes.
 
 The shell and each helper communicate over a private inherited `AF_UNIX/SOCK_SEQPACKET` socket. Messages use the internal protobuf schema in `shell-protocol/proto/shell.proto`; stdout and stderr are not protocol channels. Startup verifies the engine identity, CEF API version, packet limit, and capabilities before the shell requests an X11 browser child. Runtime operations use correlated request/response packets, while surface, loading, and lifecycle changes are ordered events. See [the shell protocol design](docs/shell-protocol.md).
 
@@ -76,7 +77,7 @@ Run the application:
 cargo run -p deb
 ```
 
-It opens `deb://new-tab/` in a Chromium tab. Create Chromium or Firefox tabs with the two add-tab buttons, use the engine picker to reload the current URL in the other engine, and use **Add profile** to create another isolated workspace in the same running application.
+It opens `deb://new-tab/` in a Chromium tab. Create Chromium or Firefox tabs with the two add-tab buttons, use the engine picker to reload the current URL in the other engine, open another top-level window with **New window**, and move a live tab between windows from **Move tab**. Windows belonging to the same profile share its controller and helper pair. Use **Add profile** to create another isolated workspace in the same running application.
 
 ## Profiles and XDG storage
 
@@ -97,7 +98,7 @@ $XDG_CACHE_HOME/deb/profiles/<profile-id>/
 
 Chromium receives an explicit persistent CEF `cache_path`; its disk cache is redirected to the XDG cache directory. Gecko runs with the Firefox data directory as its native `--profile` and redirects `cache2` through `browser.cache.disk.parent_directory`. Each engine keeps its native cookie database, while `deb` reconciles both through the profile's WAL-protected `cookies.sqlite3` canonical store and mirrors live changes in both directions. Cookie identity includes domain, path, and the complete serializable partition key. Opaque/nonce partition keys remain engine-local because the other engine cannot recreate them. Local storage, IndexedDB, service workers, permissions, caches, and other state remain engine-native and are never shared as raw files.
 
-Each profile workspace lazily owns one Chromium helper and one Firefox helper. All same-engine tabs in that profile share the corresponding helper, while each tab retains its own browser, native engine isolation, URL, title, loading state, and crash state. Opening another profile starts another isolated helper pair, and previously opened profiles remain alive while the application is running. This gives complete cookie/storage separation and avoids attempting to switch Gecko's process-global Firefox profile in place.
+Each profile workspace lazily owns one Chromium helper and one Firefox helper. All same-engine tabs and top-level windows in that profile share the corresponding helper, while each tab retains its own browser, native engine isolation, URL, title, loading state, crash state, and current window assignment. Opening another profile starts another isolated helper pair, and previously opened profiles remain alive while the application is running. This gives complete cookie/storage separation and avoids attempting to switch Gecko's process-global Firefox profile in place.
 
 ## Internal pages
 
@@ -117,7 +118,7 @@ The implemented slice covers:
 - reference-counted browser, browser-host, main-frame, and task objects
 - life-span, loading-state, and load-error callbacks
 - navigation, reload, focus, resize, native-window lookup, and close
-- multiple browsers per profile helper, visibility changes, titles, committed URLs, and renderer/content crash events
+- multiple browsers per profile helper, app-container embedding, visibility changes, titles, committed URLs, and renderer/content crash events
 - registration of the build-owned `deb://new-tab/` internal page
 - global cookie snapshots, exact set/delete operations, live change observation, timestamps, and serializable partition keys
 
@@ -156,7 +157,7 @@ For the normal inner loop after changing Rust, QML, or the adapter, run:
 scripts/smoke-test.sh
 ```
 
-This performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches `deb` with isolated temporary XDG directories under `xvfb-run`. The application creates two tabs per engine in one profile, verifies cookie synchronization, navigates and samples both native engines to reject blank rendering, deliberately crashes one Chromium renderer and one Gecko content process, and requires recovery without affecting either same-engine sibling or replacing a helper. It then switches the crashed-and-recovered Chromium tab to Gecko, verifies three Gecko browsers in the same helper, shuts down, and returns a real pass/fail exit status. The wrapper also checks that both engine-native profile/cache trees and the canonical SQLite cookie store were created. On the current development machine the runtime portion takes roughly fifteen seconds.
+This performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches `deb` with isolated temporary XDG directories under `xvfb-run`. The application creates two tabs per engine in one profile, verifies cookie synchronization, navigates and samples both native engines to reject blank rendering, deliberately crashes one Chromium renderer and one Gecko content process, and requires recovery without affecting either same-engine sibling or replacing a helper. It then opens a second Qt window, moves live Chromium and Gecko tabs into it, verifies that each tab container moved while its engine surface parent and browser/helper identities stayed intact, samples both moved surfaces, switches the recovered Chromium tab to Gecko, and exits with a real pass/fail status. The wrapper also checks that both engine-native profile/cache trees and the canonical SQLite cookie store were created.
 
 `scripts/build-firefox-cef.sh` runs the same smoke test automatically after either a full Gecko build or a cached Rust-only rebuild. `scripts/smoke-test.sh --no-build` is available when the binaries and staged runtime are already current.
 

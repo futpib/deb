@@ -340,6 +340,7 @@ pub fn run_message_loop() -> RuntimeResult<c_int> {
     let executable = std::env::current_exe()?;
     let arguments = [
         path_cstring(&executable)?,
+        CString::new("--firefox-cef")?,
         CString::new("--profile")?,
         path_cstring(&runtime.profile)?,
         CString::new("--no-remote")?,
@@ -495,12 +496,17 @@ impl BrowserState {
 
     pub fn sync_from_parent(&self, focus: bool) -> RuntimeResult<()> {
         let (connection, _) = x11rb::connect(None)?;
-        let geometry = connection.get_geometry(self.parent)?.reply()?;
+        let window = self.window();
+        let parent = if window == 0 {
+            self.parent
+        } else {
+            connection.query_tree(window)?.reply()?.parent
+        };
+        let geometry = connection.get_geometry(parent)?.reply()?;
         let width = u32::from(geometry.width).max(2);
         let height = u32::from(geometry.height).max(2);
         self.width.store(width, Ordering::Release);
         self.height.store(height, Ordering::Release);
-        let window = self.window();
         if window != 0 {
             connection.configure_window(
                 window,

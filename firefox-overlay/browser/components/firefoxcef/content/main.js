@@ -7,27 +7,21 @@ const bridge = Cc[
 ].getService(Ci.nsIFirefoxCefBridge);
 
 const browsers = new Map();
-
+const windowParameters = new URLSearchParams(window.location.search);
+const childBrowserId = Number(windowParameters.get("browserId"));
+const startsRuntime = !Number.isInteger(childBrowserId) || childBrowserId <= 0;
+const coordinator = startsRuntime;
+const ownedBrowserId = coordinator ? bridge.browserId : childBrowserId;
+const ownedInitialUrl = coordinator
+  ? bridge.initialUrl
+  : windowParameters.get("url") ?? "about:blank";
 function loadUrl(browser, url) {
   browser.loadURI(Services.io.newURI(url), {
     triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
   });
 }
 
-function activateBrowser(browser) {
-  for (const entry of browsers.values()) {
-    const active = entry.browser == browser;
-    entry.browser.docShellIsActive = active;
-    entry.browser.hidden = !active;
-  }
-  document.getElementById("browsers").selectedPanel = browser;
-}
-
-function createBrowser(browserId, initialUrl) {
-  if (!browserId || browsers.has(browserId)) {
-    return;
-  }
-
+function createBrowserElement(browserId) {
   const browser = document.createXULElement("browser");
   browser.id = `content-${browserId}`;
   browser.setAttribute("type", "content");
@@ -36,7 +30,51 @@ function createBrowser(browserId, initialUrl) {
   browser.setAttribute("remoteType", "web");
   browser.setAttribute("maychangeremoteness", "true");
   browser.setAttribute("flex", "1");
+  return browser;
+}
 
+function presentBrowser(entry) {
+  const baseWindow = window.docShell.treeOwner.QueryInterface(Ci.nsIBaseWindow);
+  bridge.attachWindow(entry.browserId, baseWindow);
+  entry.browser.frameLoader?.requestUpdatePosition();
+  window.windowUtils.updateLayerTree();
+  entry.browser.focus();
+}
+
+function finishActivation(entry) {
+  if (!entry.active || !entry.browser.isConnected) {
+    return;
+  }
+  entry.browser.hidden = false;
+  entry.browser.getBoundingClientRect();
+  entry.browser.preserveLayers(false);
+  entry.browser.docShellIsActive = true;
+  const remoteTab = entry.browser.frameLoader?.remoteTab;
+  if (remoteTab) {
+    remoteTab.priorityHint = true;
+  }
+  entry.browser.renderLayers = true;
+  presentBrowser(entry);
+}
+
+function activateBrowser(browser) {
+  let selectedBrowser = browser;
+  for (const entry of browsers.values()) {
+    entry.active = entry.browser == browser;
+    if (entry.active) {
+      finishActivation(entry);
+      selectedBrowser = entry.browser;
+    } else {
+      const remoteTab = entry.browser.frameLoader?.remoteTab;
+      if (remoteTab) {
+        remoteTab.priorityHint = false;
+      }
+    }
+  }
+  document.getElementById("browsers").selectedPanel = selectedBrowser;
+}
+
+function registerBrowser(browserId, browser, initialUrl) {
   const progressListener = {
     QueryInterface: ChromeUtils.generateQI([
       "nsIWebProgressListener",
@@ -76,7 +114,10 @@ function createBrowser(browserId, initialUrl) {
   };
 
   const titleListener = () => {
-    bridge.titleChanged(browserId, browser.contentTitle ?? "");
+    bridge.titleChanged(
+      browserId,
+      browsers.get(browserId)?.browser.contentTitle ?? ""
+    );
   };
   const crashListener = () => {
     const entry = browsers.get(browserId);
@@ -86,7 +127,6 @@ function createBrowser(browserId, initialUrl) {
     bridge.browserCrashed(browserId, "Gecko content process terminated");
   };
 
-  document.getElementById("browsers").appendChild(browser);
   browser.webProgress.addProgressListener(
     progressListener,
     Ci.nsIWebProgress.NOTIFY_LOCATION |
@@ -94,14 +134,29 @@ function createBrowser(browserId, initialUrl) {
   );
   browser.addEventListener("DOMTitleChanged", titleListener, true);
   browser.addEventListener("oop-browser-crashed", crashListener);
-  browsers.set(browserId, {
+  const entry = {
+    active: false,
     browser,
+    browserId,
     crashListener,
     crashed: false,
     currentUrl: initialUrl,
     progressListener,
     titleListener,
-  });
+  };
+  browsers.set(browserId, entry);
+  return entry;
+}
+
+function createBrowser(browserId, initialUrl) {
+  if (!browserId || browsers.has(browserId)) {
+    return;
+  }
+
+  const browser = createBrowserElement(browserId);
+  document.getElementById("browsers").appendChild(browser);
+  browser.getBoundingClientRect();
+  registerBrowser(browserId, browser, initialUrl);
 
   activateBrowser(browser);
   loadUrl(browser, initialUrl);
@@ -138,8 +193,11 @@ function setBrowserVisibility(browserId, visible) {
     activateBrowser(entry.browser);
     return;
   }
-  entry.browser.docShellIsActive = false;
-  entry.browser.hidden = true;
+  entry.active = false;
+  const remoteTab = entry.browser.frameLoader?.remoteTab;
+  if (remoteTab) {
+    remoteTab.priorityHint = false;
+  }
 }
 
 function closeBrowser(browserId, force) {
@@ -153,58 +211,82 @@ function closeBrowser(browserId, force) {
   removeBrowser(browserId, true);
 }
 
-window.addEventListener("load", () => {
-  Services.obs.addObserver((subject, topic, command) => {
-    const [name, browserIdText, ...arguments_] = command.split("\t");
-    const browserId = Number.parseInt(browserIdText, 10);
-    const entry = browsers.get(browserId);
-    switch (name) {
-      case "create":
-        createBrowser(browserId, arguments_.join("\t"));
-        break;
-      case "navigate":
-        if (entry) {
-          const url = arguments_.join("\t");
-          if (entry.crashed) {
-            replaceCrashedBrowser(browserId, url);
-          } else {
-            loadUrl(entry.browser, url);
-            activateBrowser(entry.browser);
-            entry.browser.focus();
-          }
-        }
-        break;
-      case "reload":
-        if (entry?.crashed) {
-          replaceCrashedBrowser(browserId, entry.currentUrl);
+const commandObserver = (subject, topic, command) => {
+  const [name, browserIdText, ...arguments_] = command.split("\t");
+  const browserId = Number.parseInt(browserIdText, 10);
+  const entry = browsers.get(browserId);
+  switch (name) {
+    case "create":
+      if (coordinator) {
+        const url = arguments_.join("\t");
+        const childUrl =
+          `chrome://firefoxcef/content/main.xhtml?browserId=${browserId}` +
+          `&url=${encodeURIComponent(url)}`;
+        Services.ww.openWindow(
+          null,
+          childUrl,
+          `_firefox_cef_${browserId}`,
+          "chrome,dialog=no,resizable",
+          null
+        );
+      }
+      break;
+    case "navigate":
+      if (entry) {
+        const url = arguments_.join("\t");
+        if (entry.crashed) {
+          replaceCrashedBrowser(browserId, url);
         } else {
-          entry?.browser.reload();
-        }
-        break;
-      case "focus":
-        if (entry) {
-          window.focus();
+          loadUrl(entry.browser, url);
           activateBrowser(entry.browser);
           entry.browser.focus();
         }
-        break;
-      case "visibility":
-        setBrowserVisibility(browserId, arguments_[0] == "1");
-        break;
-      case "close":
+      }
+      break;
+    case "reload":
+      if (entry?.crashed) {
+        replaceCrashedBrowser(browserId, entry.currentUrl);
+      } else {
+        entry?.browser.reload();
+      }
+      break;
+    case "focus":
+      if (entry) {
+        window.focus();
+        activateBrowser(entry.browser);
+        entry.browser.focus();
+      }
+      break;
+    case "visibility":
+      setBrowserVisibility(browserId, arguments_[0] == "1");
+      break;
+    case "close":
+      if (entry) {
         closeBrowser(browserId, arguments_[0] == "1");
-        break;
-      case "shutdown":
-        window.close();
-        break;
-    }
-  }, "firefox-cef-command");
+        if (!coordinator) {
+          window.close();
+        }
+      }
+      break;
+    case "shutdown":
+      window.close();
+      break;
+  }
+};
 
-  bridge.runtimeReady();
-  createBrowser(bridge.browserId, bridge.initialUrl);
+window.addEventListener("load", () => {
+  Services.obs.addObserver(commandObserver, "firefox-cef-command");
+
+  const baseWindow = window.docShell.treeOwner.QueryInterface(Ci.nsIBaseWindow);
+  bridge.attachWindow(ownedBrowserId, baseWindow);
+  if (startsRuntime) {
+    bridge.runtimeReady();
+  }
+  createBrowser(ownedBrowserId, ownedInitialUrl);
 }, { once: true });
 
 window.addEventListener("unload", () => {
+  Services.obs.removeObserver(commandObserver, "firefox-cef-command");
   for (const browserId of [...browsers.keys()]) {
     closeBrowser(browserId, true);
   }

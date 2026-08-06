@@ -14,11 +14,10 @@ diff --git a/toolkit/library/libxul.symbols b/toolkit/library/libxul.symbols
 index e63e3e7442..902d5ee39f 100644
 --- a/toolkit/library/libxul.symbols
 +++ b/toolkit/library/libxul.symbols
-@@ -1,4 +1,18 @@
+@@ -1,4 +1,17 @@
  XRE_GetBootstrap
 +firefox_cef_gecko_set_callbacks
 +firefox_cef_gecko_configure
-+firefox_cef_gecko_set_native_window
 +firefox_cef_gecko_navigate
 +firefox_cef_gecko_reload
 +firefox_cef_gecko_focus
@@ -33,58 +32,6 @@ index e63e3e7442..902d5ee39f 100644
  uprofiler_get
  #ifdef XP_IOS
  MainProcessInit
-diff --git a/widget/gtk/nsWindow.cpp b/widget/gtk/nsWindow.cpp
-index 9d11df1895..6faa5578c6 100644
---- a/widget/gtk/nsWindow.cpp
-+++ b/widget/gtk/nsWindow.cpp
-@@ -12,6 +12,7 @@
-
- #include <algorithm>
- #include <cstdint>
-+#include <cstdlib>
- #ifdef MOZ_X11
- #  include <X11/Xlib.h>
- #endif
-@@ -101,6 +102,7 @@
- #include "nsString.h"
- #include "nsWidgetsCID.h"
- #include "nsXPLookAndFeel.h"
-+#include "prenv.h"
- #include "prlink.h"
- #include "Screen.h"
- #include "ScreenHelperGTK.h"
-@@ -4460,5 +4462,31 @@ nsresult nsWindow::Create(nsIWidget* aParent, const LayoutDeviceIntRect& aRect,
-   }
-
-   gtk_widget_realize(container);
-+#ifdef MOZ_X11
-+  if (mWindowType == WindowType::TopLevel && GdkIsX11Display()) {
-+    const char* parentIdString = PR_GetEnv("FIREFOX_CEF_PARENT_XID");
-+    if (parentIdString && *parentIdString) {
-+      char* end = nullptr;
-+      uint64_t parentId = std::strtoull(parentIdString, &end, 10);
-+      GdkWindow* shellWindow = gtk_widget_get_window(mShell);
-+      if (parentId && end && !*end && shellWindow) {
-+        GdkWindow* parentWindow = gdk_x11_window_foreign_new_for_display(
-+            gtk_widget_get_display(mShell), parentId);
-+        if (parentWindow) {
-+          gtk_window_set_decorated(GTK_WINDOW(mShell), FALSE);
-+          gdk_window_reparent(shellWindow, parentWindow, 0, 0);
-+          g_object_unref(parentWindow);
-+          unsetenv("FIREFOX_CEF_PARENT_XID");
-+          auto setNativeWindow = reinterpret_cast<void (*)(uint64_t)>(dlsym(
-+              RTLD_DEFAULT, "firefox_cef_gecko_set_native_window"));
-+          if (setNativeWindow) {
-+            setNativeWindow(GDK_WINDOW_XID(shellWindow));
-+          }
-+        }
-+      }
-+    }
-+  }
-+#endif
-+
-   // mGdkWindow is set by moz_container_realize() / SetGdkWindow().
-   MOZ_DIAGNOSTIC_ASSERT(mGdkWindow, "MozContainer realize failed?");
 diff --git a/browser/moz.configure b/browser/moz.configure
 --- a/browser/moz.configure
 +++ b/browser/moz.configure

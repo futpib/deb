@@ -1,3 +1,5 @@
+pragma ComponentBehavior: Bound
+
 import QtQuick
 import QtQuick.Controls.Fusion
 import QtQuick.Layouts
@@ -12,6 +14,8 @@ ApplicationWindow {
     minimumHeight: 560
     visible: true
     title: "deb · Chromium + Gecko"
+    property int nextViewId: 1
+    property var detachedWindows: []
 
     ProfileManager {
         id: profileManager
@@ -25,12 +29,36 @@ ApplicationWindow {
         id: profilesModel
     }
 
+    function allocateViewId() {
+        return String(nextViewId++)
+    }
+
+    function openDetachedWindow(backendObject, profileId, profileName) {
+        const browserWindow = detachedWindowComponent.createObject(root, {
+            "backendObject": backendObject,
+            "profileId": profileId,
+            "profileName": profileName,
+            "viewId": allocateViewId()
+        })
+        detachedWindows = detachedWindows.concat([browserWindow])
+        browserWindow.show()
+        return browserWindow
+    }
+
+    function releaseDetachedWindow(browserWindow) {
+        detachedWindows = detachedWindows.filter(candidate => candidate !== browserWindow)
+        if (detachedWindows.length === 0 && !root.visible) {
+            Qt.callLater(root.close)
+        }
+    }
+
     function loadProfiles() {
         const profiles = JSON.parse(profileManager.profilesJson)
         for (const profile of profiles) {
             profilesModel.append({
                 "profileId": profile.id,
-                "profileName": profile.name
+                "profileName": profile.name,
+                "profileViewId": root.allocateViewId()
             })
         }
         if (profilesModel.count > 0) {
@@ -55,7 +83,8 @@ ApplicationWindow {
             }
             profilesModel.append({
                 "profileId": profile.id,
-                "profileName": profile.name
+                "profileName": profile.name,
+                "profileViewId": allocateViewId()
             })
             profileTabs.currentIndex = profilesModel.count - 1
             newProfileName.clear()
@@ -77,9 +106,11 @@ ApplicationWindow {
                     model: profilesModel
 
                     TabButton {
-                        text: profilesModel.get(index).profileName
+                        required property string profileId
+                        required property string profileName
+                        text: profileName
                         ToolTip.visible: hovered
-                        ToolTip.text: `Profile ${profilesModel.get(index).profileId}`
+                        ToolTip.text: `Profile ${profileId}`
                     }
                 }
             }
@@ -108,7 +139,6 @@ ApplicationWindow {
     }
 
     StackLayout {
-        id: profileStack
         anchors.fill: parent
         currentIndex: profileTabs.currentIndex
 
@@ -121,18 +151,69 @@ ApplicationWindow {
         }
     }
 
+    Component {
+        id: detachedWindowComponent
+
+        ApplicationWindow {
+            id: detachedWindow
+            required property var backendObject
+            required property string profileId
+            required property string profileName
+            required property string viewId
+            width: 1280
+            height: 760
+            minimumWidth: 760
+            minimumHeight: 480
+            title: `deb · ${profileName}`
+
+            Component.onCompleted: {
+                if (backendObject.smokeTest) {
+                    x = 720
+                    y = 100
+                    width = 700
+                    height = 700
+                }
+            }
+
+            BrowserView {
+                id: detachedBrowserView
+                anchors.fill: parent
+                backendObject: detachedWindow.backendObject
+                profileId: detachedWindow.profileId
+                profileName: detachedWindow.profileName
+                viewId: detachedWindow.viewId
+                windowLabel: detachedWindow.title
+                viewVisible: detachedWindow.visible
+                viewFocused: detachedWindow.active
+            }
+
+            onClosing: function(close) {
+                if (detachedBrowserView.registered) {
+                    backendObject.unregister_window(viewId)
+                    detachedBrowserView.registered = false
+                }
+                root.releaseDetachedWindow(detachedWindow)
+                close.accepted = true
+                Qt.callLater(detachedWindow.destroy)
+            }
+
+            Component.onDestruction: {
+                if (detachedBrowserView.registered) {
+                    backendObject.unregister_window(viewId)
+                    detachedBrowserView.registered = false
+                }
+                root.releaseDetachedWindow(detachedWindow)
+            }
+        }
+    }
+
     component ProfileWorkspace: Item {
         id: workspace
         required property int index
         readonly property string profileId: profilesModel.get(index).profileId
         readonly property string profileName: profilesModel.get(index).profileName
-        property bool rebuildingTabs: false
-
-        property var browserHost: nativeWindows.createHost()
-
-        ListModel {
-            id: tabsModel
-        }
+        readonly property string viewId: profilesModel.get(index).profileViewId
+        property bool smokeWindowOpened: false
 
         Backend {
             id: backend
@@ -142,18 +223,96 @@ ApplicationWindow {
         Connections {
             target: backend
 
-            function onTabsJsonChanged() {
-                workspace.rebuildTabs()
+            function onWindowStateJsonChanged() {
+                if (backend.smokeTest && !workspace.smokeWindowOpened) {
+                    const state = JSON.parse(backend.windowStateJson)
+                    if ((state.windows ?? []).some(candidate => candidate.id === workspace.viewId)) {
+                        workspace.smokeWindowOpened = true
+                        root.openDetachedWindow(
+                            backend,
+                            workspace.profileId,
+                            `${workspace.profileName} smoke window`
+                        )
+                    }
+                }
             }
         }
 
-        function rebuildTabs() {
+        BrowserView {
+            anchors.fill: parent
+            backendObject: backend
+            profileId: workspace.profileId
+            profileName: workspace.profileName
+            viewId: workspace.viewId
+            windowLabel: `${workspace.profileName} · main window`
+            viewVisible: workspace.visible && root.visible
+            viewFocused: root.active && workspace.visible
+        }
+
+        function stop() {
+            backend.stop()
+        }
+
+        Component.onDestruction: stop()
+    }
+
+    component BrowserView: Item {
+        id: browserView
+        required property var backendObject
+        required property string profileId
+        required property string profileName
+        required property string viewId
+        required property string windowLabel
+        required property bool viewVisible
+        required property bool viewFocused
+        property bool rebuildingTabs: false
+        property bool registered: false
+        property string activeTabId: ""
+        property string currentUrl: ""
+        property string currentStatus: "Waiting for native host…"
+        property var browserHost: nativeWindows.createHost()
+
+        ListModel {
+            id: tabsModel
+        }
+
+        ListModel {
+            id: moveTargetsModel
+        }
+
+        Connections {
+            target: browserView.backendObject
+
+            function onWindowStateJsonChanged() {
+                browserView.rebuildState()
+            }
+        }
+
+        function rebuildState() {
+            const state = JSON.parse(backendObject.windowStateJson)
+            const windows = state.windows ?? []
+            const ownWindow = windows.find(candidate => candidate.id === viewId)
             rebuildingTabs = true
             tabsModel.clear()
-            const tabs = JSON.parse(backend.tabsJson)
+            moveTargetsModel.clear()
+            for (const candidate of windows) {
+                if (candidate.id !== viewId) {
+                    moveTargetsModel.append({
+                        "targetId": candidate.id,
+                        "targetLabel": candidate.label
+                    })
+                }
+            }
+            if (ownWindow === undefined) {
+                activeTabId = ""
+                currentUrl = ""
+                rebuildingTabs = false
+                return
+            }
+            activeTabId = ownWindow.activeTabId
             let activeIndex = -1
-            for (let tabIndex = 0; tabIndex < tabs.length; ++tabIndex) {
-                const tab = tabs[tabIndex]
+            for (let tabIndex = 0; tabIndex < ownWindow.tabs.length; ++tabIndex) {
+                const tab = ownWindow.tabs[tabIndex]
                 tabsModel.append({
                     "tabId": tab.id,
                     "engine": tab.engine,
@@ -163,8 +322,10 @@ ApplicationWindow {
                     "loading": tab.loading,
                     "crashed": tab.crashed
                 })
-                if (tab.id === backend.activeTabId) {
+                if (tab.id === activeTabId) {
                     activeIndex = tabIndex
+                    currentUrl = tab.url
+                    currentStatus = tab.status
                 }
             }
             if (activeIndex >= 0) {
@@ -175,15 +336,19 @@ ApplicationWindow {
         }
 
         function syncNativeGeometry() {
-            backend.sync_geometry(
+            if (!registered && !viewVisible) {
+                return
+            }
+            backendObject.sync_geometry(
+                viewId,
                 nativeWindows.windowId(browserHost),
                 Math.round(nativeSurface.width),
-                Math.round(nativeSurface.height)
+                Math.round(nativeSurface.height),
+                windowLabel,
+                viewVisible,
+                viewFocused
             )
-        }
-
-        function stop() {
-            backend.stop()
+            registered = true
         }
 
         ColumnLayout {
@@ -211,28 +376,35 @@ ApplicationWindow {
                                 model: tabsModel
 
                                 TabButton {
-                                    text: `${tabsModel.get(index).engine === "firefox" ? "🦊" : "◉"} ${tabsModel.get(index).tabTitle || tabsModel.get(index).tabUrl}`
+                                    required property string engine
+                                    required property string tabUrl
+                                    required property string tabTitle
+                                    required property string tabStatus
+                                    text: `${engine === "firefox" ? "🦊" : "◉"} ${tabTitle || tabUrl}`
                                     width: Math.max(150, Math.min(260, implicitWidth))
                                     ToolTip.visible: hovered
-                                    ToolTip.text: `${tabsModel.get(index).tabUrl}\n${tabsModel.get(index).tabStatus}`
+                                    ToolTip.text: `${tabUrl}\n${tabStatus}`
                                 }
                             }
 
                             onCurrentIndexChanged: {
-                                if (!workspace.rebuildingTabs && currentIndex >= 0 && currentIndex < tabsModel.count) {
-                                    backend.select_tab(tabsModel.get(currentIndex).tabId)
+                                if (!browserView.rebuildingTabs && currentIndex >= 0 && currentIndex < tabsModel.count) {
+                                    browserView.backendObject.select_tab(
+                                        browserView.viewId,
+                                        tabsModel.get(currentIndex).tabId
+                                    )
                                 }
                             }
                         }
 
                         Button {
                             text: "+ Chromium"
-                            onClicked: backend.new_tab("chromium")
+                            onClicked: browserView.backendObject.new_tab(browserView.viewId, "chromium")
                         }
 
                         Button {
                             text: "+ Firefox"
-                            onClicked: backend.new_tab("firefox")
+                            onClicked: browserView.backendObject.new_tab(browserView.viewId, "firefox")
                         }
                     }
 
@@ -243,7 +415,7 @@ ApplicationWindow {
                             text: "↻"
                             ToolTip.visible: hovered
                             ToolTip.text: "Reload this tab"
-                            onClicked: backend.reload()
+                            onClicked: browserView.backendObject.reload(browserView.viewId)
                         }
 
                         ComboBox {
@@ -251,9 +423,9 @@ ApplicationWindow {
                             model: ["Chromium", "Firefox"]
                             Layout.preferredWidth: 125
                             onActivated: {
-                                if (backend.activeTabId.length > 0) {
-                                    backend.switch_engine(
-                                        backend.activeTabId,
+                                if (browserView.activeTabId.length > 0) {
+                                    browserView.backendObject.switch_engine(
+                                        browserView.activeTabId,
                                         currentIndex === 1 ? "firefox" : "chromium"
                                     )
                                 }
@@ -263,32 +435,60 @@ ApplicationWindow {
                         TextField {
                             id: address
                             Layout.fillWidth: true
-                            text: backend.url
+                            text: browserView.currentUrl
                             selectByMouse: true
-                            onAccepted: {
-                                backend.url = text
-                                backend.navigate()
-                            }
+                            onAccepted: browserView.backendObject.navigate(browserView.viewId, text)
                         }
 
                         Button {
                             text: "Go"
-                            onClicked: {
-                                backend.url = address.text
-                                backend.navigate()
-                            }
+                            onClicked: browserView.backendObject.navigate(browserView.viewId, address.text)
                         }
 
                         Button {
                             text: "Close tab"
-                            enabled: backend.activeTabId.length > 0
-                            onClicked: backend.close_tab(backend.activeTabId)
+                            enabled: browserView.activeTabId.length > 0
+                            onClicked: browserView.backendObject.close_tab(browserView.activeTabId)
+                        }
+
+                        Button {
+                            text: "New window"
+                            onClicked: root.openDetachedWindow(
+                                browserView.backendObject,
+                                browserView.profileId,
+                                browserView.profileName
+                            )
+                        }
+
+                        Button {
+                            id: moveButton
+                            text: "Move tab"
+                            enabled: browserView.activeTabId.length > 0 && moveTargetsModel.count > 0
+                            onClicked: moveMenu.open()
+
+                            Menu {
+                                id: moveMenu
+
+                                Repeater {
+                                    model: moveTargetsModel
+
+                                    MenuItem {
+                                        required property string targetId
+                                        required property string targetLabel
+                                        text: targetLabel
+                                        onTriggered: browserView.backendObject.move_tab(
+                                            browserView.activeTabId,
+                                            targetId
+                                        )
+                                    }
+                                }
+                            }
                         }
 
                         Label {
-                            text: backend.status
+                            text: browserView.currentStatus
                             elide: Text.ElideRight
-                            Layout.maximumWidth: 320
+                            Layout.maximumWidth: 260
                         }
                     }
                 }
@@ -311,7 +511,7 @@ ApplicationWindow {
                 WindowContainer {
                     anchors.fill: parent
                     anchors.margins: 1
-                    window: browserHost
+                    window: browserView.browserHost
                     visible: window !== null
                     focus: true
                 }
@@ -320,21 +520,22 @@ ApplicationWindow {
 
         Timer {
             interval: 100
-            running: workspace.visible && root.visible
+            running: browserView.registered && browserView.viewVisible
             repeat: true
-            onTriggered: workspace.syncNativeGeometry()
+            onTriggered: browserView.syncNativeGeometry()
         }
 
-        onVisibleChanged: {
-            if (visible) {
-                Qt.callLater(syncNativeGeometry)
-            }
-        }
-
-        Component.onDestruction: stop()
+        onViewVisibleChanged: Qt.callLater(syncNativeGeometry)
+        onViewFocusedChanged: Qt.callLater(syncNativeGeometry)
+        Component.onCompleted: Qt.callLater(syncNativeGeometry)
     }
 
-    onClosing: {
+    onClosing: function(close) {
+        if (detachedWindows.length > 0) {
+            close.accepted = false
+            root.hide()
+            return
+        }
         for (let index = 0; index < profileRepeater.count; ++index) {
             profileRepeater.itemAt(index).stop()
         }

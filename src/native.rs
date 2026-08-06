@@ -786,13 +786,41 @@ pub(crate) fn sampled_pixel_variants(
     window: Window,
 ) -> NativeResult<usize> {
     let geometry = connection.get_geometry(window)?.reply()?;
-    let width = geometry.width.saturating_sub(8).min(512);
-    let height = geometry.height.saturating_sub(8).min(512);
+    let tree = connection.query_tree(window)?.reply()?;
+    let position = connection
+        .translate_coordinates(window, tree.root, 0, 0)?
+        .reply()?;
+    let x = position.dst_x.checked_add(4).ok_or("surface x overflow")?;
+    let y = position.dst_y.checked_add(4).ok_or("surface y overflow")?;
+    if x < 0 || y < 0 {
+        return Err("browser surface is outside the root window".into());
+    }
+    let root_geometry = connection.get_geometry(tree.root)?.reply()?;
+    let available_width = u16::try_from(i32::from(root_geometry.width) - i32::from(x))?;
+    let available_height = u16::try_from(i32::from(root_geometry.height) - i32::from(y))?;
+    let width = geometry
+        .width
+        .saturating_sub(8)
+        .min(available_width)
+        .min(512);
+    let height = geometry
+        .height
+        .saturating_sub(8)
+        .min(available_height)
+        .min(512);
     if width < 2 || height < 2 {
         return Err("browser surface has no drawable area".into());
     }
     let image = connection
-        .get_image(ImageFormat::Z_PIXMAP, window, 4, 4, width, height, u32::MAX)?
+        .get_image(
+            ImageFormat::Z_PIXMAP,
+            tree.root,
+            x,
+            y,
+            width,
+            height,
+            u32::MAX,
+        )?
         .reply()?;
     Ok(image
         .data

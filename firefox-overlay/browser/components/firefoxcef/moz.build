@@ -18,3 +18,5 @@ XPIDL_SOURCES += ["nsIFirefoxCefBridge.idl"]
 EXPORTS.mozilla += ["FirefoxCefBridge.h"]
 
 SOURCES += ["FirefoxCefBridge.cpp"]
+
+CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]
