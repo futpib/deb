@@ -280,6 +280,130 @@ impl Backend {
     }
 
     #[qslot]
+    fn pointer_move(&mut self, window_id: String, x: i32, y: i32, modifiers: i32, leaving: bool) {
+        if let (Some(controller), Ok(window_id), Ok(modifiers)) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            u32::try_from(modifiers),
+        ) {
+            let _ = controller.send(TabCommand::MouseMove {
+                window_id,
+                x,
+                y,
+                modifiers,
+                leaving,
+            });
+        }
+    }
+
+    #[qslot]
+    #[allow(clippy::too_many_arguments)]
+    fn pointer_button(
+        &mut self,
+        window_id: String,
+        x: i32,
+        y: i32,
+        modifiers: i32,
+        button: i32,
+        mouse_up: bool,
+        click_count: i32,
+    ) {
+        let button = match button {
+            0 => shell_protocol::wire::MouseButton::Left,
+            1 => shell_protocol::wire::MouseButton::Middle,
+            2 => shell_protocol::wire::MouseButton::Right,
+            _ => return,
+        };
+        if let (Some(controller), Ok(window_id), Ok(modifiers), Ok(click_count)) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            u32::try_from(modifiers),
+            u32::try_from(click_count),
+        ) {
+            let _ = controller.send(TabCommand::MouseClick {
+                window_id,
+                x,
+                y,
+                modifiers,
+                button,
+                mouse_up,
+                click_count,
+            });
+        }
+    }
+
+    #[qslot]
+    #[allow(clippy::too_many_arguments)]
+    fn pointer_wheel(
+        &mut self,
+        window_id: String,
+        x: i32,
+        y: i32,
+        modifiers: i32,
+        delta_x: i32,
+        delta_y: i32,
+    ) {
+        if let (Some(controller), Ok(window_id), Ok(modifiers)) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            u32::try_from(modifiers),
+        ) {
+            let _ = controller.send(TabCommand::MouseWheel {
+                window_id,
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            });
+        }
+    }
+
+    #[qslot]
+    #[allow(clippy::too_many_arguments)]
+    fn key_event(
+        &mut self,
+        window_id: String,
+        event_type: i32,
+        modifiers: i32,
+        windows_key_code: i32,
+        native_key_code: i32,
+        is_system_key: bool,
+        character: i32,
+        unmodified_character: i32,
+    ) {
+        if shell_protocol::wire::KeyEventType::try_from(event_type).is_err() {
+            return;
+        }
+        if let (
+            Some(controller),
+            Ok(window_id),
+            Ok(modifiers),
+            Ok(character),
+            Ok(unmodified_character),
+        ) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            u32::try_from(modifiers),
+            u32::try_from(character),
+            u32::try_from(unmodified_character),
+        ) {
+            let _ = controller.send(TabCommand::KeyEvent {
+                window_id,
+                event: shell_protocol::wire::KeyEvent {
+                    event_type,
+                    modifiers,
+                    windows_key_code,
+                    native_key_code,
+                    is_system_key,
+                    character,
+                    unmodified_character,
+                },
+            });
+        }
+    }
+
+    #[qslot]
     fn update_window_state(&mut self, state_json: String) {
         self.window_state_json = state_json;
         self.window_state_json_changed();
@@ -438,6 +562,16 @@ fn main() {
     if std::env::var_os("DISPLAY").is_some() && std::env::var_os("QT_QPA_PLATFORM").is_none() {
         unsafe {
             std::env::set_var("QT_QPA_PLATFORM", "xcb");
+        }
+    }
+    if std::env::var_os("QSG_RHI_BACKEND").is_none() {
+        unsafe {
+            std::env::set_var("QSG_RHI_BACKEND", "opengl");
+        }
+    }
+    if std::env::var_os("QT_XCB_GL_INTEGRATION").is_none() {
+        unsafe {
+            std::env::set_var("QT_XCB_GL_INTEGRATION", "xcb_glx");
         }
     }
     unsafe {

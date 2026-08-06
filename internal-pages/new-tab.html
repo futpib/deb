@@ -73,9 +73,25 @@
         letter-spacing: 0.08em;
         text-transform: uppercase;
       }
+
+      #deb-smoke {
+        display: none;
+        position: fixed;
+        z-index: 2147483647;
+        top: 12px;
+        left: 120px;
+        width: 32px;
+        height: 16px;
+        background: #00ff00;
+      }
+
+      #deb-smoke:target {
+        display: block;
+      }
     </style>
   </head>
   <body>
+    <div id="deb-smoke"></div>
     <main>
       <div class="mark" aria-hidden="true">d</div>
       <h1>deb</h1>

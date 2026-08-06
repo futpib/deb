@@ -6,8 +6,8 @@ mod strings;
 use cef_dll_sys::{
     _cef_app_t, _cef_browser_host_t, _cef_browser_settings_t, _cef_browser_t, _cef_client_t,
     _cef_dictionary_value_t, _cef_frame_t, _cef_request_context_t, _cef_scheme_handler_factory_t,
-    _cef_settings_t, _cef_task_t, cef_main_args_t, cef_string_t, cef_thread_id_t,
-    cef_window_handle_t, cef_window_info_t,
+    _cef_settings_t, _cef_task_t, cef_key_event_t, cef_main_args_t, cef_mouse_button_type_t,
+    cef_mouse_event_t, cef_string_t, cef_thread_id_t, cef_window_handle_t, cef_window_info_t,
 };
 use libc::{c_char, c_int, c_void};
 use refcount::{CefRefCounted, RefObject, add_ref_raw, release_raw};
@@ -106,6 +106,26 @@ unsafe extern "C" fn host_set_focus(host: *mut _cef_browser_host_t, focus: c_int
     }
 }
 
+unsafe extern "C" fn host_send_key_event(
+    host: *mut _cef_browser_host_t,
+    event: *const cef_key_event_t,
+) {
+    let Some(event) = (unsafe { event.as_ref() }) else {
+        return;
+    };
+    if let Err(error) = state_from(host).send_key_event(
+        event.type_ as u32,
+        event.modifiers,
+        event.windows_key_code,
+        event.native_key_code,
+        event.is_system_key != 0,
+        event.character,
+        event.unmodified_character,
+    ) {
+        eprintln!("firefox-cef: key event failed: {error}");
+    }
+}
+
 unsafe extern "C" fn host_get_window_handle(host: *mut _cef_browser_host_t) -> cef_window_handle_t {
     state_from(host).window() as cef_window_handle_t
 }
@@ -125,6 +145,59 @@ unsafe extern "C" fn host_notify_resize(host: *mut _cef_browser_host_t) {
 unsafe extern "C" fn host_was_hidden(host: *mut _cef_browser_host_t, hidden: c_int) {
     if let Err(error) = state_from(host).set_visible(hidden == 0) {
         eprintln!("firefox-cef: visibility update failed: {error}");
+    }
+}
+
+unsafe extern "C" fn host_send_mouse_move(
+    host: *mut _cef_browser_host_t,
+    event: *const cef_mouse_event_t,
+    mouse_leave: c_int,
+) {
+    let Some(event) = (unsafe { event.as_ref() }) else {
+        return;
+    };
+    if let Err(error) =
+        state_from(host).send_mouse_move(event.x, event.y, event.modifiers, mouse_leave != 0)
+    {
+        eprintln!("firefox-cef: mouse move failed: {error}");
+    }
+}
+
+unsafe extern "C" fn host_send_mouse_click(
+    host: *mut _cef_browser_host_t,
+    event: *const cef_mouse_event_t,
+    button: cef_mouse_button_type_t,
+    mouse_up: c_int,
+    click_count: c_int,
+) {
+    let Some(event) = (unsafe { event.as_ref() }) else {
+        return;
+    };
+    if let Err(error) = state_from(host).send_mouse_click(
+        event.x,
+        event.y,
+        event.modifiers,
+        button as u32,
+        mouse_up != 0,
+        click_count,
+    ) {
+        eprintln!("firefox-cef: mouse click failed: {error}");
+    }
+}
+
+unsafe extern "C" fn host_send_mouse_wheel(
+    host: *mut _cef_browser_host_t,
+    event: *const cef_mouse_event_t,
+    delta_x: c_int,
+    delta_y: c_int,
+) {
+    let Some(event) = (unsafe { event.as_ref() }) else {
+        return;
+    };
+    if let Err(error) =
+        state_from(host).send_mouse_wheel(event.x, event.y, event.modifiers, delta_x, delta_y)
+    {
+        eprintln!("firefox-cef: mouse wheel failed: {error}");
     }
 }
 
@@ -158,10 +231,14 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     host.try_close_browser = Some(host_try_close_browser);
     host.is_ready_to_be_closed = Some(host_is_ready_to_close);
     host.set_focus = Some(host_set_focus);
+    host.send_key_event = Some(host_send_key_event);
     host.get_window_handle = Some(host_get_window_handle);
     host.get_client = Some(host_get_client);
     host.notify_move_or_resize_started = Some(host_notify_resize);
     host.was_hidden = Some(host_was_hidden);
+    host.send_mouse_move_event = Some(host_send_mouse_move);
+    host.send_mouse_click_event = Some(host_send_mouse_click);
+    host.send_mouse_wheel_event = Some(host_send_mouse_wheel);
     let host = RefObject::allocate(host, state.clone());
     state.host.store(host, Ordering::Release);
 

@@ -212,6 +212,85 @@ impl CefInstance {
         )
     }
 
+    pub(crate) fn send_mouse_move(
+        &mut self,
+        browser_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        leaving: bool,
+    ) -> NativeResult<()> {
+        self.send_browser_request(
+            browser_id,
+            wire::request::Operation::MouseMove(wire::MouseMove {
+                x,
+                y,
+                modifiers,
+                leaving,
+            }),
+            "mouse move",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_mouse_click(
+        &mut self,
+        browser_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        button: wire::MouseButton,
+        mouse_up: bool,
+        click_count: u32,
+    ) -> NativeResult<()> {
+        self.send_browser_request(
+            browser_id,
+            wire::request::Operation::MouseClick(wire::MouseClick {
+                x,
+                y,
+                modifiers,
+                button: button as i32,
+                mouse_up,
+                click_count,
+            }),
+            "mouse click",
+        )
+    }
+
+    pub(crate) fn send_mouse_wheel(
+        &mut self,
+        browser_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> NativeResult<()> {
+        self.send_browser_request(
+            browser_id,
+            wire::request::Operation::MouseWheel(wire::MouseWheel {
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            }),
+            "mouse wheel",
+        )
+    }
+
+    pub(crate) fn send_key_event(
+        &mut self,
+        browser_id: u64,
+        event: wire::KeyEvent,
+    ) -> NativeResult<()> {
+        self.send_browser_request(
+            browser_id,
+            wire::request::Operation::KeyEvent(event),
+            "key event",
+        )
+    }
+
     pub(crate) fn set_browser_visible(
         &mut self,
         browser_id: u64,
@@ -749,6 +828,8 @@ fn required_capabilities() -> Vec<i32> {
         Capability::MultipleBrowsers,
         Capability::Visibility,
         Capability::RendererCrashEvents,
+        Capability::PointerInput,
+        Capability::KeyboardInput,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -784,7 +865,7 @@ fn format_response_error(context: &str, response: wire::Response) -> String {
 pub(crate) fn sampled_pixel_variants(
     connection: &RustConnection,
     window: Window,
-) -> NativeResult<usize> {
+) -> NativeResult<(usize, bool, bool)> {
     let geometry = connection.get_geometry(window)?.reply()?;
     let tree = connection.query_tree(window)?.reply()?;
     let position = connection
@@ -822,13 +903,22 @@ pub(crate) fn sampled_pixel_variants(
             u32::MAX,
         )?
         .reply()?;
-    Ok(image
-        .data
-        .chunks_exact(4)
-        .step_by(97)
-        .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
-        .collect::<HashSet<_>>()
-        .len())
+    let pixels = image.data.chunks_exact(4);
+    let has_qt_overlay = pixels
+        .clone()
+        .any(|pixel| pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 255);
+    let has_orientation_marker = pixels
+        .clone()
+        .any(|pixel| pixel[0] == 0 && pixel[1] == 255 && pixel[2] == 0);
+    Ok((
+        pixels
+            .step_by(97)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
+            .collect::<HashSet<_>>()
+            .len(),
+        has_qt_overlay,
+        has_orientation_marker,
+    ))
 }
 
 pub(crate) fn configure_native_window(

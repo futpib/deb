@@ -5,27 +5,45 @@ fn main() {
         .atleast_version("6.10")
         .probe("Qt6Quick")
         .expect("Qt 6.10 or newer with Qt Quick is required");
-    let generated = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"))
-        .join("moc_native_window_factory.cpp");
+    for dependency in ["x11", "xcomposite", "xdamage", "xfixes", "gl"] {
+        pkg_config::Config::new()
+            .probe(dependency)
+            .unwrap_or_else(|_| panic!("{dependency} development files are required"));
+    }
+    let output = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is not set"));
     let moc = PathBuf::from(
         pkg_config::get_variable("Qt6Core", "libexecdir")
             .expect("Qt6Core does not publish its libexec directory"),
     )
     .join("moc");
-    let status = Command::new(moc)
-        .arg("src/native_window_factory.h")
-        .arg("-o")
-        .arg(&generated)
-        .status()
-        .expect("could not run Qt moc");
-    assert!(status.success(), "Qt moc failed");
+    let generated = [
+        (
+            "src/native_window_factory.h",
+            "moc_native_window_factory.cpp",
+        ),
+        ("src/browser_surface.h", "moc_browser_surface.cpp"),
+    ]
+    .map(|(source, name)| {
+        let generated = output.join(name);
+        let status = Command::new(&moc)
+            .arg(source)
+            .arg("-o")
+            .arg(&generated)
+            .status()
+            .expect("could not run Qt moc");
+        assert!(status.success(), "Qt moc failed for {source}");
+        generated
+    });
 
     let mut build = cc::Build::new();
     build
         .cpp(true)
+        .file("src/browser_surface.cpp")
         .file("src/native_window_factory.cpp")
-        .file(generated)
         .flag_if_supported("-std=c++17");
+    for generated in generated {
+        build.file(generated);
+    }
     for include in qt.include_paths {
         build.include(include);
     }
@@ -33,4 +51,6 @@ fn main() {
 
     println!("cargo:rerun-if-changed=src/native_window_factory.cpp");
     println!("cargo:rerun-if-changed=src/native_window_factory.h");
+    println!("cargo:rerun-if-changed=src/browser_surface.cpp");
+    println!("cargo:rerun-if-changed=src/browser_surface.h");
 }

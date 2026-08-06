@@ -56,7 +56,7 @@ timeout --signal=TERM 45s \
   XDG_CACHE_HOME="$test_root/cache" \
   LIBGL_ALWAYS_SOFTWARE=1 \
   DEB_URL=about:blank \
-  DEB_SMOKE_NAVIGATE_URL=deb://new-tab/ \
+  DEB_SMOKE_NAVIGATE_URL=deb://new-tab/#deb-smoke \
   DEB_AUTOMATED_SMOKE_TEST=1 \
   "$project_root/target/debug/deb" >"$log_file" 2>&1
 status=$?

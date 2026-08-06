@@ -513,7 +513,73 @@ ApplicationWindow {
                     anchors.margins: 1
                     window: browserView.browserHost
                     visible: window !== null
+                }
+
+                BrowserSurface {
+                    anchors.fill: parent
+                    anchors.margins: 1
+                    sourceWindow: browserView.browserHost
                     focus: true
+
+                    onPointerMoved: function(x, y, modifiers, leaving) {
+                        browserView.backendObject.pointer_move(
+                            browserView.viewId, x, y, modifiers, leaving
+                        )
+                    }
+
+                    onPointerButton: function(x, y, modifiers, button, mouseUp, clickCount) {
+                        browserView.backendObject.pointer_button(
+                            browserView.viewId,
+                            x,
+                            y,
+                            modifiers,
+                            button,
+                            mouseUp,
+                            clickCount
+                        )
+                    }
+
+                    onPointerWheel: function(x, y, modifiers, deltaX, deltaY) {
+                        browserView.backendObject.pointer_wheel(
+                            browserView.viewId,
+                            x,
+                            y,
+                            modifiers,
+                            deltaX,
+                            deltaY
+                        )
+                    }
+
+                    onBrowserKey: function(
+                        eventType,
+                        modifiers,
+                        windowsKeyCode,
+                        nativeKeyCode,
+                        systemKey,
+                        character,
+                        unmodifiedCharacter
+                    ) {
+                        browserView.backendObject.key_event(
+                            browserView.viewId,
+                            eventType,
+                            modifiers,
+                            windowsKeyCode,
+                            nativeKeyCode,
+                            systemKey,
+                            character,
+                            unmodifiedCharacter
+                        )
+                    }
+                }
+
+                Rectangle {
+                    x: 12
+                    y: 12
+                    width: 80
+                    height: 40
+                    visible: false
+                    color: "#ff00ff"
+                    Component.onCompleted: visible = browserView.backendObject.smokeTest
                 }
             }
         }

@@ -99,6 +99,34 @@ pub enum TabCommand {
     Close(u64),
     SwitchEngine(u64, TabEngine),
     Move(u64, u64),
+    MouseMove {
+        window_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        leaving: bool,
+    },
+    MouseClick {
+        window_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        button: wire::MouseButton,
+        mouse_up: bool,
+        click_count: u32,
+    },
+    MouseWheel {
+        window_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        delta_x: i32,
+        delta_y: i32,
+    },
+    KeyEvent {
+        window_id: u64,
+        event: wire::KeyEvent,
+    },
     Stop,
 }
 
@@ -540,6 +568,35 @@ impl Runtime {
                 Ok(TabCommand::Move(tab_id, target_window)) => {
                     self.move_tab(tab_id, target_window)?
                 }
+                Ok(TabCommand::MouseMove {
+                    window_id,
+                    x,
+                    y,
+                    modifiers,
+                    leaving,
+                }) => self.mouse_move(window_id, x, y, modifiers, leaving)?,
+                Ok(TabCommand::MouseClick {
+                    window_id,
+                    x,
+                    y,
+                    modifiers,
+                    button,
+                    mouse_up,
+                    click_count,
+                }) => {
+                    self.mouse_click(window_id, x, y, modifiers, button, mouse_up, click_count)?
+                }
+                Ok(TabCommand::MouseWheel {
+                    window_id,
+                    x,
+                    y,
+                    modifiers,
+                    delta_x,
+                    delta_y,
+                }) => self.mouse_wheel(window_id, x, y, modifiers, delta_x, delta_y)?,
+                Ok(TabCommand::KeyEvent { window_id, event }) => {
+                    self.key_event(window_id, event)?
+                }
                 Ok(TabCommand::Stop) | Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
             }
@@ -942,6 +999,88 @@ impl Runtime {
         Ok(())
     }
 
+    fn active_browser(&self, window_id: u64) -> TabResult<(CefBackend, Option<u64>)> {
+        let tab = self.tab(self.window(window_id)?.active_tab)?;
+        Ok((tab.engine.backend(), tab.browser_id))
+    }
+
+    fn mouse_move(
+        &mut self,
+        window_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        leaving: bool,
+    ) -> TabResult<()> {
+        let (backend, browser_id) = self.active_browser(window_id)?;
+        if let Some(browser_id) = browser_id
+            && let Some(engine) = self.engine_mut(backend)
+        {
+            engine
+                .process
+                .send_mouse_move(browser_id, x, y, modifiers, leaving)?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mouse_click(
+        &mut self,
+        window_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        button: wire::MouseButton,
+        mouse_up: bool,
+        click_count: u32,
+    ) -> TabResult<()> {
+        let (backend, browser_id) = self.active_browser(window_id)?;
+        if let Some(browser_id) = browser_id
+            && let Some(engine) = self.engine_mut(backend)
+        {
+            engine.process.send_mouse_click(
+                browser_id,
+                x,
+                y,
+                modifiers,
+                button,
+                mouse_up,
+                click_count,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn mouse_wheel(
+        &mut self,
+        window_id: u64,
+        x: i32,
+        y: i32,
+        modifiers: u32,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> TabResult<()> {
+        let (backend, browser_id) = self.active_browser(window_id)?;
+        if let Some(browser_id) = browser_id
+            && let Some(engine) = self.engine_mut(backend)
+        {
+            engine
+                .process
+                .send_mouse_wheel(browser_id, x, y, modifiers, delta_x, delta_y)?;
+        }
+        Ok(())
+    }
+
+    fn key_event(&mut self, window_id: u64, event: wire::KeyEvent) -> TabResult<()> {
+        let (backend, browser_id) = self.active_browser(window_id)?;
+        if let Some(browser_id) = browser_id
+            && let Some(engine) = self.engine_mut(backend)
+        {
+            engine.process.send_key_event(browser_id, event)?;
+        }
+        Ok(())
+    }
+
     fn layout(&mut self, window_id: u64, bounds: NativeRect) -> TabResult<()> {
         self.window_mut(window_id)?.bounds = bounds;
         let tab_states = self
@@ -1335,7 +1474,7 @@ impl Runtime {
             AutomationPhase::CaptureChromium { deadline, attempts }
                 if Instant::now() >= deadline =>
             {
-                match self.capture_tab(automation.chromium_tab) {
+                match self.capture_tab(automation.chromium_tab, true) {
                     Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let firefox_tab = automation.firefox_tab.expect("Firefox tab was created");
                         let window_id = self.tab(firefox_tab)?.window_id;
@@ -1368,7 +1507,10 @@ impl Runtime {
             AutomationPhase::CaptureFirefox { deadline, attempts }
                 if Instant::now() >= deadline =>
             {
-                match self.capture_tab(automation.firefox_tab.expect("Firefox tab was created")) {
+                match self.capture_tab(
+                    automation.firefox_tab.expect("Firefox tab was created"),
+                    true,
+                ) {
                     Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let chromium_process = self
                             .chromium
@@ -1548,7 +1690,7 @@ impl Runtime {
                 let chromium_sibling = automation
                     .chromium_sibling
                     .expect("Chromium sibling was created");
-                match self.capture_tab(chromium_sibling) {
+                match self.capture_tab(chromium_sibling, false) {
                     Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let source_window = self.tab(chromium_sibling)?.window_id;
                         let target_window = automation
@@ -1591,7 +1733,7 @@ impl Runtime {
                 let firefox_sibling = automation
                     .firefox_sibling
                     .expect("Firefox sibling was created");
-                match self.capture_tab(firefox_sibling) {
+                match self.capture_tab(firefox_sibling, false) {
                     Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let target_window = automation
                             .second_window
@@ -1685,7 +1827,7 @@ impl Runtime {
                 let chromium_sibling = automation
                     .chromium_sibling
                     .expect("Chromium sibling was created");
-                match self.capture_tab(chromium_sibling) {
+                match self.capture_tab(chromium_sibling, false) {
                     Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let target_window = automation
                             .second_window
@@ -1725,7 +1867,7 @@ impl Runtime {
                 let firefox_sibling = automation
                     .firefox_sibling
                     .expect("Firefox sibling was created");
-                match self.capture_tab(firefox_sibling) {
+                match self.capture_tab(firefox_sibling, false) {
                     Ok(variants) if variants >= MIN_RENDER_VARIANTS => {
                         let chromium_tab = automation.chromium_tab;
                         self.switch_engine(chromium_tab, TabEngine::Firefox)?;
@@ -1797,7 +1939,7 @@ impl Runtime {
             AutomationPhase::CaptureSwitched { deadline, attempts }
                 if Instant::now() >= deadline =>
             {
-                match self.capture_tab(automation.chromium_tab) {
+                match self.capture_tab(automation.chromium_tab, false) {
                     Ok(switched_variants) if switched_variants >= MIN_RENDER_VARIANTS => {
                         return Ok(Some((
                             "PASS".to_owned(),
@@ -1858,7 +2000,7 @@ impl Runtime {
         Ok(())
     }
 
-    fn capture_tab(&mut self, tab_id: u64) -> TabResult<usize> {
+    fn capture_tab(&mut self, tab_id: u64, require_orientation: bool) -> TabResult<usize> {
         let window_id = self.tab(tab_id)?.window_id;
         if self.window(window_id)?.active_tab != tab_id {
             self.select(window_id, tab_id)?;
@@ -1872,7 +2014,14 @@ impl Runtime {
             .and_then(|engine| engine.surfaces.get(&browser_id))
             .copied()
             .ok_or("active tab has no native surface")?;
-        let variants = sampled_pixel_variants(&self.connection, window)?;
+        let (variants, has_qt_overlay, has_orientation_marker) =
+            sampled_pixel_variants(&self.connection, window)?;
+        if !has_qt_overlay {
+            return Err("Qt scene overlay was occluded by the browser surface".into());
+        }
+        if require_orientation && !has_orientation_marker {
+            return Err("browser texture orientation marker was missing from its top edge".into());
+        }
         eprintln!(
             "deb-smoke: sampled tab {tab_id} browser {browser_id} ({:?}, {:?}): {variants} colors",
             active.url, active.title

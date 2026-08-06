@@ -21,11 +21,15 @@
 #include "XREChildData.h"
 #include "mozilla/Bootstrap.h"
 #include "mozilla/ClearOnShutdown.h"
+#include "mozilla/MouseEvents.h"
 #include "mozilla/OriginAttributes.h"
 #include "mozilla/ProcessType.h"
 #include "mozilla/Services.h"
 #include "mozilla/StaticMutex.h"
 #include "mozilla/StaticPtr.h"
+#include "mozilla/TextEvents.h"
+#include "mozilla/dom/MouseEventBinding.h"
+#include "mozilla/dom/WheelEventBinding.h"
 #include "nsIArray.h"
 #include "nsArrayUtils.h"
 #include "nsICookie.h"
@@ -100,6 +104,7 @@ bool sRuntimeReady;
 bool sObservingCookies;
 std::map<uint32_t, BrowserConfig> sConfiguredBrowsers;
 std::map<uint32_t, uint64_t> sNativeWindows;
+std::map<uint32_t, nsCOMPtr<nsIWidget>> sWidgets;
 std::unordered_set<uint32_t> sReadyBrowsers;
 std::unordered_set<uint32_t> sAfterCreatedBrowsers;
 std::unordered_set<uint32_t> sBeforeCloseBrowsers;
@@ -225,6 +230,263 @@ void DispatchCookieCompletion(FirefoxCefCookieCompletion aCompletion,
 FirefoxCefCallbacks Callbacks() {
   mozilla::StaticMutexAutoLock lock(sMutex);
   return sCallbacks;
+}
+
+nsCOMPtr<nsIWidget> BrowserWidget(uint32_t aBrowserId) {
+  mozilla::StaticMutexAutoLock lock(sMutex);
+  auto entry = sWidgets.find(aBrowserId);
+  return entry == sWidgets.end() ? nullptr : entry->second;
+}
+
+mozilla::Modifiers GeckoModifiers(uint32_t aModifiers) {
+  mozilla::Modifiers modifiers = mozilla::MODIFIER_NONE;
+  if (aModifiers & 2) {
+    modifiers |= mozilla::MODIFIER_SHIFT;
+  }
+  if (aModifiers & 4) {
+    modifiers |= mozilla::MODIFIER_CONTROL;
+  }
+  if (aModifiers & 8) {
+    modifiers |= mozilla::MODIFIER_ALT;
+  }
+  if (aModifiers & 128) {
+    modifiers |= mozilla::MODIFIER_META;
+  }
+  if (aModifiers & 1) {
+    modifiers |= mozilla::MODIFIER_CAPSLOCK;
+  }
+  if (aModifiers & 256) {
+    modifiers |= mozilla::MODIFIER_NUMLOCK;
+  }
+  if (aModifiers & 4096) {
+    modifiers |= mozilla::MODIFIER_ALTGRAPH;
+  }
+  return modifiers;
+}
+
+int16_t GeckoButtons(uint32_t aModifiers) {
+  int16_t buttons = mozilla::MouseButtonsFlag::eNoButtons;
+  if (aModifiers & 16) {
+    buttons |= mozilla::MouseButtonsFlag::ePrimaryFlag;
+  }
+  if (aModifiers & 32) {
+    buttons |= mozilla::MouseButtonsFlag::eMiddleFlag;
+  }
+  if (aModifiers & 64) {
+    buttons |= mozilla::MouseButtonsFlag::eSecondaryFlag;
+  }
+  return buttons;
+}
+
+mozilla::MouseButton GeckoButton(uint32_t aButton) {
+  switch (aButton) {
+    case 0:
+      return mozilla::MouseButton::ePrimary;
+    case 1:
+      return mozilla::MouseButton::eMiddle;
+    case 2:
+      return mozilla::MouseButton::eSecondary;
+    default:
+      return mozilla::MouseButton::eNotPressed;
+  }
+}
+
+void DispatchMouseMove(uint32_t aBrowserId, int32_t aX, int32_t aY,
+                       uint32_t aModifiers, bool aLeaving) {
+  nsCOMPtr<nsIWidget> widget = BrowserWidget(aBrowserId);
+  if (!widget) {
+    return;
+  }
+  mozilla::WidgetMouseEvent event(
+      true, aLeaving ? mozilla::eMouseExitFromWidget : mozilla::eMouseMove,
+      widget, mozilla::WidgetMouseEvent::eReal);
+  event.mRefPoint = mozilla::LayoutDeviceIntPoint(aX, aY);
+  event.mButtons = GeckoButtons(aModifiers);
+  event.mModifiers = GeckoModifiers(aModifiers);
+  event.mInputSource =
+      mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_MOUSE;
+  if (aLeaving) {
+    event.mExitFrom =
+        mozilla::Some(mozilla::WidgetMouseEvent::ePlatformTopLevel);
+  }
+  widget->DispatchInputEvent(&event);
+}
+
+void DispatchMouseClick(uint32_t aBrowserId, int32_t aX, int32_t aY,
+                        uint32_t aModifiers, uint32_t aButton, bool aMouseUp,
+                        int32_t aClickCount) {
+  nsCOMPtr<nsIWidget> widget = BrowserWidget(aBrowserId);
+  mozilla::MouseButton button = GeckoButton(aButton);
+  if (!widget || button == mozilla::MouseButton::eNotPressed) {
+    return;
+  }
+  mozilla::WidgetMouseEvent event(
+      true, aMouseUp ? mozilla::eMouseUp : mozilla::eMouseDown, widget,
+      mozilla::WidgetMouseEvent::eReal);
+  event.mRefPoint = mozilla::LayoutDeviceIntPoint(aX, aY);
+  event.mButton = button;
+  event.mButtons = GeckoButtons(aModifiers);
+  const int16_t changedButton =
+      mozilla::MouseButtonsFlagToChange(button);
+  if (aMouseUp) {
+    event.mButtons &= ~changedButton;
+  } else {
+    event.mButtons |= changedButton;
+  }
+  event.mClickCount = static_cast<uint32_t>(aClickCount);
+  event.mModifiers = GeckoModifiers(aModifiers);
+  event.mInputSource =
+      mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_MOUSE;
+  widget->DispatchInputEvent(&event);
+}
+
+void DispatchMouseWheel(uint32_t aBrowserId, int32_t aX, int32_t aY,
+                        uint32_t aModifiers, int32_t aDeltaX,
+                        int32_t aDeltaY) {
+  nsCOMPtr<nsIWidget> widget = BrowserWidget(aBrowserId);
+  if (!widget) {
+    return;
+  }
+  mozilla::WidgetWheelEvent event(true, mozilla::eWheel, widget);
+  event.mRefPoint = mozilla::LayoutDeviceIntPoint(aX, aY);
+  event.mModifiers = GeckoModifiers(aModifiers);
+  event.mButtons = GeckoButtons(aModifiers);
+  if (aModifiers & (1 << 14)) {
+    event.mDeltaMode =
+        mozilla::dom::WheelEvent_Binding::DOM_DELTA_PIXEL;
+    event.mDeltaX = -static_cast<double>(aDeltaX);
+    event.mDeltaY = -static_cast<double>(aDeltaY);
+    event.mIsNoLineOrPageDelta = true;
+  } else {
+    event.mDeltaMode =
+        mozilla::dom::WheelEvent_Binding::DOM_DELTA_LINE;
+    event.mDeltaX = event.mLineOrPageDeltaX =
+        -static_cast<double>(aDeltaX) / 40.0;
+    event.mDeltaY = event.mLineOrPageDeltaY =
+        -static_cast<double>(aDeltaY) / 40.0;
+    event.mWheelTicksX = -static_cast<double>(aDeltaX) / 120.0;
+    event.mWheelTicksY = -static_cast<double>(aDeltaY) / 120.0;
+  }
+  event.mInputSource =
+      mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_MOUSE;
+  widget->DispatchInputEvent(&event);
+}
+
+mozilla::KeyNameIndex GeckoKeyName(int32_t aWindowsKeyCode,
+                                   char16_t aCharacter) {
+  if (aCharacter >= 0x20) {
+    return mozilla::KEY_NAME_INDEX_USE_STRING;
+  }
+  switch (aWindowsKeyCode) {
+    case 0x08:
+      return mozilla::KEY_NAME_INDEX_Backspace;
+    case 0x09:
+      return mozilla::KEY_NAME_INDEX_Tab;
+    case 0x0d:
+      return mozilla::KEY_NAME_INDEX_Enter;
+    case 0x10:
+      return mozilla::KEY_NAME_INDEX_Shift;
+    case 0x11:
+      return mozilla::KEY_NAME_INDEX_Control;
+    case 0x12:
+      return mozilla::KEY_NAME_INDEX_Alt;
+    case 0x13:
+      return mozilla::KEY_NAME_INDEX_Pause;
+    case 0x14:
+      return mozilla::KEY_NAME_INDEX_CapsLock;
+    case 0x1b:
+      return mozilla::KEY_NAME_INDEX_Escape;
+    case 0x21:
+      return mozilla::KEY_NAME_INDEX_PageUp;
+    case 0x22:
+      return mozilla::KEY_NAME_INDEX_PageDown;
+    case 0x23:
+      return mozilla::KEY_NAME_INDEX_End;
+    case 0x24:
+      return mozilla::KEY_NAME_INDEX_Home;
+    case 0x25:
+      return mozilla::KEY_NAME_INDEX_ArrowLeft;
+    case 0x26:
+      return mozilla::KEY_NAME_INDEX_ArrowUp;
+    case 0x27:
+      return mozilla::KEY_NAME_INDEX_ArrowRight;
+    case 0x28:
+      return mozilla::KEY_NAME_INDEX_ArrowDown;
+    case 0x2d:
+      return mozilla::KEY_NAME_INDEX_Insert;
+    case 0x2e:
+      return mozilla::KEY_NAME_INDEX_Delete;
+    case 0x5b:
+    case 0x5c:
+      return mozilla::KEY_NAME_INDEX_Meta;
+    case 0x5d:
+      return mozilla::KEY_NAME_INDEX_ContextMenu;
+    case 0x90:
+      return mozilla::KEY_NAME_INDEX_NumLock;
+    case 0x91:
+      return mozilla::KEY_NAME_INDEX_ScrollLock;
+    default:
+      return mozilla::KEY_NAME_INDEX_Unidentified;
+  }
+}
+
+void DispatchKey(uint32_t aBrowserId, uint32_t aEventType,
+                 uint32_t aModifiers, int32_t aWindowsKeyCode,
+                 char16_t aCharacter, char16_t aUnmodifiedCharacter) {
+  nsCOMPtr<nsIWidget> widget = BrowserWidget(aBrowserId);
+  if (!widget) {
+    return;
+  }
+  mozilla::EventMessage message;
+  switch (aEventType) {
+    case 0:
+    case 1:
+      message = mozilla::eKeyDown;
+      break;
+    case 2:
+      message = mozilla::eKeyUp;
+      break;
+    case 3:
+      message = mozilla::eKeyPress;
+      break;
+    default:
+      return;
+  }
+  mozilla::WidgetKeyboardEvent event(true, message, widget);
+  event.mModifiers = GeckoModifiers(aModifiers);
+  event.mKeyCode = aEventType == 3 ? 0 : aWindowsKeyCode;
+  event.mCharCode = aEventType == 3 ? aCharacter : 0;
+  event.mPseudoCharCode = aEventType <= 1 ? aCharacter : 0;
+  event.mIsRepeat = (aModifiers & (1 << 13)) != 0;
+  event.mLocation = aModifiers & (1 << 9)
+                        ? mozilla::eKeyLocationNumpad
+                        : mozilla::eKeyLocationStandard;
+  char16_t keyCharacter = aUnmodifiedCharacter != 0
+                              ? aUnmodifiedCharacter
+                              : aCharacter;
+  event.mKeyNameIndex = GeckoKeyName(aWindowsKeyCode, keyCharacter);
+  if (event.mKeyNameIndex == mozilla::KEY_NAME_INDEX_USE_STRING) {
+    event.mKeyValue.Assign(keyCharacter);
+  }
+  widget->DispatchInputEvent(&event);
+}
+
+template <typename Callback>
+int DispatchBrowserInput(uint32_t aBrowserId, const char* aName,
+                         Callback&& aCallback) {
+  {
+    mozilla::StaticMutexAutoLock lock(sMutex);
+    if (sConfiguredBrowsers.find(aBrowserId) == sConfiguredBrowsers.end()) {
+      return 0;
+    }
+  }
+  if (NS_IsMainThread()) {
+    aCallback();
+    return 1;
+  }
+  nsresult result = NS_DispatchToMainThread(NS_NewRunnableFunction(
+      aName, std::forward<Callback>(aCallback)));
+  return NS_SUCCEEDED(result);
 }
 
 void MaybeFireAfterCreated(uint32_t aBrowserId) {
@@ -399,6 +661,7 @@ NS_IMETHODIMP FirefoxCefBridge::AttachWindow(uint32_t aBrowserId,
   {
     StaticMutexAutoLock lock(sMutex);
     sNativeWindows[aBrowserId] = nativeWindow;
+    sWidgets[aBrowserId] = widget;
   }
   MaybeFireAfterCreated(aBrowserId);
   return NS_OK;
@@ -530,6 +793,7 @@ NS_IMETHODIMP FirefoxCefBridge::BeforeClose(uint32_t aBrowserId) {
     sConfiguredBrowsers.erase(aBrowserId);
     sReadyBrowsers.erase(aBrowserId);
     sNativeWindows.erase(aBrowserId);
+    sWidgets.erase(aBrowserId);
     callbacks = sCallbacks;
   }
   if (callbacks.onBeforeClose) {
@@ -686,6 +950,52 @@ extern "C" NS_EXPORT int firefox_cef_gecko_set_visibility(
   command.Append(aVisible ? '1' : '0');
   NotifyCommand(std::move(command));
   return 1;
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_send_mouse_move(
+    uint32_t aBrowserId, int32_t aX, int32_t aY, uint32_t aModifiers,
+    uint8_t aLeaving) {
+  return DispatchBrowserInput(
+      aBrowserId, "FirefoxCefBridge::MouseMove",
+      [=] { DispatchMouseMove(aBrowserId, aX, aY, aModifiers, aLeaving); });
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_send_mouse_click(
+    uint32_t aBrowserId, int32_t aX, int32_t aY, uint32_t aModifiers,
+    uint32_t aButton, uint8_t aMouseUp, int32_t aClickCount) {
+  if (aButton > 2 || aClickCount <= 0) {
+    return 0;
+  }
+  return DispatchBrowserInput(
+      aBrowserId, "FirefoxCefBridge::MouseClick", [=] {
+        DispatchMouseClick(aBrowserId, aX, aY, aModifiers, aButton, aMouseUp,
+                           aClickCount);
+      });
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_send_mouse_wheel(
+    uint32_t aBrowserId, int32_t aX, int32_t aY, uint32_t aModifiers,
+    int32_t aDeltaX, int32_t aDeltaY) {
+  return DispatchBrowserInput(
+      aBrowserId, "FirefoxCefBridge::MouseWheel", [=] {
+        DispatchMouseWheel(aBrowserId, aX, aY, aModifiers, aDeltaX, aDeltaY);
+      });
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_send_key(
+    uint32_t aBrowserId, uint32_t aEventType, uint32_t aModifiers,
+    int32_t aWindowsKeyCode, int32_t aNativeKeyCode, uint8_t aSystemKey,
+    char16_t aCharacter, char16_t aUnmodifiedCharacter) {
+  if (aEventType > 3) {
+    return 0;
+  }
+  (void)aNativeKeyCode;
+  (void)aSystemKey;
+  return DispatchBrowserInput(
+      aBrowserId, "FirefoxCefBridge::Key", [=] {
+        DispatchKey(aBrowserId, aEventType, aModifiers, aWindowsKeyCode,
+                    aCharacter, aUnmodifiedCharacter);
+      });
 }
 
 extern "C" NS_EXPORT int firefox_cef_gecko_close(uint32_t aBrowserId,

@@ -64,6 +64,10 @@ type Command = unsafe extern "C" fn() -> c_int;
 type BrowserCommand = unsafe extern "C" fn(u32) -> c_int;
 type BrowserBoolCommand = unsafe extern "C" fn(u32, u8) -> c_int;
 type BrowserStringCommand = unsafe extern "C" fn(u32, *const c_char) -> c_int;
+type MouseMoveCommand = unsafe extern "C" fn(u32, c_int, c_int, u32, u8) -> c_int;
+type MouseClickCommand = unsafe extern "C" fn(u32, c_int, c_int, u32, u32, u8, c_int) -> c_int;
+type MouseWheelCommand = unsafe extern "C" fn(u32, c_int, c_int, u32, c_int, c_int) -> c_int;
+type KeyCommand = unsafe extern "C" fn(u32, u32, u32, c_int, c_int, u8, u16, u16) -> c_int;
 type PostTask =
     unsafe extern "C" fn(Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void) -> c_int;
 pub type CookieVisitor = unsafe extern "C" fn(*mut c_void, *const FirefoxCefCookie);
@@ -82,6 +86,10 @@ struct GeckoApi {
     reload: BrowserCommand,
     focus: BrowserCommand,
     set_visibility: BrowserBoolCommand,
+    send_mouse_move: MouseMoveCommand,
+    send_mouse_click: MouseClickCommand,
+    send_mouse_wheel: MouseWheelCommand,
+    send_key: KeyCommand,
     close: BrowserBoolCommand,
     shutdown: Command,
     post_task: PostTask,
@@ -109,6 +117,10 @@ impl GeckoApi {
             reload: unsafe { symbol(libxul, b"firefox_cef_gecko_reload\0")? },
             focus: unsafe { symbol(libxul, b"firefox_cef_gecko_focus\0")? },
             set_visibility: unsafe { symbol(libxul, b"firefox_cef_gecko_set_visibility\0")? },
+            send_mouse_move: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_move\0")? },
+            send_mouse_click: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_click\0")? },
+            send_mouse_wheel: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_wheel\0")? },
+            send_key: unsafe { symbol(libxul, b"firefox_cef_gecko_send_key\0")? },
             close: unsafe { symbol(libxul, b"firefox_cef_gecko_close\0")? },
             shutdown: unsafe { symbol(libxul, b"firefox_cef_gecko_shutdown\0")? },
             post_task: unsafe { symbol(libxul, b"firefox_cef_gecko_post_task\0")? },
@@ -490,6 +502,92 @@ impl BrowserState {
     pub fn set_visible(&self, visible: bool) -> RuntimeResult<()> {
         if unsafe { (gecko()?.set_visibility)(self.id as u32, u8::from(visible)) } == 0 {
             return Err(format!("Gecko rejected visibility for browser {}", self.id).into());
+        }
+        Ok(())
+    }
+
+    pub fn send_mouse_move(
+        &self,
+        x: c_int,
+        y: c_int,
+        modifiers: u32,
+        leaving: bool,
+    ) -> RuntimeResult<()> {
+        if unsafe { (gecko()?.send_mouse_move)(self.id as u32, x, y, modifiers, u8::from(leaving)) }
+            == 0
+        {
+            return Err(format!("Gecko rejected mouse move for browser {}", self.id).into());
+        }
+        Ok(())
+    }
+
+    pub fn send_mouse_click(
+        &self,
+        x: c_int,
+        y: c_int,
+        modifiers: u32,
+        button: u32,
+        mouse_up: bool,
+        click_count: c_int,
+    ) -> RuntimeResult<()> {
+        if unsafe {
+            (gecko()?.send_mouse_click)(
+                self.id as u32,
+                x,
+                y,
+                modifiers,
+                button,
+                u8::from(mouse_up),
+                click_count,
+            )
+        } == 0
+        {
+            return Err(format!("Gecko rejected mouse click for browser {}", self.id).into());
+        }
+        Ok(())
+    }
+
+    pub fn send_mouse_wheel(
+        &self,
+        x: c_int,
+        y: c_int,
+        modifiers: u32,
+        delta_x: c_int,
+        delta_y: c_int,
+    ) -> RuntimeResult<()> {
+        if unsafe { (gecko()?.send_mouse_wheel)(self.id as u32, x, y, modifiers, delta_x, delta_y) }
+            == 0
+        {
+            return Err(format!("Gecko rejected mouse wheel for browser {}", self.id).into());
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_key_event(
+        &self,
+        event_type: u32,
+        modifiers: u32,
+        windows_key_code: c_int,
+        native_key_code: c_int,
+        system_key: bool,
+        character: u16,
+        unmodified_character: u16,
+    ) -> RuntimeResult<()> {
+        if unsafe {
+            (gecko()?.send_key)(
+                self.id as u32,
+                event_type,
+                modifiers,
+                windows_key_code,
+                native_key_code,
+                u8::from(system_key),
+                character,
+                unmodified_character,
+            )
+        } == 0
+        {
+            return Err(format!("Gecko rejected key event for browser {}", self.id).into());
         }
         Ok(())
     }

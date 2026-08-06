@@ -111,6 +111,44 @@ enum ControlCommand {
     ReadCookies,
     SetCookie(wire::Cookie),
     DeleteCookie(wire::Cookie),
+    MouseMove(wire::MouseMove),
+    MouseClick {
+        command: wire::MouseClick,
+        button: MouseButtonType,
+        click_count: i32,
+    },
+    MouseWheel(wire::MouseWheel),
+    KeyEvent(KeyEvent),
+}
+
+fn mouse_button(value: i32) -> Result<MouseButtonType, Box<dyn Error>> {
+    match wire::MouseButton::try_from(value) {
+        Ok(wire::MouseButton::Left) => Ok(MouseButtonType::LEFT),
+        Ok(wire::MouseButton::Middle) => Ok(MouseButtonType::MIDDLE),
+        Ok(wire::MouseButton::Right) => Ok(MouseButtonType::RIGHT),
+        _ => Err("mouse click has an invalid button".into()),
+    }
+}
+
+fn key_event(command: wire::KeyEvent) -> Result<KeyEvent, Box<dyn Error>> {
+    let type_ = match wire::KeyEventType::try_from(command.event_type) {
+        Ok(wire::KeyEventType::RawKeyDown) => KeyEventType::RAWKEYDOWN,
+        Ok(wire::KeyEventType::Character) => KeyEventType::CHAR,
+        Ok(wire::KeyEventType::KeyUp) => KeyEventType::KEYUP,
+        _ => return Err("key event has an invalid type".into()),
+    };
+    Ok(KeyEvent {
+        size: std::mem::size_of::<KeyEvent>(),
+        type_,
+        modifiers: command.modifiers,
+        windows_key_code: command.windows_key_code,
+        native_key_code: command.native_key_code,
+        is_system_key: i32::from(command.is_system_key),
+        character: u16::try_from(command.character).map_err(|_| "key character is not UTF-16")?,
+        unmodified_character: u16::try_from(command.unmodified_character)
+            .map_err(|_| "unmodified key character is not UTF-16")?,
+        focus_on_editable_field: 0,
+    })
 }
 
 fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Error>> {
@@ -132,6 +170,24 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         wire::request::Operation::DeleteCookie(command) => Ok(ControlCommand::DeleteCookie(
             command.cookie.ok_or("DeleteCookie cookie is required")?,
         )),
+        wire::request::Operation::MouseMove(command) => Ok(ControlCommand::MouseMove(command)),
+        wire::request::Operation::MouseClick(command) => {
+            let button = mouse_button(command.button)?;
+            let click_count =
+                i32::try_from(command.click_count).map_err(|_| "mouse click count is too large")?;
+            if click_count == 0 {
+                return Err("mouse click count must be nonzero".into());
+            }
+            Ok(ControlCommand::MouseClick {
+                command,
+                button,
+                click_count,
+            })
+        }
+        wire::request::Operation::MouseWheel(command) => Ok(ControlCommand::MouseWheel(command)),
+        wire::request::Operation::KeyEvent(command) => {
+            Ok(ControlCommand::KeyEvent(key_event(command)?))
+        }
         wire::request::Operation::CreateBrowser(_) | wire::request::Operation::Shutdown(_) => {
             Err("a browser already exists in this helper".into())
         }
@@ -645,8 +701,6 @@ wrap_app! {
             };
 
             command_line.append_switch(Some(&"disable-session-crashed-bubble".into()));
-            command_line.append_switch(Some(&"disable-gpu".into()));
-            command_line.append_switch(Some(&"disable-gpu-compositing".into()));
             command_line.append_switch(Some(&"hide-crash-restore-bubble".into()));
             command_line.append_switch(Some(&"noerrdialogs".into()));
             command_line.append_switch_with_value(
@@ -762,6 +816,66 @@ wrap_task! {
                         Err(error) => Err(error),
                     }
                 }
+                ControlCommand::MouseMove(command) => {
+                    if let Some(host) = self.browser.host() {
+                        host.send_mouse_move_event(
+                            Some(&MouseEvent {
+                                x: command.x,
+                                y: command.y,
+                                modifiers: command.modifiers,
+                            }),
+                            i32::from(command.leaving),
+                        );
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
+                }
+                ControlCommand::MouseClick {
+                    command,
+                    button,
+                    click_count,
+                } => {
+                    if let Some(host) = self.browser.host() {
+                        host.send_mouse_click_event(
+                            Some(&MouseEvent {
+                                x: command.x,
+                                y: command.y,
+                                modifiers: command.modifiers,
+                            }),
+                            *button,
+                            i32::from(command.mouse_up),
+                            *click_count,
+                        );
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
+                }
+                ControlCommand::MouseWheel(command) => {
+                    if let Some(host) = self.browser.host() {
+                        host.send_mouse_wheel_event(
+                            Some(&MouseEvent {
+                                x: command.x,
+                                y: command.y,
+                                modifiers: command.modifiers,
+                            }),
+                            command.delta_x,
+                            command.delta_y,
+                        );
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
+                }
+                ControlCommand::KeyEvent(event) => {
+                    if let Some(host) = self.browser.host() {
+                        host.send_key_event(Some(event));
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
+                }
             };
             match result {
                 Ok(()) => self.emitter.success(self.request_id),
@@ -870,6 +984,8 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::MultipleBrowsers,
         Capability::Visibility,
         Capability::RendererCrashEvents,
+        Capability::PointerInput,
+        Capability::KeyboardInput,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -1264,7 +1380,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlCommand, absolute_profile_path, bounds_from_viewport, control_command,
+        ControlCommand, KeyEventType, absolute_profile_path, bounds_from_viewport, control_command,
         is_deb_internal_url, validate_cef_api_hash,
     };
     use shell_protocol::wire;
@@ -1348,6 +1464,101 @@ mod tests {
             }),
             Ok(ControlCommand::Focus(true))
         ));
+    }
+
+    #[test]
+    fn parses_pointer_requests() {
+        assert!(matches!(
+            control_command(wire::Request {
+                browser_id: 1,
+                operation: Some(wire::request::Operation::MouseMove(wire::MouseMove {
+                    x: 12,
+                    y: 34,
+                    modifiers: 16,
+                    leaving: false,
+                })),
+            }),
+            Ok(ControlCommand::MouseMove(command))
+                if (command.x, command.y, command.modifiers, command.leaving)
+                    == (12, 34, 16, false)
+        ));
+        assert!(matches!(
+            control_command(wire::Request {
+                browser_id: 1,
+                operation: Some(wire::request::Operation::MouseWheel(wire::MouseWheel {
+                    x: 56,
+                    y: 78,
+                    modifiers: 1 << 14,
+                    delta_x: 2,
+                    delta_y: -4,
+                })),
+            }),
+            Ok(ControlCommand::MouseWheel(command))
+                if (command.x, command.y, command.modifiers, command.delta_x, command.delta_y)
+                    == (56, 78, 1 << 14, 2, -4)
+        ));
+        assert!(matches!(
+            control_command(wire::Request {
+                browser_id: 1,
+                operation: Some(wire::request::Operation::MouseClick(wire::MouseClick {
+                    x: 90,
+                    y: 12,
+                    modifiers: 64,
+                    button: wire::MouseButton::Right as i32,
+                    mouse_up: true,
+                    click_count: 2,
+                })),
+            }),
+            Ok(ControlCommand::MouseClick {
+                command,
+                click_count: 2,
+                ..
+            }) if (command.x, command.y, command.modifiers, command.mouse_up)
+                == (90, 12, 64, true)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_pointer_clicks() {
+        let request = |button, click_count| wire::Request {
+            browser_id: 1,
+            operation: Some(wire::request::Operation::MouseClick(wire::MouseClick {
+                x: 0,
+                y: 0,
+                modifiers: 0,
+                button,
+                mouse_up: false,
+                click_count,
+            })),
+        };
+        assert!(control_command(request(wire::MouseButton::Unspecified as i32, 1)).is_err());
+        assert!(control_command(request(wire::MouseButton::Left as i32, 0)).is_err());
+    }
+
+    #[test]
+    fn parses_and_validates_key_events() {
+        let request = |event_type, character| wire::Request {
+            browser_id: 1,
+            operation: Some(wire::request::Operation::KeyEvent(wire::KeyEvent {
+                event_type,
+                modifiers: 2,
+                windows_key_code: 0x41,
+                native_key_code: 38,
+                is_system_key: false,
+                character,
+                unmodified_character: 0x61,
+            })),
+        };
+        assert!(matches!(
+            control_command(request(wire::KeyEventType::RawKeyDown as i32, 0x61)),
+            Ok(ControlCommand::KeyEvent(event))
+                if event.type_ == KeyEventType::RAWKEYDOWN
+                    && event.windows_key_code == 0x41
+                    && event.native_key_code == 38
+                    && event.character == 0x61
+        ));
+        assert!(control_command(request(wire::KeyEventType::Unspecified as i32, 0x61)).is_err());
+        assert!(control_command(request(wire::KeyEventType::Character as i32, 0x1_0000)).is_err());
     }
 
     #[test]

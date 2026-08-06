@@ -20,6 +20,22 @@ enum Capability {
   CAPABILITY_MULTIPLE_BROWSERS = 8;
   CAPABILITY_VISIBILITY = 9;
   CAPABILITY_RENDERER_CRASH_EVENTS = 10;
+  CAPABILITY_POINTER_INPUT = 11;
+  CAPABILITY_KEYBOARD_INPUT = 12;
+}
+
+enum MouseButton {
+  MOUSE_BUTTON_UNSPECIFIED = 0;
+  MOUSE_BUTTON_LEFT = 1;
+  MOUSE_BUTTON_MIDDLE = 2;
+  MOUSE_BUTTON_RIGHT = 3;
+}
+
+enum KeyEventType {
+  KEY_EVENT_TYPE_UNSPECIFIED = 0;
+  KEY_EVENT_TYPE_RAW_KEY_DOWN = 1;
+  KEY_EVENT_TYPE_CHARACTER = 2;
+  KEY_EVENT_TYPE_KEY_UP = 3;
 }
 
 message Packet {
@@ -62,6 +78,10 @@ message Request {
     DeleteCookie delete_cookie = 18;
     SetVisibility set_visibility = 19;
     Shutdown shutdown = 20;
+    MouseMove mouse_move = 21;
+    MouseClick mouse_click = 22;
+    MouseWheel mouse_wheel = 23;
+    KeyEvent key_event = 24;
   }
 }
 
@@ -119,6 +139,40 @@ message SetVisibility {
 }
 
 message Shutdown {}
+
+message MouseMove {
+  int32 x = 1;
+  int32 y = 2;
+  uint32 modifiers = 3;
+  bool leaving = 4;
+}
+
+message MouseClick {
+  int32 x = 1;
+  int32 y = 2;
+  uint32 modifiers = 3;
+  MouseButton button = 4;
+  bool mouse_up = 5;
+  uint32 click_count = 6;
+}
+
+message MouseWheel {
+  int32 x = 1;
+  int32 y = 2;
+  uint32 modifiers = 3;
+  int32 delta_x = 4;
+  int32 delta_y = 5;
+}
+
+message KeyEvent {
+  KeyEventType event_type = 1;
+  uint32 modifiers = 2;
+  int32 windows_key_code = 3;
+  int32 native_key_code = 4;
+  bool is_system_key = 5;
+  uint32 character = 6;
+  uint32 unmodified_character = 7;
+}
 
 message Response {
   oneof result {
