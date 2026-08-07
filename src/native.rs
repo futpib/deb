@@ -18,11 +18,7 @@ use std::{
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
-use x11rb::{
-    connection::Connection,
-    protocol::xproto::{ConfigureWindowAux, ConnectionExt, ImageFormat, StackMode, Window},
-    rust_connection::RustConnection,
-};
+use x11rb::{protocol::xproto::Window, rust_connection::RustConnection};
 
 unsafe extern "C" {
     fn deb_browser_surface_submit(
@@ -1169,79 +1165,6 @@ fn format_response_error(context: &str, response: wire::Response) -> String {
         }
         None => format!("{context} response has no result"),
     }
-}
-
-pub(crate) fn sampled_pixel_variants(
-    connection: &RustConnection,
-    window: Window,
-    bounds: NativeRect,
-) -> NativeResult<(usize, bool, bool)> {
-    connection.configure_window(
-        window,
-        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-    )?;
-    connection.flush()?;
-    sleep(Duration::from_millis(100));
-    let tree = connection.query_tree(window)?.reply()?;
-    let window_position = connection
-        .translate_coordinates(window, tree.root, 0, 0)?
-        .reply()?;
-    let local_coordinate = |value: i32, origin: i16, extent: u16| {
-        let translated = value.checked_sub(i32::from(origin))?;
-        if (0..i32::from(extent)).contains(&translated) {
-            Some(translated)
-        } else {
-            (0..i32::from(extent)).contains(&value).then_some(value)
-        }
-    };
-    let geometry = connection.get_geometry(window)?.reply()?;
-    let x = local_coordinate(bounds.x, window_position.dst_x, geometry.width)
-        .and_then(|value| value.checked_add(4))
-        .ok_or("surface x is outside the application window")?;
-    let y = local_coordinate(bounds.y, window_position.dst_y, geometry.height)
-        .and_then(|value| value.checked_add(4))
-        .ok_or("surface y is outside the application window")?;
-    if x < 0 || y < 0 {
-        return Err(format!(
-            "browser surface at {},{} is outside application window {} at {},{} (local {},{})",
-            bounds.x, bounds.y, window, window_position.dst_x, window_position.dst_y, x, y,
-        )
-        .into());
-    }
-    let x = i16::try_from(x)?;
-    let y = i16::try_from(y)?;
-    let available_width = u16::try_from(i32::from(geometry.width) - i32::from(x))?;
-    let available_height = u16::try_from(i32::from(geometry.height) - i32::from(y))?;
-    let width = u16::try_from(bounds.width)?
-        .saturating_sub(8)
-        .min(available_width)
-        .min(512);
-    let height = u16::try_from(bounds.height)?
-        .saturating_sub(8)
-        .min(available_height)
-        .min(512);
-    if width < 2 || height < 2 {
-        return Err("browser surface has no drawable area".into());
-    }
-    let image = connection
-        .get_image(ImageFormat::Z_PIXMAP, window, x, y, width, height, u32::MAX)?
-        .reply()?;
-    let pixels = image.data.chunks_exact(4);
-    let has_qt_overlay = pixels
-        .clone()
-        .any(|pixel| pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 255);
-    let has_orientation_marker = pixels
-        .clone()
-        .any(|pixel| pixel[0] == 0 && pixel[1] == 255 && pixel[2] == 0);
-    Ok((
-        pixels
-            .step_by(97)
-            .map(|pixel| [pixel[0], pixel[1], pixel[2], pixel[3]])
-            .collect::<HashSet<_>>()
-            .len(),
-        has_qt_overlay,
-        has_orientation_marker,
-    ))
 }
 
 fn stop_child(child: &mut Child) {

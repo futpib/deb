@@ -22,7 +22,6 @@ struct Backend {
     status: String,
     tabs_json: String,
     window_state_json: String,
-    smoke_test: bool,
     active_tab_id: String,
     controller: Option<TabController>,
     window_bounds: HashMap<u64, NativeRect>,
@@ -38,7 +37,6 @@ impl Default for Backend {
             status: "Waiting for Qt native host…".to_owned(),
             tabs_json: "[]".to_owned(),
             window_state_json: "{\"windows\":[]}".to_owned(),
-            smoke_test: std::env::var("DEB_AUTOMATED_SMOKE_TEST").as_deref() == Ok("1"),
             active_tab_id: String::new(),
             controller: None,
             window_bounds: HashMap::new(),
@@ -64,7 +62,6 @@ impl Backend {
         Member = window_state_json,
         Notify = window_state_json_changed
     );
-    qproperty!("smokeTest", Member = smoke_test);
     qproperty!(
         "activeTabId",
         Member = active_tab_id,
@@ -453,15 +450,6 @@ impl Backend {
         self.active_tab_id_changed();
         self.url_changed();
         self.status_changed();
-    }
-
-    #[qslot]
-    fn finish_smoke_test(&mut self, outcome: String, details: String) {
-        if let Some(controller) = self.controller.take() {
-            controller.stop();
-        }
-        eprintln!("deb-smoke: {outcome}: {details}");
-        std::process::exit(i32::from(outcome != "PASS"));
     }
 
     #[qslot]

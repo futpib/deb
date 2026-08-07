@@ -8,6 +8,7 @@ import deb_native
 
 ApplicationWindow {
     id: root
+    objectName: "window.main"
     width: 1440
     height: 860
     minimumWidth: 900
@@ -96,6 +97,8 @@ ApplicationWindow {
 
             TabBar {
                 id: profileTabs
+                objectName: "profiles.tabs"
+                Accessible.id: objectName
                 Layout.fillWidth: true
 
                 Repeater {
@@ -104,6 +107,10 @@ ApplicationWindow {
                     TabButton {
                         required property string profileId
                         required property string profileName
+                        objectName: `profile.tab.${profileId}`
+                        Accessible.id: objectName
+                        Accessible.name: profileName
+                        Accessible.description: `Browser profile ${profileName}`
                         text: profileName
                         ToolTip.visible: hovered
                         ToolTip.text: `Profile ${profileId}`
@@ -112,6 +119,10 @@ ApplicationWindow {
             }
 
             Label {
+                objectName: "profile.error"
+                Accessible.id: objectName
+                Accessible.role: Accessible.AlertMessage
+                Accessible.name: text
                 visible: profileManager.error.length > 0
                 text: profileManager.error
                 color: palette.brightText
@@ -121,12 +132,18 @@ ApplicationWindow {
 
             TextField {
                 id: newProfileName
+                objectName: "profile.name-input"
+                Accessible.id: objectName
+                Accessible.name: "New profile name"
                 placeholderText: "New profile name"
                 Layout.preferredWidth: 170
                 onAccepted: profileManager.create_profile(text)
             }
 
             Button {
+                objectName: "profile.add"
+                Accessible.id: objectName
+                Accessible.name: text
                 text: "Add profile"
                 enabled: newProfileName.text.trim().length > 0
                 onClicked: profileManager.create_profile(newProfileName.text)
@@ -156,20 +173,12 @@ ApplicationWindow {
             required property string profileId
             required property string profileName
             required property string viewId
+            objectName: `window.${viewId}`
             width: 1280
             height: 760
             minimumWidth: 760
             minimumHeight: 480
             title: `deb · ${profileName}`
-
-            Component.onCompleted: {
-                if (backendObject.smokeTest) {
-                    x = 720
-                    y = 100
-                    width = 700
-                    height = 700
-                }
-            }
 
             BrowserView {
                 id: detachedBrowserView
@@ -209,29 +218,9 @@ ApplicationWindow {
         readonly property string profileId: profilesModel.get(index).profileId
         readonly property string profileName: profilesModel.get(index).profileName
         readonly property string viewId: profilesModel.get(index).profileViewId
-        property bool smokeWindowOpened: false
-
         Backend {
             id: backend
             profileId: workspace.profileId
-        }
-
-        Connections {
-            target: backend
-
-            function onWindowStateJsonChanged() {
-                if (backend.smokeTest && !workspace.smokeWindowOpened) {
-                    const state = JSON.parse(backend.windowStateJson)
-                    if ((state.windows ?? []).some(candidate => candidate.id === workspace.viewId)) {
-                        workspace.smokeWindowOpened = true
-                        root.openDetachedWindow(
-                            backend,
-                            workspace.profileId,
-                            `${workspace.profileName} smoke window`
-                        )
-                    }
-                }
-            }
         }
 
         BrowserView {
@@ -266,6 +255,10 @@ ApplicationWindow {
         property string activeTabId: ""
         property string currentUrl: ""
         property string currentStatus: "Waiting for native host…"
+        objectName: `browser.view.${viewId}`
+        Accessible.id: objectName
+        Accessible.role: Accessible.Pane
+        Accessible.name: windowLabel
 
         ListModel {
             id: tabsModel
@@ -368,16 +361,23 @@ ApplicationWindow {
 
                         TabBar {
                             id: browserTabs
+                            objectName: `browser.tabs.${browserView.viewId}`
+                            Accessible.id: objectName
                             Layout.fillWidth: true
 
                             Repeater {
                                 model: tabsModel
 
                                 TabButton {
+                                    required property string tabId
                                     required property string engine
                                     required property string tabUrl
                                     required property string tabTitle
                                     required property string tabStatus
+                                    objectName: `browser.tab.${browserView.profileId}.${tabId}`
+                                    Accessible.id: objectName
+                                    Accessible.name: tabTitle || tabUrl
+                                    Accessible.description: `${engine} tab at ${tabUrl}`
                                     text: `${engine === "firefox" ? "🦊" : "◉"} ${tabTitle || tabUrl}`
                                     width: Math.max(150, Math.min(260, implicitWidth))
                                     ToolTip.visible: hovered
@@ -396,11 +396,17 @@ ApplicationWindow {
                         }
 
                         Button {
+                            objectName: `browser.new.chromium.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: "New Chromium tab"
                             text: "+ Chromium"
                             onClicked: browserView.backendObject.new_tab(browserView.viewId, "chromium")
                         }
 
                         Button {
+                            objectName: `browser.new.firefox.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: "New Firefox tab"
                             text: "+ Firefox"
                             onClicked: browserView.backendObject.new_tab(browserView.viewId, "firefox")
                         }
@@ -410,6 +416,9 @@ ApplicationWindow {
                         Layout.fillWidth: true
 
                         Button {
+                            objectName: `browser.reload.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: "Reload this tab"
                             text: "↻"
                             ToolTip.visible: hovered
                             ToolTip.text: "Reload this tab"
@@ -418,6 +427,9 @@ ApplicationWindow {
 
                         ComboBox {
                             id: enginePicker
+                            objectName: `browser.engine.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: "Tab engine"
                             model: ["Chromium", "Firefox"]
                             Layout.preferredWidth: 125
                             onActivated: {
@@ -432,6 +444,9 @@ ApplicationWindow {
 
                         TextField {
                             id: address
+                            objectName: `browser.address.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: "Address"
                             Layout.fillWidth: true
                             text: browserView.currentUrl
                             selectByMouse: true
@@ -439,17 +454,26 @@ ApplicationWindow {
                         }
 
                         Button {
+                            objectName: `browser.go.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: text
                             text: "Go"
                             onClicked: browserView.backendObject.navigate(browserView.viewId, address.text)
                         }
 
                         Button {
+                            objectName: `browser.close.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: text
                             text: "Close tab"
                             enabled: browserView.activeTabId.length > 0
                             onClicked: browserView.backendObject.close_tab(browserView.activeTabId)
                         }
 
                         Button {
+                            objectName: `browser.new-window.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: text
                             text: "New window"
                             onClicked: root.openDetachedWindow(
                                 browserView.backendObject,
@@ -460,6 +484,9 @@ ApplicationWindow {
 
                         Button {
                             id: moveButton
+                            objectName: `browser.move.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.name: text
                             text: "Move tab"
                             enabled: browserView.activeTabId.length > 0 && moveTargetsModel.count > 0
                             onClicked: moveMenu.open()
@@ -473,6 +500,9 @@ ApplicationWindow {
                                     MenuItem {
                                         required property string targetId
                                         required property string targetLabel
+                                        objectName: `browser.move-target.${targetId}`
+                                        Accessible.id: objectName
+                                        Accessible.name: `Move tab to ${targetLabel}`
                                         text: targetLabel
                                         onTriggered: browserView.backendObject.move_tab(
                                             browserView.activeTabId,
@@ -484,6 +514,10 @@ ApplicationWindow {
                         }
 
                         Label {
+                            objectName: `browser.status.${browserView.viewId}`
+                            Accessible.id: objectName
+                            Accessible.role: Accessible.StaticText
+                            Accessible.name: text
                             text: browserView.currentStatus
                             elide: Text.ElideRight
                             Layout.maximumWidth: 260
@@ -500,6 +534,7 @@ ApplicationWindow {
                 border.color: palette.mid
 
                 Label {
+                    Accessible.ignored: true
                     anchors.centerIn: parent
                     text: "Mounting active browser tab…"
                     color: "white"
@@ -508,6 +543,12 @@ ApplicationWindow {
 
                 BrowserSurface {
                     id: browserSurface
+                    objectName: `browser.surface.${browserView.viewId}`
+                    Accessible.id: objectName
+                    Accessible.role: Accessible.WebDocument
+                    Accessible.name: `Browser content for ${browserView.profileName}`
+                    Accessible.focusable: true
+                    Accessible.focused: activeFocus
                     anchors.fill: parent
                     anchors.margins: 1
                     surfaceId: browserView.viewId
@@ -564,15 +605,6 @@ ApplicationWindow {
                     }
                 }
 
-                Rectangle {
-                    x: 12
-                    y: 12
-                    width: 80
-                    height: 40
-                    visible: false
-                    color: "#ff00ff"
-                    Component.onCompleted: visible = browserView.backendObject.smokeTest
-                }
             }
         }
 

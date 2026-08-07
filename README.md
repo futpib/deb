@@ -45,15 +45,15 @@ Linux Firefox links its allocator glue into the launcher rather than shipping it
 
 - Linux desktop with an X11 display server, EGL, OpenGL, and DMA-BUF import support
 - Rust with Edition 2024 support
-- Qt 6 Base and Qt 6 Declarative development files
+- Qt 6.10 or newer Base and Declarative development files
 - Enough disk and memory for a full Chromium/CEF build
 - Firefox build prerequisites and enough space for a full Firefox object tree
-- `pkg-config`, protobuf, a C/C++ toolchain, Python, Node.js, and the Firefox-provided build toolchains
+- `pkg-config`, protobuf, a C/C++ toolchain, Python, PyGObject, Pillow, AT-SPI, `xdotool`, Node.js, and the Firefox-provided build toolchains
 
 On Arch Linux, the core host packages can be installed with:
 
 ```sh
-paru -S --needed base-devel libx11 libdrm mesa pkgconf protobuf qt6-base qt6-declarative
+paru -S --needed at-spi2-core base-devel libx11 libdrm mesa mesa-utils pkgconf protobuf python-gobject python-pillow qt6-base qt6-declarative xdotool xorg-xdpyinfo
 ```
 
 If Firefox's build reports another missing prerequisite, run `./mach bootstrap` in the pinned `firefox` submodule and select the desktop Firefox build environment.
@@ -134,7 +134,7 @@ The Qt shell has no Firefox-specific navigation API. Extending Gecko support mea
 ## Current limitations
 
 - Each helper supports multiple browsers for one profile. Multiple profiles use isolated helper pairs; multiple CEF request contexts inside one helper are not implemented.
-- Engine-created popup browsers, downloads, extensions, accessibility integration, full IME preedit/composition handling, devtools, arbitrary application-defined custom schemes, per-request-context cookie managers, and request interception are outside the current CEF slice. Normal key events and committed input-method text are supported.
+- Engine-created popup browsers, downloads, extensions, embedded web-content accessibility integration, full IME preedit/composition handling, devtools, arbitrary application-defined custom schemes, per-request-context cookie managers, and request interception are outside the current CEF slice. The Qt shell itself exposes production accessibility IDs, roles, names, states, and geometry through AT-SPI. Normal key events and committed input-method text are supported.
 - Presentation is X11/EGL only. Wayland-native and Xwayland presentation are not supported.
 - The Gecko helper keeps WebRender in the browser process so the CEF callback and frame leases remain process-local; Gecko content tabs still use normal content processes, but a separate Firefox GPU process is not currently used.
 
@@ -165,7 +165,7 @@ For the normal inner loop after changing Rust, QML, or the adapter, run:
 scripts/smoke-test.sh
 ```
 
-This requires a real X11 `DISPLAY`; it deliberately does not use Xvfb or force software GL because those paths cannot prove DMA-BUF presentation. It performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches `deb` with isolated temporary XDG directories. The application loads the shared internal page in both engines, switches away and back to exercise retained inactive-tab frames, samples only the browser-surface rectangle, requires an engine-rendered marker, and proves that a Qt scene marker remains visible above the imported texture. It exits with a real pass/fail status. The wrapper also checks that both engine-native profile/cache trees and the canonical SQLite cookie store were created.
+This requires native Xorg with hardware-accelerated OpenGL; it rejects XWayland and software renderers because those paths cannot prove the supported DMA-BUF presentation path. It performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches the unmodified `deb` application with isolated temporary XDG directories. An external driver locates production controls by their Qt accessibility IDs over AT-SPI, sends real mouse and keyboard input through XTEST, opens a Firefox tab, navigates it, switches back to Chromium, and hovers a real tab tooltip. All assertions come from the final composited screen and the XDG trees: both engines must render their page marker, the Qt tooltip must change pixels over the browser surface, and both engine-native profile/cache trees plus the canonical SQLite cookie store must exist. Failures preserve a screenshot, accessibility-tree dump, driver log, and application log in the reported temporary directory.
 
 `scripts/build-firefox-cef.sh` runs the same smoke test automatically after either a full Gecko build or a cached Rust-only rebuild. `scripts/smoke-test.sh --no-build` is available when the binaries and staged runtime are already current.
 

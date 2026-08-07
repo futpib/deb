@@ -17,7 +17,7 @@ case "${1:-}" in
     ;;
 esac
 
-for command in timeout rg; do
+for command in glxinfo python3 timeout rg xdotool xdpyinfo; do
   if ! command -v "$command" >/dev/null; then
     echo "Required smoke-test command is unavailable: $command" >&2
     exit 1
@@ -26,6 +26,21 @@ done
 
 if [[ -z "${DISPLAY:-}" ]]; then
   echo "The DMA-BUF smoke test requires a real X11 DISPLAY" >&2
+  exit 1
+fi
+
+display_info=$(xdpyinfo)
+if rg -q '^    XWAYLAND$' <<<"$display_info"; then
+  echo "The E2E smoke test requires native Xorg; DISPLAY=$DISPLAY is XWayland" >&2
+  exit 1
+fi
+if ! rg -q '^    XTEST$' <<<"$display_info"; then
+  echo "The E2E smoke test requires the XTEST extension" >&2
+  exit 1
+fi
+gl_info=$(glxinfo -B)
+if rg -qi 'Accelerated: no|llvmpipe|softpipe|Software Rasterizer' <<<"$gl_info"; then
+  echo "The DMA-BUF smoke test requires hardware-accelerated OpenGL" >&2
   exit 1
 fi
 
@@ -43,34 +58,42 @@ if [[ ! -f "$project_root/target/debug/firefox-cef-runtime/libcef.so" ]]; then
 fi
 
 test_root=$(mktemp -d "${TMPDIR:-/tmp}/deb-smoke.XXXXXX")
+test_passed=0
 cleanup() {
-  if [[ -n "$test_root" && -d "$test_root" && "$test_root" == */deb-smoke.* ]]; then
+  if ((test_passed)) && [[ -n "$test_root" && -d "$test_root" && "$test_root" == */deb-smoke.* ]]; then
     rm -rf -- "$test_root"
   fi
 }
 trap cleanup EXIT
 
-log_file="$test_root/smoke.log"
+app_log="$test_root/deb.log"
+driver_log="$test_root/e2e.log"
+artifacts="$test_root/artifacts"
 SECONDS=0
 set +e
-timeout --signal=TERM 45s \
+timeout --signal=TERM --kill-after=20s 120s \
   env \
   XDG_CONFIG_HOME="$test_root/config" \
   XDG_DATA_HOME="$test_root/data" \
   XDG_CACHE_HOME="$test_root/cache" \
+  QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 \
   DEB_URL=deb://new-tab/#deb-smoke \
-  DEB_AUTOMATED_SMOKE_TEST=1 \
-  "$project_root/target/debug/deb" >"$log_file" 2>&1
+  python3 "$script_directory/e2e-smoke.py" \
+    --binary "$project_root/target/debug/deb" \
+    --log "$app_log" \
+    --artifacts "$artifacts" >"$driver_log" 2>&1
 status=$?
-set -e
 
 if ((status != 0)); then
   echo "Browser smoke test failed with status $status" >&2
-  rg -n "." "$log_file" >&2
+  rg -n "." "$driver_log" >&2
+  rg -n "." "$app_log" >&2
+  echo "Failure artifacts retained at $test_root" >&2
   exit "$status"
 fi
+set -e
 
-rg '^deb-smoke:' "$log_file"
+rg '^deb-smoke:' "$driver_log"
 
 required_profile_files=(
   "$test_root/config/deb/profiles.json"
@@ -87,4 +110,5 @@ for required_path in "${required_profile_files[@]}"; do
   fi
 done
 
+test_passed=1
 echo "Browser smoke test passed in ${SECONDS}s"

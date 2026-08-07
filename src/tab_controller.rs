@@ -2,7 +2,7 @@ use crate::{
     cookie_store::{CanonicalCookie, CookieIdentity, CookieStore, cookie_contents_equal},
     native::{
         CefBackend, CefInstance, NativeRect, ProtocolNotice, RoutedNotice, clear_qt_surface,
-        sampled_pixel_variants, spawn_cef_browser,
+        spawn_cef_browser,
     },
     profile::ProfileDirectories,
 };
@@ -18,12 +18,11 @@ use std::{
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 use x11rb::{protocol::xproto::Window, rust_connection::RustConnection};
 
 type TabResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
-const MIN_RENDER_VARIANTS: usize = 8;
 static NEXT_BROWSER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -142,15 +141,6 @@ pub fn spawn(
                 .and_then(Runtime::run);
             if let Err(error) = result {
                 eprintln!("deb: tab controller failed: {error}");
-                if std::env::var("DEB_AUTOMATED_SMOKE_TEST").as_deref() == Ok("1") {
-                    let invoker = invoker.lock().unwrap_or_else(|error| error.into_inner());
-                    invoke_method!(
-                        &*invoker,
-                        "finish_smoke_test",
-                        "FAIL".to_owned(),
-                        error.to_string()
-                    );
-                }
             }
         }
     });
@@ -400,35 +390,6 @@ fn reconcile_mutation(
     })
 }
 
-enum AutomationPhase {
-    WaitChromium,
-    WaitFirefox,
-    WaitChromiumFrame,
-    CaptureChromium(Instant),
-    WaitFirefoxFrame,
-    CaptureFirefox(Instant),
-}
-
-struct Automation {
-    started: Instant,
-    chromium_tab: u64,
-    firefox_tab: Option<u64>,
-    phase: AutomationPhase,
-    chromium_variants: usize,
-}
-
-impl Automation {
-    fn from_environment() -> Option<Self> {
-        (std::env::var("DEB_AUTOMATED_SMOKE_TEST").as_deref() == Ok("1")).then(|| Self {
-            started: Instant::now(),
-            chromium_tab: 1,
-            firefox_tab: None,
-            phase: AutomationPhase::WaitChromium,
-            chromium_variants: 0,
-        })
-    }
-}
-
 struct Runtime {
     profile_id: String,
     directories: ProfileDirectories,
@@ -441,7 +402,6 @@ struct Runtime {
     chromium: Option<EngineRuntime>,
     firefox: Option<EngineRuntime>,
     cookie_sync: CookieSync,
-    automation: Option<Automation>,
     dirty: bool,
 }
 
@@ -466,7 +426,6 @@ impl Runtime {
             chromium: None,
             firefox: None,
             cookie_sync,
-            automation: Automation::from_environment(),
             dirty: false,
         })
     }
@@ -485,15 +444,6 @@ impl Runtime {
             }
             self.poll_engine(CefBackend::Chromium)?;
             self.poll_engine(CefBackend::Firefox)?;
-            if let Some((outcome, details)) = self.advance_automation()? {
-                self.shutdown_engines();
-                let invoker = self
-                    .invoker
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                invoke_method!(&*invoker, "finish_smoke_test", outcome, details);
-                return Ok(());
-            }
             if self.dirty {
                 self.publish();
             }
@@ -1020,114 +970,6 @@ impl Runtime {
             }
         }
         Ok(())
-    }
-
-    fn advance_automation(&mut self) -> TabResult<Option<(String, String)>> {
-        let Some(automation) = self.automation.as_ref() else {
-            return Ok(None);
-        };
-        if automation.started.elapsed() > Duration::from_secs(180) {
-            return Ok(Some((
-                "FAIL".to_owned(),
-                "DMA-BUF smoke test timed out".to_owned(),
-            )));
-        }
-        match automation.phase {
-            AutomationPhase::WaitChromium if self.tab_ready(automation.chromium_tab) => {
-                let window = self.tab(automation.chromium_tab)?.window_id;
-                let firefox = self.add_tab(
-                    window,
-                    TabEngine::Firefox,
-                    "deb://new-tab/#deb-smoke".to_owned(),
-                );
-                self.window_mut(window)?.active_tab = firefox;
-                self.attach_tab(firefox)?;
-                self.refresh_visibility()?;
-                let automation = self.automation.as_mut().expect("automation exists");
-                automation.firefox_tab = Some(firefox);
-                automation.phase = AutomationPhase::WaitFirefox;
-            }
-            AutomationPhase::WaitFirefox => {
-                let firefox = automation.firefox_tab.expect("Firefox tab exists");
-                if self.tab_ready(firefox) {
-                    let window = self.tab(automation.chromium_tab)?.window_id;
-                    self.select(window, automation.chromium_tab)?;
-                    self.automation.as_mut().expect("automation exists").phase =
-                        AutomationPhase::WaitChromiumFrame;
-                }
-            }
-            AutomationPhase::WaitChromiumFrame
-                if self.tab(automation.chromium_tab)?.frame_ready =>
-            {
-                self.automation.as_mut().expect("automation exists").phase =
-                    AutomationPhase::CaptureChromium(Instant::now() + Duration::from_secs(1));
-            }
-            AutomationPhase::CaptureChromium(deadline) if Instant::now() >= deadline => {
-                let variants = self.capture_window_for_tab(automation.chromium_tab)?;
-                if variants < MIN_RENDER_VARIANTS {
-                    return Ok(Some((
-                        "FAIL".to_owned(),
-                        format!("Chromium rendered only {variants} colors"),
-                    )));
-                }
-                let firefox = automation.firefox_tab.expect("Firefox tab exists");
-                let window = self.tab(firefox)?.window_id;
-                self.select(window, firefox)?;
-                let automation = self.automation.as_mut().expect("automation exists");
-                automation.chromium_variants = variants;
-                automation.phase = AutomationPhase::WaitFirefoxFrame;
-            }
-            AutomationPhase::WaitFirefoxFrame
-                if self
-                    .tab(automation.firefox_tab.expect("Firefox tab exists"))?
-                    .frame_ready =>
-            {
-                self.automation.as_mut().expect("automation exists").phase =
-                    AutomationPhase::CaptureFirefox(Instant::now() + Duration::from_secs(1));
-            }
-            AutomationPhase::CaptureFirefox(deadline) if Instant::now() >= deadline => {
-                let firefox = automation.firefox_tab.expect("Firefox tab exists");
-                let variants = self.capture_window_for_tab(firefox)?;
-                if variants < MIN_RENDER_VARIANTS {
-                    return Ok(Some((
-                        "FAIL".to_owned(),
-                        format!("Firefox rendered only {variants} colors"),
-                    )));
-                }
-                return Ok(Some((
-                    "PASS".to_owned(),
-                    format!(
-                        "Qt scene composited direct DMA-BUF frames above both engines (Chromium {} colors, Firefox {variants} colors)",
-                        automation.chromium_variants,
-                    ),
-                )));
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
-    fn capture_window_for_tab(&self, tab_id: u64) -> TabResult<usize> {
-        let tab = self.tab(tab_id)?;
-        let engine = match tab.engine {
-            TabEngine::Chromium => "Chromium",
-            TabEngine::Firefox => "Firefox",
-        };
-        let window = self.window(tab.window_id)?;
-        let (variants, has_qt_overlay, has_engine_marker) =
-            sampled_pixel_variants(&self.connection, window.parent, window.bounds)?;
-        if !has_qt_overlay {
-            return Err(format!("Qt overlay was not composited above the {engine} texture").into());
-        }
-        if !has_engine_marker {
-            return Err(format!("{engine} DMA-BUF content marker was not rendered").into());
-        }
-        Ok(variants)
-    }
-
-    fn tab_ready(&self, tab_id: u64) -> bool {
-        self.tab(tab_id)
-            .is_ok_and(|tab| tab.browser_id.is_some() && !tab.loading && !tab.crashed)
     }
 
     fn publish(&mut self) {
