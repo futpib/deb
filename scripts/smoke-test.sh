@@ -71,7 +71,7 @@ driver_log="$test_root/e2e.log"
 artifacts="$test_root/artifacts"
 SECONDS=0
 set +e
-timeout --signal=TERM --kill-after=20s 120s \
+timeout --signal=TERM --kill-after=20s 180s \
   env \
   XDG_CONFIG_HOME="$test_root/config" \
   XDG_DATA_HOME="$test_root/data" \

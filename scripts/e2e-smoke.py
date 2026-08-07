@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import http.server
 import os
+import secrets
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -17,6 +20,112 @@ from gi.repository import Atspi
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+class E2ESite:
+    def __init__(self):
+        self.cookie_name = "deb_e2e_cross_engine"
+        self.token = secrets.token_hex(12)
+        site = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                route = self.path.split("?", 1)[0]
+                if route == f"/set/{site.token}":
+                    mode = "set"
+                elif route == f"/observe/{site.token}":
+                    mode = "observe"
+                else:
+                    self.send_error(404)
+                    return
+                body = site.page(mode).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_arguments):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def page(self, mode):
+        if mode == "set":
+            action = f"""
+document.cookie = `${{cookieName}}=${{token}}; Path=/; SameSite=Lax`;
+if (hasCookie()) {{
+  document.title = `deb-e2e chromium set ${{token}}`;
+  status.textContent = "Chromium set the synchronization cookie";
+  document.body.classList.add("complete");
+}} else {{
+  document.title = "deb-e2e Chromium cookie set failed";
+  status.textContent = "Chromium did not retain the synchronization cookie";
+}}
+"""
+        else:
+            action = """
+function observeCookie() {
+  if (hasCookie()) {
+    document.title = `deb-e2e firefox synced ${token}`;
+    status.textContent = "Firefox received the Chromium cookie";
+    document.body.classList.add("complete");
+  } else {
+    document.title = "deb-e2e waiting for synchronized cookie";
+    window.setTimeout(observeCookie, 100);
+  }
+}
+observeCookie();
+"""
+        return f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>deb-e2e loading</title>
+<style>
+html, body {{ width: 100%; height: 100%; margin: 0; }}
+body {{
+  display: grid;
+  place-items: center;
+  color: white;
+  background: linear-gradient(135deg, #172033, #51246d 48%, #a23b72);
+  font: 24px sans-serif;
+}}
+body.complete {{ background: linear-gradient(135deg, #123020, #176b3a, #49a078); }}
+#marker {{ position: fixed; top: 12px; left: 12px; width: 96px; height: 64px; background: #00ff00; }}
+#status {{ padding: 32px; border: 3px solid #f4d35e; background: #101522; }}
+</style>
+</head>
+<body>
+<div id="marker"></div>
+<div id="status">Waiting for the cross-engine cookie</div>
+<script>
+const cookieName = {self.cookie_name!r};
+const token = {self.token!r};
+const status = document.getElementById("status");
+function hasCookie() {{
+  return document.cookie.split("; ").includes(`${{cookieName}}=${{token}}`);
+}}
+{action}
+</script>
+</body>
+</html>
+"""
+
+    @property
+    def origin(self):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
 
 
 def descendants(accessible):
@@ -92,7 +201,7 @@ class Driver:
             accessible = self.find_id(accessible_id)
             if accessible is None:
                 return None
-            name = accessible.get_name()
+            name = accessible.get_name() or ""
             return accessible if expected in name else None
 
         return self.wait_until(
@@ -109,6 +218,22 @@ class Driver:
             except Exception:
                 continue
         return None
+
+    def wait_for_descendant(self, accessible_id, ancestor_id, timeout=20.0):
+        def probe():
+            accessible = self.find_id(accessible_id)
+            while accessible is not None:
+                try:
+                    if accessible.get_accessible_id() == ancestor_id:
+                        return accessible
+                    accessible = accessible.get_parent()
+                except Exception:
+                    return None
+            return None
+
+        return self.wait_until(
+            f"{accessible_id} to move below {ancestor_id}", probe, timeout
+        )
 
     @staticmethod
     def rectangle(accessible):
@@ -134,7 +259,13 @@ class Driver:
         )
         return result.stdout.strip() if capture else ""
 
-    def raise_windows(self):
+    @staticmethod
+    def shell_values(output):
+        return dict(
+            line.split("=", 1) for line in output.splitlines() if "=" in line
+        )
+
+    def visible_windows(self):
         result = subprocess.run(
             ["xdotool", "search", "--onlyvisible", "--pid", str(self.process.pid)],
             check=False,
@@ -142,25 +273,85 @@ class Driver:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
         )
-        for window in result.stdout.split():
-            self.xdotool("windowraise", window)
-            subprocess.run(
-                ["xdotool", "windowfocus", window],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+        return result.stdout.split()
 
-    def move_pointer(self, accessible):
+    def top_level(self, accessible):
+        current = accessible
+        while current is not None:
+            try:
+                parent = current.get_parent()
+            except Exception:
+                break
+            if parent is None or parent == self.application:
+                return current
+            current = parent
+        return accessible
+
+    def focus_accessible_window(self, accessible):
+        top_level = self.top_level(accessible)
+        top_rectangle = self.rectangle(top_level)
+        try:
+            top_name = top_level.get_name() or ""
+        except Exception:
+            top_name = ""
+        candidates = []
+        for window in self.visible_windows():
+            try:
+                values = self.shell_values(
+                    self.xdotool("getwindowgeometry", "--shell", window, capture=True)
+                )
+                rectangle = (
+                    int(values["X"]),
+                    int(values["Y"]),
+                    int(values["WIDTH"]),
+                    int(values["HEIGHT"]),
+                )
+                window_name = self.xdotool("getwindowname", window, capture=True)
+            except Exception:
+                continue
+            score = sum(
+                abs(first - second)
+                for first, second in zip(
+                    rectangle,
+                    (
+                        top_rectangle.x,
+                        top_rectangle.y,
+                        top_rectangle.width,
+                        top_rectangle.height,
+                    ),
+                )
+            )
+            candidates.append((window_name != top_name, score, window))
+        if not candidates:
+            raise SmokeFailure("deb has no visible X11 window for an accessible control")
+        _, _, window = min(candidates)
+        self.xdotool("windowraise", window)
+        subprocess.run(
+            ["xdotool", "windowfocus", window],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def wait_for_actionable(self, accessible_id):
+        def probe():
+            accessible = self.find_id(accessible_id)
+            if accessible is None:
+                return None
+            self.rectangle(accessible)
+            return accessible
+
+        return self.wait_until(f"actionable control {accessible_id}", probe)
+
+    def move_pointer(self, accessible, focus_window=True):
         rectangle = self.rectangle(accessible)
         x = rectangle.x + rectangle.width // 2
         y = rectangle.y + rectangle.height // 2
-        self.raise_windows()
+        if focus_window:
+            self.focus_accessible_window(accessible)
         self.xdotool("mousemove", str(x), str(y))
         location = self.xdotool("getmouselocation", "--shell", capture=True)
-        coordinates = dict(
-            line.split("=", 1) for line in location.splitlines() if "=" in line
-        )
+        coordinates = self.shell_values(location)
         actual_x = int(coordinates.get("X", -1))
         actual_y = int(coordinates.get("Y", -1))
         if abs(actual_x - x) > 2 or abs(actual_y - y) > 2:
@@ -171,9 +362,9 @@ class Driver:
             )
         return x, y
 
-    def click(self, accessible_id):
-        accessible = self.wait_for_id(accessible_id)
-        self.move_pointer(accessible)
+    def click(self, accessible_id, focus_window=True):
+        accessible = self.wait_for_actionable(accessible_id)
+        self.move_pointer(accessible, focus_window)
         self.xdotool("click", "1")
 
     def type_address(self, accessible_id, address):
@@ -196,6 +387,7 @@ class Driver:
 
     def surface_statistics(self, accessible_id):
         surface = self.wait_for_id(accessible_id)
+        self.focus_accessible_window(surface)
         rectangle = self.rectangle(surface)
         image = self.capture().crop(
             (
@@ -317,6 +509,8 @@ def parse_arguments():
 def main():
     arguments = parse_arguments()
     arguments.artifacts.mkdir(parents=True, exist_ok=True)
+    site = E2ESite()
+    site.start()
     with arguments.log.open("wb") as log:
         process = subprocess.Popen(
             [str(arguments.binary)],
@@ -336,34 +530,110 @@ def main():
                 "deb to appear on AT-SPI", driver.find_application
             )
             driver.wait_for_name("browser.status.1", "Chromium")
+            chromium_initial_marker, chromium_initial_variants = driver.wait_for_surface(
+                "browser.surface.1", "initial Chromium"
+            )
             print("deb-e2e: clicking New Firefox tab through XTEST", flush=True)
             driver.click("browser.new.firefox.1")
             driver.wait_for_id("browser.tab.default.2")
-            print("deb-e2e: typing the Firefox URL through XTEST", flush=True)
-            driver.type_address("browser.address.1", "deb://new-tab/#deb-smoke")
             driver.wait_for_name("browser.status.1", "Gecko")
-            print("deb-e2e: sampling the Firefox surface", flush=True)
-            firefox_marker, firefox_variants = driver.wait_for_surface(
-                "browser.surface.1", "Firefox"
+            driver.wait_for_name("browser.tab.default.2", "New tab · deb")
+            driver.type_address("browser.address.1", "deb://new-tab/#deb-smoke")
+            firefox_internal_marker, firefox_internal_variants = driver.wait_for_surface(
+                "browser.surface.1", "Firefox internal page"
             )
 
-            print("deb-e2e: clicking the Chromium tab through XTEST", flush=True)
+            print("deb-e2e: navigating Chromium through the real address field", flush=True)
             driver.click("browser.tab.default.1")
             driver.wait_for_name("browser.status.1", "Chromium")
-            print("deb-e2e: sampling the retained Chromium surface", flush=True)
+            chromium_url = f"{site.origin}/set/{site.token}"
+            driver.type_address("browser.address.1", chromium_url)
+            driver.wait_for_name(
+                "browser.tab.default.1", f"deb-e2e chromium set {site.token}"
+            )
             chromium_marker, chromium_variants = driver.wait_for_surface(
                 "browser.surface.1", "Chromium"
             )
-            print("deb-e2e: hovering the real tab tooltip through XTEST", flush=True)
-            changed_pixels = driver.verify_tooltip_overlay(
+            print("deb-e2e: proving Qt composition over Chromium", flush=True)
+            chromium_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.1", "browser.surface.1"
             )
+
+            print("deb-e2e: observing Chromium's cookie from Firefox", flush=True)
+            driver.click("browser.tab.default.2")
+            driver.wait_for_name("browser.status.1", "Gecko")
+            firefox_url = f"{site.origin}/observe/{site.token}"
+            driver.type_address("browser.address.1", firefox_url)
+            driver.wait_for_name(
+                "browser.tab.default.2",
+                f"deb-e2e firefox synced {site.token}",
+                timeout=45.0,
+            )
+            firefox_marker, firefox_variants = driver.wait_for_surface(
+                "browser.surface.1", "Firefox after cookie synchronization"
+            )
+            print("deb-e2e: proving Qt composition over Firefox", flush=True)
+            firefox_tooltip_pixels = driver.verify_tooltip_overlay(
+                "browser.tab.default.2", "browser.surface.1"
+            )
+
+            print("deb-e2e: reselecting both retained inactive frames", flush=True)
+            driver.click("browser.tab.default.1")
+            driver.wait_for_name(
+                "browser.tab.default.1", f"deb-e2e chromium set {site.token}"
+            )
+            retained_chromium_marker, retained_chromium_variants = (
+                driver.wait_for_surface("browser.surface.1", "retained Chromium")
+            )
+            driver.click("browser.tab.default.2")
+            driver.wait_for_name(
+                "browser.tab.default.2", f"deb-e2e firefox synced {site.token}"
+            )
+            retained_firefox_marker, retained_firefox_variants = driver.wait_for_surface(
+                "browser.surface.1", "retained Firefox"
+            )
+
+            print("deb-e2e: opening a second production window", flush=True)
+            driver.click("browser.new-window.1")
+            driver.wait_for_id("browser.view.2")
+            driver.wait_for_id("browser.tab.default.3")
+            driver.wait_for_name("browser.status.2", "Chromium")
+            second_window_marker, second_window_variants = driver.wait_for_surface(
+                "browser.surface.2", "second-window Chromium"
+            )
+
+            print("deb-e2e: moving the live Firefox tab into the second window", flush=True)
+            driver.click("browser.move.1")
+            driver.click("browser.move-target.2", focus_window=False)
+            driver.wait_for_descendant("browser.tab.default.2", "browser.view.2")
+            driver.wait_for_name("browser.status.2", "Gecko")
+            driver.wait_for_name(
+                "browser.tab.default.2", f"deb-e2e firefox synced {site.token}"
+            )
+            moved_firefox_marker, moved_firefox_variants = driver.wait_for_surface(
+                "browser.surface.2", "moved Firefox"
+            )
+            moved_tooltip_pixels = driver.verify_tooltip_overlay(
+                "browser.tab.default.2", "browser.surface.2"
+            )
+            driver.wait_for_name("browser.status.1", "Chromium")
+            main_after_move_marker, main_after_move_variants = driver.wait_for_surface(
+                "browser.surface.1", "main-window Chromium after the tab move"
+            )
+
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                "Chromium and Firefox direct surfaces "
+                "both engines, cookie sync, retained frames, and two windows "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
-                f"tooltip changed {changed_pixels} pixels)"
+                f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
+                f"Firefox internal page {firefox_internal_variants}/{firefox_internal_marker}, "
+                f"retained Chromium {retained_chromium_variants}/{retained_chromium_marker}, "
+                f"retained Firefox {retained_firefox_variants}/{retained_firefox_marker}, "
+                f"second window {second_window_variants}/{second_window_marker}, "
+                f"moved Firefox {moved_firefox_variants}/{moved_firefox_marker}, "
+                f"main after move {main_after_move_variants}/{main_after_move_marker}, "
+                f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0
         except Exception as error:
@@ -372,6 +642,7 @@ def main():
             return 1
         finally:
             stop_process(process)
+            site.stop()
 
 
 if __name__ == "__main__":
