@@ -109,10 +109,11 @@ body.complete {{ background: linear-gradient(135deg, #123020, #176b3a, #49a078);
   background: #2457c5;
   font: 700 24px sans-serif;
 }}
-body.clicked #click-target {{ color: #101522; background: #ff00ff; }}
+body.chromium.clicked #click-target {{ color: #101522; background: #ff00ff; }}
+body.firefox.clicked #click-target {{ color: #101522; background: #00ffff; }}
 </style>
 </head>
-<body>
+<body class="{engine}">
 <div id="marker"></div>
 <div id="status">Waiting for the cross-engine cookie</div>
 <button id="click-target" type="button">Click this page target</button>
@@ -232,6 +233,21 @@ class Driver:
 
         return self.wait_until(
             f"{accessible_id} to contain {expected!r}", probe, timeout
+        )
+
+    def wait_for_text(self, accessible_id, expected, timeout=30.0):
+        def probe():
+            accessible = self.find_id(accessible_id)
+            if accessible is None:
+                return None
+            text = accessible.get_text_iface()
+            if text is None:
+                return None
+            actual = Atspi.Text.get_text(text, 0, -1)
+            return accessible if actual == expected else None
+
+        return self.wait_until(
+            f"{accessible_id} text to equal {expected!r}", probe, timeout
         )
 
     def find_tooltip(self):
@@ -407,6 +423,11 @@ class Driver:
         self.move_pointer_to(x, y)
         self.xdotool("click", "1")
 
+    def send_shortcut(self, accessible_id, sequence):
+        accessible = self.wait_for_id(accessible_id)
+        self.focus_accessible_window(accessible)
+        self.xdotool("key", "--clearmodifiers", sequence)
+
     def type_address(self, accessible_id, address):
         self.click(accessible_id)
         self.xdotool("key", "--clearmodifiers", "ctrl+a")
@@ -458,11 +479,20 @@ class Driver:
         )
 
     def wait_for_page_click(self, accessible_id, engine):
+        if engine == "Chromium":
+            target = (255, 0, 255)
+        elif engine == "Firefox":
+            target = (0, 255, 255)
+        else:
+            raise SmokeFailure(f"unknown page-click engine {engine}")
+
         def probe():
             pixels = self.surface_image(accessible_id).get_flattened_data()
             marker_pixels = sum(
-                red > 239 and green < 16 and blue > 239
-                for red, green, blue in pixels
+                abs(pixel[0] - target[0]) < 16
+                and abs(pixel[1] - target[1]) < 16
+                and abs(pixel[2] - target[2]) < 16
+                for pixel in pixels
             )
             return marker_pixels if marker_pixels >= 128 else None
 
@@ -626,6 +656,9 @@ def main():
             print("deb-e2e: observing Chromium's cookie from Firefox", flush=True)
             driver.click("browser.tab.default.2")
             driver.wait_for_name("browser.status.1", "Gecko")
+            driver.wait_for_text(
+                "browser.address.1", "deb://new-tab/#deb-smoke"
+            )
             firefox_url = f"{site.origin}/observe/{site.token}"
             driver.type_address("browser.address.1", firefox_url)
             driver.wait_for_name(
@@ -650,22 +683,54 @@ def main():
                 "browser.tab.default.2", "browser.surface.1"
             )
 
-            print("deb-e2e: reselecting both retained inactive frames", flush=True)
+            print("deb-e2e: switching retained tabs through their buttons", flush=True)
             driver.click("browser.tab.default.1")
+            driver.wait_for_name("browser.status.1", "Chromium")
+            driver.wait_for_text("browser.address.1", chromium_url)
             driver.wait_for_name(
                 "browser.tab.default.1",
                 f"deb-e2e chromium click received {site.token}",
+            )
+            retained_chromium_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Chromium"
             )
             retained_chromium_marker, retained_chromium_variants = (
                 driver.wait_for_surface("browser.surface.1", "retained Chromium")
             )
             driver.click("browser.tab.default.2")
+            driver.wait_for_name("browser.status.1", "Gecko")
+            driver.wait_for_text("browser.address.1", firefox_url)
             driver.wait_for_name(
                 "browser.tab.default.2",
                 f"deb-e2e firefox click received {site.token}",
             )
+            retained_firefox_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Firefox"
+            )
             retained_firefox_marker, retained_firefox_variants = driver.wait_for_surface(
                 "browser.surface.1", "retained Firefox"
+            )
+
+            print("deb-e2e: switching tabs through both keyboard shortcuts", flush=True)
+            driver.send_shortcut("browser.surface.1", "ctrl+shift+Tab")
+            driver.wait_for_name("browser.status.1", "Chromium")
+            driver.wait_for_text("browser.address.1", chromium_url)
+            driver.wait_for_name(
+                "browser.tab.default.1",
+                f"deb-e2e chromium click received {site.token}",
+            )
+            shortcut_chromium_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Chromium"
+            )
+            driver.send_shortcut("browser.surface.1", "ctrl+Tab")
+            driver.wait_for_name("browser.status.1", "Gecko")
+            driver.wait_for_text("browser.address.1", firefox_url)
+            driver.wait_for_name(
+                "browser.tab.default.2",
+                f"deb-e2e firefox click received {site.token}",
+            )
+            shortcut_firefox_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Firefox"
             )
 
             print("deb-e2e: opening a second production window", flush=True)
@@ -689,17 +754,24 @@ def main():
             moved_firefox_marker, moved_firefox_variants = driver.wait_for_surface(
                 "browser.surface.2", "moved Firefox"
             )
+            moved_firefox_click_pixels = driver.wait_for_page_click(
+                "browser.surface.2", "Firefox"
+            )
             moved_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.2", "browser.surface.2"
             )
             driver.wait_for_name("browser.status.1", "Chromium")
+            driver.wait_for_text("browser.address.1", chromium_url)
             main_after_move_marker, main_after_move_variants = driver.wait_for_surface(
                 "browser.surface.1", "main-window Chromium after the tab move"
+            )
+            main_after_move_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Chromium"
             )
 
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                "both engines, trusted page clicks, cookie sync, retained frames, and two windows "
+                "both engines, trusted page clicks, tab buttons and shortcuts, cookie sync, retained frames, and two windows "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -710,6 +782,9 @@ def main():
                 f"moved Firefox {moved_firefox_variants}/{moved_firefox_marker}, "
                 f"main after move {main_after_move_variants}/{main_after_move_marker}, "
                 f"page clicks {chromium_click_pixels}/{firefox_click_pixels} pixels, "
+                f"retained clicks {retained_chromium_click_pixels}/{retained_firefox_click_pixels}, "
+                f"shortcut clicks {shortcut_chromium_click_pixels}/{shortcut_firefox_click_pixels}, "
+                f"moved/main clicks {moved_firefox_click_pixels}/{main_after_move_click_pixels}, "
                 f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0

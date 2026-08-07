@@ -183,7 +183,6 @@ struct Tab {
     status: String,
     loading: bool,
     crashed: bool,
-    frame_ready: bool,
 }
 
 impl Tab {
@@ -576,7 +575,6 @@ impl Runtime {
             status: "Starting engine…".to_owned(),
             loading: true,
             crashed: false,
-            frame_ready: false,
         });
         id
     }
@@ -687,7 +685,6 @@ impl Runtime {
             return Err(format!("tab {tab_id} does not belong to window {window_id}").into());
         }
         self.window_mut(window_id)?.active_tab = tab_id;
-        self.tab_mut(tab_id)?.frame_ready = false;
         if self.tab(tab_id)?.browser_id.is_none() {
             self.attach_tab(tab_id)?;
         }
@@ -903,7 +900,7 @@ impl Runtime {
             ProtocolNotice::SurfaceReady => {
                 tab.status = format!("Live · {}", backend.label());
             }
-            ProtocolNotice::FrameReady => tab.frame_ready = true,
+            ProtocolNotice::FrameReady => return Ok(()),
             ProtocolNotice::LoadingChanged(loading) => {
                 tab.loading = loading;
                 if !loading {

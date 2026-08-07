@@ -260,12 +260,51 @@ ApplicationWindow {
         Accessible.role: Accessible.Pane
         Accessible.name: windowLabel
 
+        function requestTabSelection(tabId) {
+            if (rebuildingTabs || tabId.length === 0 || tabId === activeTabId) {
+                return
+            }
+            backendObject.select_tab(viewId, tabId)
+        }
+
+        function selectRelativeTab(offset) {
+            if (rebuildingTabs || tabsModel.count < 2) {
+                return
+            }
+            let activeIndex = -1
+            for (let index = 0; index < tabsModel.count; ++index) {
+                if (tabsModel.get(index).tabId === activeTabId) {
+                    activeIndex = index
+                    break
+                }
+            }
+            if (activeIndex < 0) {
+                return
+            }
+            const targetIndex = (activeIndex + offset + tabsModel.count) % tabsModel.count
+            requestTabSelection(tabsModel.get(targetIndex).tabId)
+        }
+
         ListModel {
             id: tabsModel
         }
 
         ListModel {
             id: moveTargetsModel
+        }
+
+        Shortcut {
+            sequence: "Ctrl+Tab"
+            context: Qt.WindowShortcut
+            enabled: browserView.viewVisible && tabsModel.count > 1
+            onActivated: browserView.selectRelativeTab(1)
+        }
+
+        Shortcut {
+            sequence: "Ctrl+Shift+Tab"
+            context: Qt.WindowShortcut
+            enabled: browserView.viewVisible && tabsModel.count > 1
+            onActivated: browserView.selectRelativeTab(-1)
         }
 
         Connections {
@@ -378,19 +417,12 @@ ApplicationWindow {
                                     Accessible.id: objectName
                                     Accessible.name: tabTitle || tabUrl
                                     Accessible.description: `${engine} tab at ${tabUrl}`
+                                    Accessible.selected: checked
                                     text: `${engine === "firefox" ? "🦊" : "◉"} ${tabTitle || tabUrl}`
                                     width: Math.max(150, Math.min(260, implicitWidth))
                                     ToolTip.visible: hovered
                                     ToolTip.text: `${tabUrl}\n${tabStatus}`
-                                }
-                            }
-
-                            onCurrentIndexChanged: {
-                                if (!browserView.rebuildingTabs && currentIndex >= 0 && currentIndex < tabsModel.count) {
-                                    browserView.backendObject.select_tab(
-                                        browserView.viewId,
-                                        tabsModel.get(currentIndex).tabId
-                                    )
+                                    onClicked: browserView.requestTabSelection(tabId)
                                 }
                             }
                         }
