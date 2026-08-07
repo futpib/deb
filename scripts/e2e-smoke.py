@@ -53,6 +53,7 @@ class E2ESite:
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
     def page(self, mode):
+        engine = "chromium" if mode == "set" else "firefox"
         if mode == "set":
             action = f"""
 document.cookie = `${{cookieName}}=${{token}}; Path=/; SameSite=Lax`;
@@ -96,19 +97,44 @@ body {{
 body.complete {{ background: linear-gradient(135deg, #123020, #176b3a, #49a078); }}
 #marker {{ position: fixed; top: 12px; left: 12px; width: 96px; height: 64px; background: #00ff00; }}
 #status {{ padding: 32px; border: 3px solid #f4d35e; background: #101522; }}
+#click-target {{
+  position: fixed;
+  z-index: 2;
+  left: 30%;
+  top: 72%;
+  width: 40%;
+  height: 16%;
+  border: 4px solid white;
+  color: white;
+  background: #2457c5;
+  font: 700 24px sans-serif;
+}}
+body.clicked #click-target {{ color: #101522; background: #ff00ff; }}
 </style>
 </head>
 <body>
 <div id="marker"></div>
 <div id="status">Waiting for the cross-engine cookie</div>
+<button id="click-target" type="button">Click this page target</button>
 <script>
 const cookieName = {self.cookie_name!r};
 const token = {self.token!r};
 const status = document.getElementById("status");
+const clickTarget = document.getElementById("click-target");
+const clickTitle = {f"deb-e2e {engine} click received {self.token}"!r};
 function hasCookie() {{
   return document.cookie.split("; ").includes(`${{cookieName}}=${{token}}`);
 }}
 {action}
+clickTarget.addEventListener("click", event => {{
+  if (!event.isTrusted) {{
+    document.title = `deb-e2e {engine} rejected untrusted click ${{token}}`;
+    return;
+  }}
+  document.title = clickTitle;
+  status.textContent = "The page received a trusted browser click";
+  document.body.classList.add("clicked");
+}});
 </script>
 </body>
 </html>
@@ -343,12 +369,7 @@ class Driver:
 
         return self.wait_until(f"actionable control {accessible_id}", probe)
 
-    def move_pointer(self, accessible, focus_window=True):
-        rectangle = self.rectangle(accessible)
-        x = rectangle.x + rectangle.width // 2
-        y = rectangle.y + rectangle.height // 2
-        if focus_window:
-            self.focus_accessible_window(accessible)
+    def move_pointer_to(self, x, y):
         self.xdotool("mousemove", str(x), str(y))
         location = self.xdotool("getmouselocation", "--shell", capture=True)
         coordinates = self.shell_values(location)
@@ -362,9 +383,28 @@ class Driver:
             )
         return x, y
 
+    def move_pointer(self, accessible, focus_window=True):
+        rectangle = self.rectangle(accessible)
+        x = rectangle.x + rectangle.width // 2
+        y = rectangle.y + rectangle.height // 2
+        if focus_window:
+            self.focus_accessible_window(accessible)
+        return self.move_pointer_to(x, y)
+
     def click(self, accessible_id, focus_window=True):
         accessible = self.wait_for_actionable(accessible_id)
         self.move_pointer(accessible, focus_window)
+        self.xdotool("click", "1")
+
+    def click_surface(self, accessible_id, x_fraction, y_fraction):
+        if not 0.0 < x_fraction < 1.0 or not 0.0 < y_fraction < 1.0:
+            raise SmokeFailure("surface click fractions must be inside the viewport")
+        surface = self.wait_for_id(accessible_id)
+        rectangle = self.rectangle(surface)
+        self.focus_accessible_window(surface)
+        x = rectangle.x + round(rectangle.width * x_fraction)
+        y = rectangle.y + round(rectangle.height * y_fraction)
+        self.move_pointer_to(x, y)
         self.xdotool("click", "1")
 
     def type_address(self, accessible_id, address):
@@ -385,19 +425,21 @@ class Driver:
     def capture(self):
         return ImageGrab.grab()
 
-    def surface_statistics(self, accessible_id):
+    def surface_image(self, accessible_id):
         surface = self.wait_for_id(accessible_id)
         self.focus_accessible_window(surface)
         rectangle = self.rectangle(surface)
-        image = self.capture().crop(
+        return self.capture().crop(
             (
                 rectangle.x,
                 rectangle.y,
                 rectangle.x + rectangle.width,
                 rectangle.y + rectangle.height,
             )
-        )
-        pixels = list(image.convert("RGB").get_flattened_data())
+        ).convert("RGB")
+
+    def surface_statistics(self, accessible_id):
+        pixels = list(self.surface_image(accessible_id).get_flattened_data())
         marker_pixels = sum(
             red < 16 and green > 239 and blue < 16 for red, green, blue in pixels
         )
@@ -413,6 +455,19 @@ class Driver:
 
         return self.wait_until(
             f"a composed {engine} browser frame", probe, timeout=30.0
+        )
+
+    def wait_for_page_click(self, accessible_id, engine):
+        def probe():
+            pixels = self.surface_image(accessible_id).get_flattened_data()
+            marker_pixels = sum(
+                red > 239 and green < 16 and blue > 239
+                for red, green, blue in pixels
+            )
+            return marker_pixels if marker_pixels >= 128 else None
+
+        return self.wait_until(
+            f"the {engine} page's trusted-click marker", probe, timeout=20.0
         )
 
     @staticmethod
@@ -554,6 +609,15 @@ def main():
             chromium_marker, chromium_variants = driver.wait_for_surface(
                 "browser.surface.1", "Chromium"
             )
+            print("deb-e2e: clicking the Chromium page through XTEST", flush=True)
+            driver.click_surface("browser.surface.1", 0.5, 0.8)
+            driver.wait_for_name(
+                "browser.tab.default.1",
+                f"deb-e2e chromium click received {site.token}",
+            )
+            chromium_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Chromium"
+            )
             print("deb-e2e: proving Qt composition over Chromium", flush=True)
             chromium_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.1", "browser.surface.1"
@@ -572,6 +636,15 @@ def main():
             firefox_marker, firefox_variants = driver.wait_for_surface(
                 "browser.surface.1", "Firefox after cookie synchronization"
             )
+            print("deb-e2e: clicking the Firefox page through XTEST", flush=True)
+            driver.click_surface("browser.surface.1", 0.5, 0.8)
+            driver.wait_for_name(
+                "browser.tab.default.2",
+                f"deb-e2e firefox click received {site.token}",
+            )
+            firefox_click_pixels = driver.wait_for_page_click(
+                "browser.surface.1", "Firefox"
+            )
             print("deb-e2e: proving Qt composition over Firefox", flush=True)
             firefox_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.2", "browser.surface.1"
@@ -580,14 +653,16 @@ def main():
             print("deb-e2e: reselecting both retained inactive frames", flush=True)
             driver.click("browser.tab.default.1")
             driver.wait_for_name(
-                "browser.tab.default.1", f"deb-e2e chromium set {site.token}"
+                "browser.tab.default.1",
+                f"deb-e2e chromium click received {site.token}",
             )
             retained_chromium_marker, retained_chromium_variants = (
                 driver.wait_for_surface("browser.surface.1", "retained Chromium")
             )
             driver.click("browser.tab.default.2")
             driver.wait_for_name(
-                "browser.tab.default.2", f"deb-e2e firefox synced {site.token}"
+                "browser.tab.default.2",
+                f"deb-e2e firefox click received {site.token}",
             )
             retained_firefox_marker, retained_firefox_variants = driver.wait_for_surface(
                 "browser.surface.1", "retained Firefox"
@@ -608,7 +683,8 @@ def main():
             driver.wait_for_descendant("browser.tab.default.2", "browser.view.2")
             driver.wait_for_name("browser.status.2", "Gecko")
             driver.wait_for_name(
-                "browser.tab.default.2", f"deb-e2e firefox synced {site.token}"
+                "browser.tab.default.2",
+                f"deb-e2e firefox click received {site.token}",
             )
             moved_firefox_marker, moved_firefox_variants = driver.wait_for_surface(
                 "browser.surface.2", "moved Firefox"
@@ -623,7 +699,7 @@ def main():
 
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                "both engines, cookie sync, retained frames, and two windows "
+                "both engines, trusted page clicks, cookie sync, retained frames, and two windows "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -633,6 +709,7 @@ def main():
                 f"second window {second_window_variants}/{second_window_marker}, "
                 f"moved Firefox {moved_firefox_variants}/{moved_firefox_marker}, "
                 f"main after move {main_after_move_variants}/{main_after_move_marker}, "
+                f"page clicks {chromium_click_pixels}/{firefox_click_pixels} pixels, "
                 f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0
