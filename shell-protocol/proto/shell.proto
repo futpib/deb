@@ -15,7 +15,7 @@ enum Capability {
   CAPABILITY_RESIZE = 3;
   CAPABILITY_FOCUS = 4;
   CAPABILITY_LOADING_EVENTS = 5;
-  CAPABILITY_NATIVE_X11_SURFACE = 6;
+  CAPABILITY_ACCELERATED_DMABUF_SURFACE = 6;
   CAPABILITY_COOKIE_SYNC = 7;
   CAPABILITY_MULTIPLE_BROWSERS = 8;
   CAPABILITY_VISIBILITY = 9;
@@ -47,6 +47,7 @@ message Packet {
     Request request = 12;
     Response response = 13;
     Event event = 14;
+    FrameRelease frame_release = 15;
   }
 }
 
@@ -87,7 +88,7 @@ message Request {
 
 message CreateBrowser {
   string initial_url = 1;
-  X11Target x11 = 2;
+  SurfaceTarget surface = 2;
   string profile_id = 3;
   string profile_data_path = 4;
   string profile_cache_path = 5;
@@ -101,9 +102,14 @@ message Viewport {
   double scale_factor = 5;
 }
 
-message X11Target {
+message SurfaceTarget {
   uint64 parent_window = 1;
   Viewport viewport = 2;
+}
+
+message FrameRelease {
+  uint64 browser_id = 1;
+  uint64 frame_id = 2;
 }
 
 message Navigate {
@@ -205,15 +211,42 @@ message Event {
     CookieSnapshotEntry cookie_snapshot_entry = 17;
     CookieSnapshotComplete cookie_snapshot_complete = 18;
     CookieChanged cookie_changed = 19;
+    AcceleratedFrame accelerated_frame = 20;
+    SurfaceCleared surface_cleared = 21;
   }
 }
 
-message SurfaceReady {
-  X11Surface x11 = 1;
+message SurfaceReady {}
+
+enum SurfaceLayer {
+  SURFACE_LAYER_UNSPECIFIED = 0;
+  SURFACE_LAYER_VIEW = 1;
+  SURFACE_LAYER_POPUP = 2;
 }
 
-message X11Surface {
-  uint64 window = 1;
+message DmabufPlane {
+  uint32 fd_index = 1;
+  uint32 stride = 2;
+  uint64 offset = 3;
+}
+
+message AcceleratedFrame {
+  uint64 frame_id = 1;
+  SurfaceLayer layer = 2;
+  int32 x = 3;
+  int32 y = 4;
+  uint32 width = 5;
+  uint32 height = 6;
+  uint32 drm_format = 7;
+  uint64 modifier = 8;
+  repeated DmabufPlane planes = 9;
+  bool has_acquire_fence = 10;
+  uint32 acquire_fence_fd_index = 11;
+  bool flip_y = 12;
+}
+
+message SurfaceCleared {
+  SurfaceLayer layer = 1;
 }
 
 message LoadingChanged {

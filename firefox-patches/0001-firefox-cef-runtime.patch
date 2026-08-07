@@ -14,10 +14,15 @@ diff --git a/toolkit/library/libxul.symbols b/toolkit/library/libxul.symbols
 index e63e3e7442..902d5ee39f 100644
 --- a/toolkit/library/libxul.symbols
 +++ b/toolkit/library/libxul.symbols
-@@ -1,4 +1,21 @@
+@@ -1,4 +1,26 @@
  XRE_GetBootstrap
 +firefox_cef_gecko_set_callbacks
 +firefox_cef_gecko_configure
++firefox_cef_gecko_resize
++firefox_cef_gecko_invalidate
++firefox_cef_gecko_release_frame
++firefox_cef_gecko_browser_for_widget
++firefox_cef_gecko_emit_accelerated_frame
 +firefox_cef_gecko_navigate
 +firefox_cef_gecko_reload
 +firefox_cef_gecko_focus
@@ -47,3 +52,46 @@ diff --git a/browser/moz.configure b/browser/moz.configure
  imply_option("MOZ_APP_ID", "{ec8030f7-c20a-464f-9b0e-13a3a9e97384}")
  # Include the DevTools client, not just the server (which is the default)
  imply_option("MOZ_DEVTOOLS", "all")
+diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_bindings/RenderCompositor.cpp
+--- a/gfx/webrender_bindings/RenderCompositor.cpp
++++ b/gfx/webrender_bindings/RenderCompositor.cpp
+@@ -16,4 +16,5 @@
+ #include "mozilla/webrender/RenderCompositorOGL.h"
+ #include "mozilla/webrender/RenderCompositorSWGL.h"
+ #include "mozilla/widget/CompositorWidget.h"
++#include "prenv.h"
+ 
+@@ -37,6 +38,9 @@
+ 
+ namespace mozilla::wr {
+ 
++UniquePtr<RenderCompositor> CreateFirefoxCefRenderCompositor(
++    const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError);
++
+ void wr_compositor_add_surface(void* aCompositor, wr::NativeSurfaceId aId,
+                                const wr::CompositorSurfaceTransform* aTransform,
+                                wr::DeviceIntRect aClipRect,
+@@ -200,6 +204,10 @@
+ /* static */
+ UniquePtr<RenderCompositor> RenderCompositor::Create(
+     const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError) {
++  if (PR_GetEnv("FIREFOX_CEF_DIRECT")) {
++    return CreateFirefoxCefRenderCompositor(aWidget, aError);
++  }
++
+   if (aWidget->GetCompositorOptions().UseSoftwareWebRender()) {
+ #ifdef XP_DARWIN
+     // Mac uses NativeLayerCA
+diff --git a/xpfe/appshell/AppWindow.cpp b/xpfe/appshell/AppWindow.cpp
+--- a/xpfe/appshell/AppWindow.cpp
++++ b/xpfe/appshell/AppWindow.cpp
+@@ -184,7 +184,8 @@
+                           DesktopIntSize(aInitialWidth, aInitialHeight));
+ 
+   // Create top level window
+-  if (gfxPlatform::IsHeadless()) {
++  if (gfxPlatform::IsHeadless() ||
++      PR_GetEnv("FIREFOX_CEF_DIRECT")) {
+     mWindow = nsIWidget::CreateHeadlessWidget();
+   } else {
+     mWindow = nsIWidget::CreateTopLevelWindow();

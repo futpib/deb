@@ -14,7 +14,7 @@ index 40570d81b..45733e92a 100644
 +#if CEF_API_ADDED(CEF_EXPERIMENTAL)
 +class CefCookieChangeObserver;
 +#endif
- 
+
  ///
  /// Class used for managing cookies. The methods of this class may be called on
 @@ -124,7 +128,45 @@ class CefCookieManager : public virtual CefBaseRefCounted {
@@ -498,3 +498,146 @@ new file mode 100644
 ++  metadata.brand_full_version_list =
 ++      GetUserAgentBrandFullVersionListInternal(std::nullopt);
 ++#endif
+diff --git a/libcef/browser/osr/video_consumer_osr.h b/libcef/browser/osr/video_consumer_osr.h
+index a0f8a5f72..f57ab47b0 100644
+--- a/libcef/browser/osr/video_consumer_osr.h
++++ b/libcef/browser/osr/video_consumer_osr.h
+@@ -1,6 +1,7 @@
+ #ifndef LIBCEF_BROWSER_OSR_VIDEO_CONSUMER_OSR_H_
+ #define LIBCEF_BROWSER_OSR_VIDEO_CONSUMER_OSR_H_
+ 
++#include <map>
+ #include <optional>
+ 
+ #include "base/functional/callback.h"
+@@ -24,5 +25,6 @@ class CefVideoConsumerOSR : public viz::mojom::FrameSinkVideoConsumer {
+   void SetFrameRate(base::TimeDelta frame_rate);
+   void SizeChanged(const gfx::Size& size_in_pixels);
+   void RequestRefreshFrame(const std::optional<gfx::Rect>& bounds_in_pixels);
++  void ReleaseAcceleratedFrame(uint64_t frame_id);
+ 
+  private:
+@@ -46,6 +48,10 @@ class CefVideoConsumerOSR : public viz::mojom::FrameSinkVideoConsumer {
+ 
+   gfx::Size size_in_pixels_;
+   std::optional<gfx::Rect> bounds_in_pixels_;
++  std::map<
++      uint64_t,
++      mojo::Remote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>>
++      accelerated_frames_;
+ };
+ 
+ #endif  // LIBCEF_BROWSER_OSR_VIDEO_CONSUMER_OSR_H_
+diff --git a/libcef/browser/osr/video_consumer_osr.cc b/libcef/browser/osr/video_consumer_osr.cc
+index c7847c9df..3e26992c5 100644
+--- a/libcef/browser/osr/video_consumer_osr.cc
++++ b/libcef/browser/osr/video_consumer_osr.cc
+@@ -4,13 +4,26 @@
+ 
+ #include "cef/libcef/browser/osr/video_consumer_osr.h"
+ 
++#include <atomic>
++#include <unordered_map>
++
++#include "base/no_destructor.h"
++#include "cef/include/internal/cef_export.h"
+ #include "cef/libcef/browser/osr/render_widget_host_view_osr.h"
++#include "cef/libcef/browser/thread_util.h"
++#include "cef/libcef/common/task_runner_impl.h"
+ #include "media/base/video_frame_metadata.h"
+ #include "media/capture/mojom/video_capture_buffer.mojom.h"
+ #include "media/capture/mojom/video_capture_types.mojom.h"
+ #include "ui/gfx/skbitmap_operations.h"
+ 
+ namespace {
++std::atomic<uint64_t> g_next_accelerated_frame_id{1};
++auto& AcceleratedFrames() {
++  static base::NoDestructor<
++      std::unordered_map<uint64_t, CefVideoConsumerOSR*>> frames;
++  return *frames;
++}
+ 
+ // Helper to always call Done() at the end of OnFrameCaptured().
+ class ScopedVideoFrameDone {
+@@ -43,6 +51,11 @@ CefVideoConsumerOSR::CefVideoConsumerOSR(CefRenderWidgetHostViewOSR* view,
+   SizeChanged(view_->SizeInPixels());
+   SetActive(true);
+ }
+ 
+-CefVideoConsumerOSR::~CefVideoConsumerOSR() = default;
++CefVideoConsumerOSR::~CefVideoConsumerOSR() {
++  for (auto& frame : accelerated_frames_) {
++    AcceleratedFrames().erase(frame.first);
++    frame.second->Done();
++  }
++}
+ 
+@@ -79,4 +92,15 @@ void CefVideoConsumerOSR::RequestRefreshFrame(
+   video_capturer_->RequestRefreshFrame();
+ }
+ 
++void CefVideoConsumerOSR::ReleaseAcceleratedFrame(uint64_t frame_id) {
++  CEF_REQUIRE_UIT();
++  auto frame = accelerated_frames_.find(frame_id);
++  if (frame == accelerated_frames_.end()) {
++    return;
++  }
++  frame->second->Done();
++  accelerated_frames_.erase(frame);
++  AcceleratedFrames().erase(frame_id);
++}
++
+ // Frame size values are as follows:
+@@ -94,5 +118,7 @@ void CefVideoConsumerOSR::OnFrameCaptured(
+     mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
+         callbacks) {
++#if !BUILDFLAG(IS_LINUX)
+   ScopedVideoFrameDone scoped_done(std::move(callbacks));
++#endif
+ 
+   media::VideoFrameMetadata metadata = info->metadata;
+@@ -188,9 +214,17 @@ void CefVideoConsumerOSR::OnFrameCaptured(
+     auto& native_pixmap = gmb_handle.native_pixmap_handle();
+     CHECK(native_pixmap.planes.size() <= kAcceleratedPaintMaxPlanes);
+ 
++    const uint64_t frame_id =
++        g_next_accelerated_frame_id.fetch_add(1, std::memory_order_relaxed);
++    extra.has_capture_counter = true;
++    extra.capture_counter = frame_id;
+     cef_accelerated_paint_info_t paint_info = {
+         sizeof(cef_accelerated_paint_info_t)};
+     paint_info.extra = extra;
++    mojo::Remote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
++        frame_callbacks(std::move(callbacks));
++    accelerated_frames_.emplace(frame_id, std::move(frame_callbacks));
++    AcceleratedFrames().emplace(frame_id, this);
+     paint_info.plane_count = native_pixmap.planes.size();
+     paint_info.modifier = native_pixmap.modifier;
+     paint_info.format = pixel_format;
+@@ -209,5 +244,8 @@ void CefVideoConsumerOSR::OnFrameCaptured(
+     return;
+   }
+ 
++#if BUILDFLAG(IS_LINUX)
++  ScopedVideoFrameDone scoped_done(std::move(callbacks));
++#endif
+   // If it is CPU bitmap OSR.
+   if (info->pixel_format != media::PIXEL_FORMAT_ARGB) {
+@@ -247,3 +285,17 @@ void CefVideoConsumerOSR::OnFrameCaptured(
+ 
+   view_->OnPaint(damage_rect, info->coded_size, pixels);
+ }
++
++extern "C" CEF_EXPORT void cef_deb_release_accelerated_frame(
++    uint64_t frame_id) {
++  CEF_POST_TASK(
++      CEF_UIT,
++      base::BindOnce(
++          [](uint64_t id) {
++            auto frame = AcceleratedFrames().find(id);
++            if (frame != AcceleratedFrames().end()) {
++              frame->second->ReleaseAcceleratedFrame(id);
++            }
++          },
++          frame_id));
++}

@@ -1,9 +1,12 @@
 #pragma once
 
-#include <QPointer>
 #include <QQuickItem>
-#include <QWindow>
+#include <QString>
 
+#include <memory>
+
+class DmabufFrame;
+class BrowserSurfacePrivate;
 class QHoverEvent;
 class QInputMethodEvent;
 class QKeyEvent;
@@ -12,18 +15,25 @@ class QWheelEvent;
 
 class BrowserSurface : public QQuickItem {
     Q_OBJECT
-    Q_PROPERTY(QWindow *sourceWindow READ sourceWindow WRITE setSourceWindow NOTIFY sourceWindowChanged)
+    Q_PROPERTY(QString surfaceId READ surfaceId WRITE setSurfaceId NOTIFY surfaceIdChanged)
+    Q_PROPERTY(QString nativeParentWindow READ nativeParentWindow NOTIFY nativeParentWindowChanged)
 
 public:
     explicit BrowserSurface(QQuickItem *parent = nullptr);
     ~BrowserSurface() override;
 
-    QWindow *sourceWindow() const;
-    void setSourceWindow(QWindow *window);
-    void damageReceived();
+    QString surfaceId() const;
+    void setSurfaceId(const QString &surfaceId);
+    QString nativeParentWindow() const;
+    void bindBrowser(unsigned long long browserId,
+                     unsigned long long surfaceGeneration,
+                     const std::shared_ptr<DmabufFrame> &frame);
+    void submitFrame(const std::shared_ptr<DmabufFrame> &frame);
+    void clearLayer(int layer);
 
 signals:
-    void sourceWindowChanged();
+    void surfaceIdChanged();
+    void nativeParentWindowChanged();
     void pointerMoved(int x, int y, int modifiers, bool leaving);
     void pointerButton(int x, int y, int modifiers, int button, bool mouseUp,
                        int clickCount);
@@ -49,8 +59,6 @@ protected:
     void inputMethodEvent(QInputMethodEvent *event) override;
 
 private:
-    void redirectSource();
-    void releaseSource();
     void sendMotion(const QPointF &position, Qt::MouseButtons buttons,
                     Qt::KeyboardModifiers modifiers, bool leaving);
     void sendButton(const QPointF &position, Qt::MouseButton button,
@@ -58,10 +66,20 @@ private:
                     Qt::KeyboardModifiers modifiers, int clickCount);
     void sendKey(QKeyEvent *event, bool keyUp);
 
-    QPointer<QWindow> sourceWindow_;
-    unsigned long sourceId_ = 0;
-    unsigned long damage_ = 0;
-    quint64 generation_ = 0;
-    bool redirected_ = false;
+    std::unique_ptr<BrowserSurfacePrivate> d_;
     int clickCount_ = 1;
 };
+
+extern "C" void register_browser_surface();
+extern "C" void deb_browser_surface_submit(
+    const char *surfaceId, unsigned long long browserId,
+    unsigned long long leaseId, int layer, int x, int y, unsigned int width,
+    unsigned int height, unsigned int drmFormat, unsigned long long modifier,
+    int flipY, unsigned int planeCount, const int *fds,
+    const unsigned int *strides, const unsigned long long *offsets,
+    int acquireFenceFd);
+extern "C" void deb_browser_surface_clear(const char *surfaceId, int layer);
+extern "C" void deb_browser_surface_bind(
+    const char *surfaceId, unsigned long long browserId,
+    unsigned long long surfaceGeneration);
+extern "C" void deb_browser_surface_forget(unsigned long long browserId);

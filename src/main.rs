@@ -13,7 +13,7 @@ use tab_controller::{TabCommand, TabController, TabEngine};
 const DEFAULT_URL: &str = "deb://new-tab/";
 
 unsafe extern "C" {
-    fn register_native_window_factory();
+    fn register_browser_surface();
 }
 
 struct Backend {
@@ -149,6 +149,8 @@ impl Backend {
         &mut self,
         window_id: String,
         host_id: String,
+        x: i32,
+        y: i32,
         width: i32,
         height: i32,
         label: String,
@@ -164,7 +166,7 @@ impl Backend {
         if host_id == 0 {
             return;
         }
-        let Some(bounds) = NativeRect::new(0, 0, width, height) else {
+        let Some(bounds) = NativeRect::new(x, y, width, height) else {
             return;
         };
         if self.controller.is_none() {
@@ -571,11 +573,11 @@ fn main() {
     }
     if std::env::var_os("QT_XCB_GL_INTEGRATION").is_none() {
         unsafe {
-            std::env::set_var("QT_XCB_GL_INTEGRATION", "xcb_glx");
+            std::env::set_var("QT_XCB_GL_INTEGRATION", "xcb_egl");
         }
     }
     unsafe {
-        register_native_window_factory();
+        register_browser_surface();
     }
 
     QApp::new()

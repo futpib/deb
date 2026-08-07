@@ -17,12 +17,17 @@ case "${1:-}" in
     ;;
 esac
 
-for command in timeout xvfb-run rg; do
+for command in timeout rg; do
   if ! command -v "$command" >/dev/null; then
     echo "Required smoke-test command is unavailable: $command" >&2
     exit 1
   fi
 done
+
+if [[ -z "${DISPLAY:-}" ]]; then
+  echo "The DMA-BUF smoke test requires a real X11 DISPLAY" >&2
+  exit 1
+fi
 
 if ((build_rust)); then
   "$script_directory/stage-firefox-cef-rust.sh"
@@ -49,14 +54,11 @@ log_file="$test_root/smoke.log"
 SECONDS=0
 set +e
 timeout --signal=TERM 45s \
-  xvfb-run -a -s "-screen 0 1440x900x24" \
   env \
   XDG_CONFIG_HOME="$test_root/config" \
   XDG_DATA_HOME="$test_root/data" \
   XDG_CACHE_HOME="$test_root/cache" \
-  LIBGL_ALWAYS_SOFTWARE=1 \
-  DEB_URL=about:blank \
-  DEB_SMOKE_NAVIGATE_URL=deb://new-tab/#deb-smoke \
+  DEB_URL=deb://new-tab/#deb-smoke \
   DEB_AUTOMATED_SMOKE_TEST=1 \
   "$project_root/target/debug/deb" >"$log_file" 2>&1
 status=$?

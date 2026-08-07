@@ -21,10 +21,6 @@ ApplicationWindow {
         id: profileManager
     }
 
-    NativeWindowFactory {
-        id: nativeWindows
-    }
-
     ListModel {
         id: profilesModel
     }
@@ -270,7 +266,6 @@ ApplicationWindow {
         property string activeTabId: ""
         property string currentUrl: ""
         property string currentStatus: "Waiting for native host…"
-        property var browserHost: nativeWindows.createHost()
 
         ListModel {
             id: tabsModel
@@ -339,9 +334,12 @@ ApplicationWindow {
             if (!registered && !viewVisible) {
                 return
             }
+            const globalOrigin = nativeSurface.mapToGlobal(1, 1)
             backendObject.sync_geometry(
                 viewId,
-                nativeWindows.windowId(browserHost),
+                browserSurface.nativeParentWindow,
+                Math.round(globalOrigin.x),
+                Math.round(globalOrigin.y),
                 Math.round(nativeSurface.width),
                 Math.round(nativeSurface.height),
                 windowLabel,
@@ -508,17 +506,11 @@ ApplicationWindow {
                     opacity: 0.7
                 }
 
-                WindowContainer {
-                    anchors.fill: parent
-                    anchors.margins: 1
-                    window: browserView.browserHost
-                    visible: window !== null
-                }
-
                 BrowserSurface {
+                    id: browserSurface
                     anchors.fill: parent
                     anchors.margins: 1
-                    sourceWindow: browserView.browserHost
+                    surfaceId: browserView.viewId
                     focus: true
 
                     onPointerMoved: function(x, y, modifiers, leaving) {

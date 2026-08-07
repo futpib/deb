@@ -72,6 +72,14 @@ if ((needs_firefox_build)); then
     exit 1
   fi
   if ! git apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    if ! git apply --check "$patch_file" >/dev/null 2>&1; then
+      git restore -- \
+        browser/components/moz.build \
+        browser/moz.configure \
+        gfx/webrender_bindings/RenderCompositor.cpp \
+        toolkit/library/libxul.symbols \
+        xpfe/appshell/AppWindow.cpp
+    fi
     git apply "$patch_file"
   fi
   popd >/dev/null

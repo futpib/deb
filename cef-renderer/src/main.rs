@@ -13,7 +13,7 @@ use std::{
     os::fd::RawFd,
     path::PathBuf,
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::sleep,
@@ -205,6 +205,44 @@ struct BrowserConfig {
     profile_cache_path: PathBuf,
 }
 
+const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    u32::from_le_bytes([a, b, c, d])
+}
+
+const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
+const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+
+type ReleaseAcceleratedFrame = unsafe extern "C" fn(u64);
+type TakeAcceleratedFrameFence = unsafe extern "C" fn(u64) -> i32;
+
+fn release_accelerated_frame(frame_id: u64) {
+    static RELEASE: OnceLock<Option<ReleaseAcceleratedFrame>> = OnceLock::new();
+    let release = RELEASE.get_or_init(|| unsafe {
+        let symbol = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"cef_deb_release_accelerated_frame".as_ptr(),
+        );
+        (!symbol.is_null()).then(|| std::mem::transmute(symbol))
+    });
+    if let Some(release) = release {
+        unsafe { release(frame_id) };
+    } else {
+        eprintln!("cef-renderer: patched accelerated-frame release export is missing");
+    }
+}
+
+fn take_accelerated_frame_fence(frame_id: u64) -> i32 {
+    static TAKE: OnceLock<Option<TakeAcceleratedFrameFence>> = OnceLock::new();
+    let take = TAKE.get_or_init(|| unsafe {
+        let symbol = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"cef_deb_take_accelerated_frame_fence".as_ptr(),
+        );
+        (!symbol.is_null()).then(|| std::mem::transmute(symbol))
+    });
+    take.map_or(-1, |take| unsafe { take(frame_id) })
+}
+
 #[derive(Clone)]
 struct ProtocolEmitter {
     transport: Arc<Mutex<Transport>>,
@@ -237,6 +275,18 @@ impl ProtocolEmitter {
         Ok(())
     }
 
+    fn send_with_fds(
+        &self,
+        packet: wire::Packet,
+        file_descriptors: &[RawFd],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.transport
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .send_with_fds(&packet, file_descriptors)?;
+        Ok(())
+    }
+
     fn success(&self, request_id: u64) {
         if let Err(error) = self.send(response_packet(
             request_id,
@@ -261,6 +311,16 @@ impl ProtocolEmitter {
     }
 
     fn event(&self, value: wire::event::Value) {
+        if let Err(error) = self.event_with_fds(value, &[]) {
+            eprintln!("cef-renderer: protocol event failed: {error}");
+        }
+    }
+
+    fn event_with_fds(
+        &self,
+        value: wire::event::Value,
+        file_descriptors: &[RawFd],
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let packet = wire::Packet {
             request_id: 0,
             body: Some(wire::packet::Body::Event(wire::Event {
@@ -269,9 +329,7 @@ impl ProtocolEmitter {
                 value: Some(value),
             })),
         };
-        if let Err(error) = self.send(packet) {
-            eprintln!("cef-renderer: protocol event failed: {error}");
-        }
+        self.send_with_fds(packet, file_descriptors)
     }
 }
 
@@ -299,13 +357,14 @@ fn error_packet(request_id: u64, code: &str, message: impl Into<String>) -> wire
 #[derive(Default)]
 struct BrowserRegistry {
     browsers: Mutex<HashMap<u64, Browser>>,
+    bounds: Mutex<HashMap<u64, Arc<Mutex<Bounds>>>>,
     pending: Mutex<HashSet<u64>>,
     shutting_down: Mutex<bool>,
     changed: Condvar,
 }
 
 impl BrowserRegistry {
-    fn reserve(&self, browser_id: u64) -> Result<(), String> {
+    fn reserve(&self, browser_id: u64, bounds: Arc<Mutex<Bounds>>) -> Result<(), String> {
         if browser_id == 0 {
             return Err("browser ID must be nonzero".to_owned());
         }
@@ -322,11 +381,19 @@ impl BrowserRegistry {
         {
             return Err(format!("browser {browser_id} already exists"));
         }
+        self.bounds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(browser_id, bounds);
         Ok(())
     }
 
     fn cancel_reservation(&self, browser_id: u64) {
         self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&browser_id);
+        self.bounds
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&browser_id);
@@ -352,8 +419,20 @@ impl BrowserRegistry {
             .cloned()
     }
 
+    fn bounds(&self, browser_id: u64) -> Option<Arc<Mutex<Bounds>>> {
+        self.bounds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&browser_id)
+            .cloned()
+    }
+
     fn remove(&self, browser_id: u64) {
         self.browsers
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&browser_id);
+        self.bounds
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&browser_id);
@@ -407,23 +486,14 @@ wrap_life_span_handler! {
             let Some(host) = browser.host() else {
                 return;
             };
-            let native_window = host.window_handle();
-            if native_window == 0 {
-                return;
-            }
             host.set_focus(1);
             if let Err(error) = self.cookie_bridge.ensure_observer() {
                 eprintln!("cef-renderer: cookie observer setup failed: {error}");
             }
             self.registry.created(self.browser_id, browser.clone());
-            self.emitter.event(wire::event::Value::SurfaceReady(
-                wire::SurfaceReady {
-                    x11: Some(wire::X11Surface {
-                        window: native_window,
-                    }),
-                },
-            ));
-            eprintln!("cef-renderer: native browser ready");
+            self.emitter
+                .event(wire::event::Value::SurfaceReady(wire::SurfaceReady {}));
+            eprintln!("cef-renderer: windowless browser ready");
         }
 
         fn on_before_close(&self, _browser: Option<&mut Browser>) {
@@ -549,12 +619,173 @@ wrap_request_handler! {
     }
 }
 
+wrap_render_handler! {
+    struct BrowserRenderHandler {
+        bounds: Arc<Mutex<Bounds>>,
+        popup_rect: Arc<Mutex<Rect>>,
+        emitter: ProtocolEmitter,
+        software_warning_emitted: Arc<AtomicBool>,
+        flip_y: bool,
+    }
+
+    impl RenderHandler {
+        fn view_rect(&self, _browser: Option<&mut Browser>, rect: Option<&mut Rect>) {
+            let Some(rect) = rect else {
+                return;
+            };
+            let bounds = *self.bounds.lock().unwrap_or_else(|error| error.into_inner());
+            *rect = Rect {
+                x: 0,
+                y: 0,
+                width: bounds.width as i32,
+                height: bounds.height as i32,
+            };
+        }
+
+        fn screen_point(
+            &self,
+            _browser: Option<&mut Browser>,
+            view_x: i32,
+            view_y: i32,
+            screen_x: Option<&mut i32>,
+            screen_y: Option<&mut i32>,
+        ) -> i32 {
+            let (Some(screen_x), Some(screen_y)) = (screen_x, screen_y) else {
+                return 0;
+            };
+            let bounds = *self.bounds.lock().unwrap_or_else(|error| error.into_inner());
+            *screen_x = bounds.x + view_x;
+            *screen_y = bounds.y + view_y;
+            1
+        }
+
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: i32) {
+            if show == 0 {
+                self.emitter.event(wire::event::Value::SurfaceCleared(
+                    wire::SurfaceCleared {
+                        layer: wire::SurfaceLayer::Popup as i32,
+                    },
+                ));
+            }
+        }
+
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            if let Some(rect) = rect {
+                *self
+                    .popup_rect
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = rect.clone();
+            }
+        }
+
+        fn on_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            _type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            _buffer: *const u8,
+            _width: i32,
+            _height: i32,
+        ) {
+            if !self.software_warning_emitted.swap(true, Ordering::Relaxed) {
+                eprintln!("cef-renderer: rejected software paint; DMA-BUF rendering is required");
+            }
+        }
+
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            let Some(info) = info else {
+                return;
+            };
+            let frame_id = info.extra.capture_counter;
+            let plane_count = usize::try_from(info.plane_count).unwrap_or_default();
+            let width = info.extra.coded_size.width;
+            let height = info.extra.coded_size.height;
+            if frame_id == 0 || !(1..=info.planes.len()).contains(&plane_count) || width <= 0 || height <= 0 {
+                if frame_id != 0 {
+                    release_accelerated_frame(frame_id);
+                }
+                eprintln!("cef-renderer: rejected malformed accelerated paint metadata");
+                return;
+            }
+            let drm_format = if info.format == ColorType::BGRA_8888 {
+                DRM_FORMAT_ARGB8888
+            } else if info.format == ColorType::RGBA_8888 {
+                DRM_FORMAT_ABGR8888
+            } else {
+                release_accelerated_frame(frame_id);
+                eprintln!("cef-renderer: rejected unsupported accelerated paint format");
+                return;
+            };
+            let (layer, x, y) = if type_ == PaintElementType::POPUP {
+                let rect = self
+                    .popup_rect
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                (wire::SurfaceLayer::Popup, rect.x, rect.y)
+            } else {
+                (wire::SurfaceLayer::View, 0, 0)
+            };
+            let planes = info.planes[..plane_count]
+                .iter()
+                .enumerate()
+                .map(|(index, plane)| wire::DmabufPlane {
+                    fd_index: index as u32,
+                    stride: plane.stride,
+                    offset: plane.offset,
+                })
+                .collect();
+            let mut file_descriptors: Vec<_> = info.planes[..plane_count]
+                .iter()
+                .map(|plane| plane.fd)
+                .collect();
+            let acquire_fence = take_accelerated_frame_fence(frame_id);
+            let acquire_fence_fd_index = file_descriptors.len() as u32;
+            if acquire_fence >= 0 {
+                file_descriptors.push(acquire_fence);
+            }
+            let frame = wire::AcceleratedFrame {
+                frame_id,
+                layer: layer as i32,
+                x,
+                y,
+                width: width as u32,
+                height: height as u32,
+                drm_format,
+                modifier: info.modifier,
+                planes,
+                has_acquire_fence: acquire_fence >= 0,
+                acquire_fence_fd_index,
+                flip_y: self.flip_y,
+            };
+            let delivery = self.emitter.event_with_fds(
+                wire::event::Value::AcceleratedFrame(frame),
+                &file_descriptors,
+            );
+            if acquire_fence >= 0 {
+                unsafe { libc::close(acquire_fence) };
+            }
+            if let Err(error) = delivery {
+                eprintln!("cef-renderer: accelerated frame delivery failed: {error}");
+                release_accelerated_frame(frame_id);
+            }
+        }
+    }
+}
+
 wrap_client! {
     struct BrowserClient {
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
         display_handler: DisplayHandler,
         request_handler: RequestHandler,
+        render_handler: RenderHandler,
     }
 
     impl Client {
@@ -572,6 +803,10 @@ wrap_client! {
 
         fn request_handler(&self) -> Option<RequestHandler> {
             Some(self.request_handler.clone())
+        }
+
+        fn render_handler(&self) -> Option<RenderHandler> {
+            Some(self.render_handler.clone())
         }
     }
 }
@@ -737,6 +972,7 @@ wrap_app! {
 wrap_task! {
     struct BrowserCommandTask {
         browser: Browser,
+        bounds: Arc<Mutex<Bounds>>,
         command: ControlCommand,
         request_id: u64,
         emitter: ProtocolEmitter,
@@ -762,7 +998,9 @@ wrap_task! {
                     }
                     Ok(())
                 }
-                ControlCommand::Resize(_bounds) => resize_browser(&self.browser),
+                ControlCommand::Resize(bounds) => {
+                    resize_browser(&self.browser, &self.bounds, *bounds)
+                }
                 ControlCommand::Focus(focused) => {
                     if let Some(host) = self.browser.host() {
                         host.set_focus(i32::from(*focused));
@@ -794,6 +1032,7 @@ wrap_task! {
                         host.was_hidden(i32::from(!visible));
                         if *visible {
                             host.set_focus(1);
+                            host.invalidate(PaintElementType::VIEW);
                         }
                         Ok(())
                     } else {
@@ -913,9 +1152,11 @@ fn create_browser(
     registry: Arc<BrowserRegistry>,
     emitter: &ProtocolEmitter,
     cookie_bridge: CookieBridge,
+    flip_y: bool,
 ) -> Result<(), Box<dyn Error>> {
+    let bounds = Arc::new(Mutex::new(browser_config.bounds));
     registry
-        .reserve(browser_config.browser_id)
+        .reserve(browser_config.browser_id, bounds.clone())
         .map_err(|error| -> Box<dyn Error> { error.into() })?;
     let browser_emitter = emitter.for_browser(browser_config.browser_id);
     let life_span_handler = BrowserLifeSpanHandler::new(
@@ -926,22 +1167,25 @@ fn create_browser(
     );
     let load_handler = BrowserLoadHandler::new(browser_emitter.clone());
     let display_handler = BrowserDisplayHandler::new(browser_emitter.clone());
-    let request_handler = BrowserRequestHandler::new(browser_emitter);
+    let request_handler = BrowserRequestHandler::new(browser_emitter.clone());
+    let render_handler = BrowserRenderHandler::new(
+        bounds,
+        Arc::new(Mutex::new(Rect::default())),
+        browser_emitter,
+        Arc::new(AtomicBool::new(false)),
+        flip_y,
+    );
     let mut client = BrowserClient::new(
         life_span_handler,
         load_handler,
         display_handler,
         request_handler,
+        render_handler,
     );
-    let cef_bounds = Rect {
-        x: browser_config.bounds.x,
-        y: browser_config.bounds.y,
-        width: browser_config.bounds.width as i32,
-        height: browser_config.bounds.height as i32,
-    };
     let window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
-        ..WindowInfo::default().set_as_child(browser_config.parent as _, &cef_bounds)
+        shared_texture_enabled: 1,
+        ..WindowInfo::default().set_as_windowless(browser_config.parent as _)
     };
     let browser_settings = BrowserSettings {
         background_color: 0xffff_ffff,
@@ -963,12 +1207,16 @@ fn create_browser(
     Ok(())
 }
 
-fn resize_browser(browser: &Browser) -> Result<(), Box<dyn Error>> {
+fn resize_browser(
+    browser: &Browser,
+    shared_bounds: &Arc<Mutex<Bounds>>,
+    bounds: Bounds,
+) -> Result<(), Box<dyn Error>> {
     let host = browser.host().ok_or("CEF browser has no host")?;
-    if host.window_handle() == 0 {
-        return Err("CEF browser has no native window yet".into());
-    }
-    host.notify_move_or_resize_started();
+    *shared_bounds
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = bounds;
+    host.was_resized();
     Ok(())
 }
 
@@ -979,7 +1227,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::Resize,
         Capability::Focus,
         Capability::LoadingEvents,
-        Capability::NativeX11Surface,
+        Capability::AcceleratedDmabufSurface,
         Capability::CookieSync,
         Capability::MultipleBrowsers,
         Capability::Visibility,
@@ -1061,9 +1309,11 @@ fn browser_config_from_request(
         Some(wire::request::Operation::CreateBrowser(create)) => create,
         _ => return Err("request is not CreateBrowser".into()),
     };
-    let x11 = create.x11.ok_or("CreateBrowser X11 target is required")?;
-    if x11.parent_window == 0 {
-        return Err("X11 parent window must be nonzero".into());
+    let surface = create
+        .surface
+        .ok_or("CreateBrowser surface target is required")?;
+    if surface.parent_window == 0 {
+        return Err("surface parent window must be nonzero".into());
     }
     if !is_valid_profile_id(&create.profile_id) {
         return Err(format!("invalid profile ID {:?}", create.profile_id).into());
@@ -1085,8 +1335,8 @@ fn browser_config_from_request(
         } else {
             create.initial_url
         },
-        parent: x11.parent_window,
-        bounds: bounds_from_viewport(x11.viewport)?,
+        parent: surface.parent_window,
+        bounds: bounds_from_viewport(surface.viewport)?,
         profile_id: create.profile_id,
         profile_data_path,
         profile_cache_path,
@@ -1149,6 +1399,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
     let settings = Settings {
         no_sandbox: 1,
         multi_threaded_message_loop: i32::from(!single_threaded),
+        windowless_rendering_enabled: 1,
         cache_path: CefString::from(browser_config.profile_data_path.to_string_lossy().as_ref()),
         root_cache_path: CefString::from(
             browser_config.profile_data_path.to_string_lossy().as_ref(),
@@ -1213,6 +1464,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
         registry.clone(),
         &emitter,
         cookie_bridge.clone(),
+        single_threaded,
     ) {
         emitter.error(
             browser_config.request_id,
@@ -1242,6 +1494,18 @@ fn run() -> Result<i32, Box<dyn Error>> {
             let request_id = received.request_id;
             let request = match received.body {
                 Some(wire::packet::Body::Request(request)) => request,
+                Some(wire::packet::Body::FrameRelease(release)) => {
+                    if request_id != 0 || release.browser_id == 0 || release.frame_id == 0 {
+                        command_emitter.error(
+                            request_id,
+                            "INVALID_FRAME_RELEASE",
+                            "FrameRelease requires request ID zero and nonzero browser/frame IDs",
+                        );
+                    } else {
+                        release_accelerated_frame(release.frame_id);
+                    }
+                    continue;
+                }
                 _ => {
                     command_emitter.error(
                         request_id,
@@ -1286,6 +1550,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     command_registry.clone(),
                     &command_emitter,
                     command_cookie_bridge.clone(),
+                    single_threaded,
                 ) {
                     Ok(()) => command_emitter.success(request_id),
                     Err(error) => {
@@ -1325,6 +1590,14 @@ fn run() -> Result<i32, Box<dyn Error>> {
                 );
                 continue;
             };
+            let Some(command_bounds) = command_registry.bounds(browser_id) else {
+                command_emitter.error(
+                    request_id,
+                    "UNKNOWN_BROWSER",
+                    format!("browser {browser_id} has no surface state"),
+                );
+                continue;
+            };
             let command = match control_command(request) {
                 Ok(command) => command,
                 Err(error) => {
@@ -1334,6 +1607,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
             };
             let mut task = BrowserCommandTask::new(
                 command_browser,
+                command_bounds,
                 command,
                 request_id,
                 command_emitter.for_browser(browser_id),

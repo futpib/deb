@@ -167,6 +167,7 @@ version = "0.1.0"
 dependencies = [
  "cef",
  "cef-cookie",
+ "libc",
  "shell-protocol",
 ]
 
@@ -365,6 +366,7 @@ name = "deb"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "libc",
  "pkg-config",
  "qtbridge",
  "rusqlite",
@@ -512,7 +514,6 @@ dependencies = [
  "cef-cookie",
  "cef-dll-sys",
  "libc",
- "x11rb",
 ]
 
 [[package]]

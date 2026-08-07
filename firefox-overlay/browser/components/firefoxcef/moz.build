@@ -17,6 +17,17 @@ XPIDL_SOURCES += ["nsIFirefoxCefBridge.idl"]
 
 EXPORTS.mozilla += ["FirefoxCefBridge.h"]
 
-SOURCES += ["FirefoxCefBridge.cpp"]
+SOURCES += [
+    "FirefoxCefBridge.cpp",
+    "FirefoxCefRenderCompositor.cpp",
+]
+
+LOCAL_INCLUDES += [
+    "!/ipc/ipdl/_ipdlheaders",
+    "/gfx/gl",
+    "/gfx/webrender_bindings",
+    "/ipc/chromium/src",
+    "/widget/gtk",
+]
 
 CXXFLAGS += CONFIG["MOZ_GTK3_CFLAGS"]

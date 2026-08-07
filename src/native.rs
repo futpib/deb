@@ -6,20 +6,147 @@ use shell_protocol::{
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
+    ffi::CString,
+    os::fd::{IntoRawFd, OwnedFd},
     path::{Path, PathBuf},
     process::{Child, Command},
-    sync::mpsc::{self, RecvTimeoutError, TryRecvError},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, TryRecvError},
+    },
     thread::{JoinHandle, sleep},
     time::{Duration, Instant},
 };
 use x11rb::{
     connection::Connection,
-    protocol::xproto::{
-        ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, EventMask, ImageFormat,
-        StackMode, Window,
-    },
+    protocol::xproto::{ConfigureWindowAux, ConnectionExt, ImageFormat, StackMode, Window},
     rust_connection::RustConnection,
 };
+
+unsafe extern "C" {
+    fn deb_browser_surface_submit(
+        surface_id: *const libc::c_char,
+        browser_id: u64,
+        lease_id: u64,
+        layer: i32,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        drm_format: u32,
+        modifier: u64,
+        flip_y: i32,
+        plane_count: u32,
+        fds: *const i32,
+        strides: *const u32,
+        offsets: *const u64,
+        acquire_fence_fd: i32,
+    );
+    fn deb_browser_surface_clear(surface_id: *const libc::c_char, layer: i32);
+    fn deb_browser_surface_bind(surface_id: *const libc::c_char, browser_id: u64, generation: u64);
+    fn deb_browser_surface_forget(browser_id: u64);
+}
+
+struct FrameReleaseTarget {
+    sender: mpsc::Sender<FrameLeaseEvent>,
+    browser_id: u64,
+    frame_id: u64,
+    layer: wire::SurfaceLayer,
+    surface_generation: u64,
+}
+
+enum FrameLeaseEvent {
+    Presented(u64, u64),
+    Released(u64, u64),
+}
+
+fn frame_leases() -> &'static Mutex<HashMap<u64, FrameReleaseTarget>> {
+    static LEASES: OnceLock<Mutex<HashMap<u64, FrameReleaseTarget>>> = OnceLock::new();
+    LEASES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_frame_lease(
+    sender: &mpsc::Sender<FrameLeaseEvent>,
+    browser_id: u64,
+    frame_id: u64,
+    layer: wire::SurfaceLayer,
+    surface_generation: u64,
+) -> u64 {
+    static NEXT_LEASE: AtomicU64 = AtomicU64::new(1);
+    let lease_id = NEXT_LEASE.fetch_add(1, Ordering::Relaxed);
+    frame_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(
+            lease_id,
+            FrameReleaseTarget {
+                sender: sender.clone(),
+                browser_id,
+                frame_id,
+                layer,
+                surface_generation,
+            },
+        );
+    lease_id
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn deb_release_dmabuf_lease(lease_id: u64) {
+    let target = frame_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&lease_id);
+    if let Some(target) = target {
+        let _ = target.sender.send(FrameLeaseEvent::Released(
+            target.browser_id,
+            target.frame_id,
+        ));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn deb_present_dmabuf_lease(lease_id: u64) {
+    let target = frame_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&lease_id)
+        .and_then(|target| {
+            (target.layer == wire::SurfaceLayer::View).then(|| {
+                (
+                    target.sender.clone(),
+                    target.browser_id,
+                    target.surface_generation,
+                )
+            })
+        });
+    if let Some((sender, browser_id, surface_generation)) = target {
+        let _ = sender.send(FrameLeaseEvent::Presented(browser_id, surface_generation));
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn deb_rebind_dmabuf_lease(lease_id: u64, surface_generation: u64) {
+    let mut leases = frame_leases()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(target) = leases.get_mut(&lease_id) {
+        target.surface_generation = surface_generation;
+    }
+}
+
+fn bind_qt_surface(surface_id: &str, browser_id: u64, generation: u64) {
+    let surface_id = CString::new(surface_id).expect("internal surface ID contains no NUL bytes");
+    unsafe {
+        deb_browser_surface_bind(surface_id.as_ptr(), browser_id, generation);
+    }
+}
+
+fn forget_qt_browser(browser_id: u64) {
+    unsafe {
+        deb_browser_surface_forget(browser_id);
+    }
+}
 
 pub(crate) type NativeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -111,8 +238,11 @@ impl CefBackend {
 pub(crate) struct CefInstance {
     child: Child,
     transport: Transport,
-    incoming: mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
-    window: Window,
+    incoming: mpsc::Receiver<Result<shell_protocol::ReceivedPacket, ProtocolError>>,
+    surfaces: HashMap<u64, String>,
+    surface_generations: HashMap<u64, u64>,
+    lease_sender: mpsc::Sender<FrameLeaseEvent>,
+    lease_events: mpsc::Receiver<FrameLeaseEvent>,
     browser_id: u64,
     next_request_id: u64,
     pending_requests: HashMap<u64, (u64, &'static str)>,
@@ -121,6 +251,8 @@ pub(crate) struct CefInstance {
 }
 
 impl CefInstance {
+    const MAX_PACKETS_PER_POLL: usize = 64;
+
     fn send_browser_request(
         &mut self,
         browser_id: u64,
@@ -155,6 +287,7 @@ impl CefInstance {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_browser(
         &mut self,
         browser_id: u64,
@@ -163,12 +296,17 @@ impl CefInstance {
         url: &str,
         profile_id: &str,
         directories: &EngineDirectories,
+        surface_id: String,
     ) -> NativeResult<()> {
-        self.send_browser_request(
+        self.surfaces.insert(browser_id, surface_id.clone());
+        let generation = self.surface_generations.entry(browser_id).or_default();
+        *generation += 1;
+        bind_qt_surface(&surface_id, browser_id, *generation);
+        if let Err(error) = self.send_browser_request(
             browser_id,
             wire::request::Operation::CreateBrowser(wire::CreateBrowser {
                 initial_url: url.to_owned(),
-                x11: Some(wire::X11Target {
+                surface: Some(wire::SurfaceTarget {
                     parent_window: u64::from(parent),
                     viewport: Some(bounds.viewport()),
                 }),
@@ -177,7 +315,13 @@ impl CefInstance {
                 profile_cache_path: protocol_path(&directories.cache)?,
             }),
             "browser creation",
-        )
+        ) {
+            self.surfaces.remove(&browser_id);
+            self.surface_generations.remove(&browser_id);
+            forget_qt_browser(browser_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn navigate_browser(&mut self, browser_id: u64, url: &str) -> NativeResult<()> {
@@ -304,6 +448,9 @@ impl CefInstance {
     }
 
     pub(crate) fn close_browser(&mut self, browser_id: u64, force: bool) -> NativeResult<()> {
+        self.surfaces.remove(&browser_id);
+        self.surface_generations.remove(&browser_id);
+        forget_qt_browser(browser_id);
         self.send_browser_request(
             browser_id,
             wire::request::Operation::Close(wire::Close { force }),
@@ -347,16 +494,63 @@ impl CefInstance {
         )
     }
 
+    pub(crate) fn bind_browser_surface(&mut self, browser_id: u64, surface_id: Option<String>) {
+        match surface_id {
+            Some(surface_id) => {
+                if self.surfaces.get(&browser_id) != Some(&surface_id) {
+                    self.surfaces.insert(browser_id, surface_id.clone());
+                    let generation = self.surface_generations.entry(browser_id).or_default();
+                    *generation += 1;
+                    bind_qt_surface(&surface_id, browser_id, *generation);
+                }
+            }
+            None => {
+                self.surfaces.remove(&browser_id);
+            }
+        }
+    }
+
     pub(crate) fn exited(&mut self) -> NativeResult<Option<std::process::ExitStatus>> {
         Ok(self.child.try_wait()?)
     }
 
     pub(crate) fn drain_routed_notices(&mut self) -> Vec<RoutedNotice> {
         let mut notices = Vec::new();
+        while let Ok(event) = self.lease_events.try_recv() {
+            match event {
+                FrameLeaseEvent::Presented(browser_id, surface_generation)
+                    if self.surface_generations.get(&browser_id) == Some(&surface_generation) =>
+                {
+                    notices.push(RoutedNotice {
+                        browser_id,
+                        value: ProtocolNotice::FrameReady,
+                    })
+                }
+                FrameLeaseEvent::Presented(_, _) => {}
+                FrameLeaseEvent::Released(browser_id, frame_id) => {
+                    if let Err(error) = self.transport.send(&wire::Packet {
+                        request_id: 0,
+                        body: Some(wire::packet::Body::FrameRelease(wire::FrameRelease {
+                            browser_id,
+                            frame_id,
+                        })),
+                    }) {
+                        notices.push(RoutedNotice {
+                            browser_id,
+                            value: ProtocolNotice::ProtocolFailed(format!(
+                                "frame release failed: {error}"
+                            )),
+                        });
+                        self.protocol_closed = true;
+                        return notices;
+                    }
+                }
+            }
+        }
         if self.protocol_closed {
             return notices;
         }
-        loop {
+        for _ in 0..Self::MAX_PACKETS_PER_POLL {
             match self.incoming.try_recv() {
                 Ok(Ok(received)) => {
                     if let Some(notice) = self.handle_packet(received) {
@@ -385,9 +579,10 @@ impl CefInstance {
         notices
     }
 
-    fn handle_packet(&mut self, received: wire::Packet) -> Option<RoutedNotice> {
-        let request_id = received.request_id;
-        let (browser_id, value) = match received.body {
+    fn handle_packet(&mut self, received: shell_protocol::ReceivedPacket) -> Option<RoutedNotice> {
+        let request_id = received.packet.request_id;
+        let file_descriptors = received.file_descriptors;
+        let (browser_id, value) = match received.packet.body {
             Some(wire::packet::Body::Response(response)) => {
                 let Some((browser_id, description)) = self.pending_requests.remove(&request_id)
                 else {
@@ -425,12 +620,7 @@ impl CefInstance {
                 self.last_event_sequence = event.sequence;
                 let browser_id = event.browser_id;
                 let value = match event.value {
-                    Some(wire::event::Value::SurfaceReady(surface)) => match surface.x11 {
-                        Some(surface) => Some(ProtocolNotice::SurfaceReady(surface.window)),
-                        None => Some(ProtocolNotice::ProtocolFailed(
-                            "surface readiness has no X11 window".to_owned(),
-                        )),
-                    },
+                    Some(wire::event::Value::SurfaceReady(_)) => Some(ProtocolNotice::SurfaceReady),
                     Some(wire::event::Value::LoadingChanged(loading)) => {
                         Some(ProtocolNotice::LoadingChanged(loading.loading))
                     }
@@ -474,6 +664,25 @@ impl CefInstance {
                             change.cause
                         ))),
                     },
+                    Some(wire::event::Value::AcceleratedFrame(frame)) => {
+                        let frame_id = frame.frame_id;
+                        match self.deliver_frame(browser_id, frame, file_descriptors) {
+                            Ok(()) => None,
+                            Err(error) => {
+                                let _ = self.send_frame_release(browser_id, frame_id);
+                                Some(ProtocolNotice::ProtocolFailed(error.to_string()))
+                            }
+                        }
+                    }
+                    Some(wire::event::Value::SurfaceCleared(clear)) => {
+                        if let (Some(surface_id), Ok(layer)) = (
+                            self.surfaces.get(&browser_id),
+                            wire::SurfaceLayer::try_from(clear.layer),
+                        ) {
+                            clear_qt_surface(surface_id, layer);
+                        }
+                        None
+                    }
                     None => None,
                 };
                 (browser_id, value)
@@ -494,7 +703,110 @@ impl CefInstance {
         value.map(|value| RoutedNotice { browser_id, value })
     }
 
+    fn deliver_frame(
+        &mut self,
+        browser_id: u64,
+        frame: wire::AcceleratedFrame,
+        file_descriptors: Vec<OwnedFd>,
+    ) -> NativeResult<()> {
+        let layer = wire::SurfaceLayer::try_from(frame.layer)
+            .map_err(|_| format!("frame has invalid surface layer {}", frame.layer))?;
+        if !matches!(layer, wire::SurfaceLayer::View | wire::SurfaceLayer::Popup) {
+            return Err("frame has unspecified surface layer".into());
+        }
+        if frame.frame_id == 0 || frame.width == 0 || frame.height == 0 {
+            return Err("frame has invalid identity or dimensions".into());
+        }
+        let surface_id = self.surfaces.get(&browser_id).cloned().unwrap_or_default();
+        if frame.planes.is_empty() || frame.planes.len() > 4 {
+            return Err("frame has an invalid plane count".into());
+        }
+        let mut used_indices = HashSet::new();
+        for plane in &frame.planes {
+            if plane.fd_index as usize >= file_descriptors.len()
+                || !used_indices.insert(plane.fd_index)
+            {
+                return Err("frame plane has an invalid or reused FD index".into());
+            }
+        }
+        if frame.has_acquire_fence
+            && (frame.acquire_fence_fd_index as usize >= file_descriptors.len()
+                || !used_indices.insert(frame.acquire_fence_fd_index))
+        {
+            return Err("frame has an invalid or reused acquire-fence FD index".into());
+        }
+        let surface_id = CString::new(surface_id)?;
+        let mut descriptors: Vec<Option<OwnedFd>> =
+            file_descriptors.into_iter().map(Some).collect();
+        let mut fds = Vec::with_capacity(frame.planes.len());
+        let mut strides = Vec::with_capacity(frame.planes.len());
+        let mut offsets = Vec::with_capacity(frame.planes.len());
+        for plane in &frame.planes {
+            let descriptor = descriptors
+                .get_mut(plane.fd_index as usize)
+                .and_then(Option::take)
+                .expect("frame plane indices were validated");
+            fds.push(descriptor.into_raw_fd());
+            strides.push(plane.stride);
+            offsets.push(plane.offset);
+        }
+        let acquire_fence_fd = if frame.has_acquire_fence {
+            descriptors
+                .get_mut(frame.acquire_fence_fd_index as usize)
+                .and_then(Option::take)
+                .expect("acquire-fence index was validated")
+                .into_raw_fd()
+        } else {
+            -1
+        };
+        let lease_id = register_frame_lease(
+            &self.lease_sender,
+            browser_id,
+            frame.frame_id,
+            layer,
+            *self
+                .surface_generations
+                .get(&browser_id)
+                .ok_or("browser surface has no generation")?,
+        );
+        unsafe {
+            deb_browser_surface_submit(
+                surface_id.as_ptr(),
+                browser_id,
+                lease_id,
+                frame.layer,
+                frame.x,
+                frame.y,
+                frame.width,
+                frame.height,
+                frame.drm_format,
+                frame.modifier,
+                i32::from(frame.flip_y),
+                fds.len() as u32,
+                fds.as_ptr(),
+                strides.as_ptr(),
+                offsets.as_ptr(),
+                acquire_fence_fd,
+            );
+        }
+        Ok(())
+    }
+
+    fn send_frame_release(&self, browser_id: u64, frame_id: u64) -> NativeResult<()> {
+        self.transport.send(&wire::Packet {
+            request_id: 0,
+            body: Some(wire::packet::Body::FrameRelease(wire::FrameRelease {
+                browser_id,
+                frame_id,
+            })),
+        })?;
+        Ok(())
+    }
+
     pub(crate) fn shutdown(mut self) {
+        for browser_id in self.surface_generations.keys().copied() {
+            forget_qt_browser(browser_id);
+        }
         let _ = self.send_process_request(
             wire::request::Operation::Shutdown(wire::Shutdown {}),
             "shutdown",
@@ -502,16 +814,8 @@ impl CefInstance {
         stop_child(&mut self.child);
     }
 
-    pub(crate) fn initial_window(&self) -> Window {
-        self.window
-    }
-
     pub(crate) fn initial_browser_id(&self) -> u64 {
         self.browser_id
-    }
-
-    pub(crate) fn process_id(&self) -> u32 {
-        self.child.id()
     }
 
     pub(crate) fn protocol_closed(&self) -> bool {
@@ -526,7 +830,8 @@ pub(crate) struct RoutedNotice {
 
 pub(crate) enum ProtocolNotice {
     CommandFailed(String),
-    SurfaceReady(u64),
+    SurfaceReady,
+    FrameReady,
     LoadingChanged(bool),
     NavigationCommitted(String),
     TitleChanged(String),
@@ -541,7 +846,7 @@ pub(crate) enum ProtocolNotice {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_cef_browser(
-    connection: &RustConnection,
+    _connection: &RustConnection,
     parent: Window,
     bounds: NativeRect,
     url: &str,
@@ -549,6 +854,7 @@ pub(crate) fn spawn_cef_browser(
     directories: &EngineDirectories,
     backend: CefBackend,
     browser_id: u64,
+    surface_id: String,
 ) -> NativeResult<CefInstance> {
     let executable = std::env::current_exe()?;
     let executable_directory = executable
@@ -587,7 +893,7 @@ pub(crate) fn spawn_cef_browser(
         CefBackend::Chromium => Duration::from_secs(30),
         CefBackend::Firefox => Duration::from_secs(90),
     };
-    let (window, last_event_sequence) = match initialize_helper(
+    let last_event_sequence = match initialize_helper(
         &transport,
         &incoming,
         &mut child,
@@ -607,22 +913,16 @@ pub(crate) fn spawn_cef_browser(
             return Err(format!("{} did not become ready: {error}", backend.name()).into());
         }
     };
-    let native_child = connection.query_tree(window)?.reply()?.parent == parent;
-    if !native_child {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(format!("{} returned a window outside the Qt host", backend.name()).into());
-    }
-    connection.change_window_attributes(
-        window,
-        &ChangeWindowAttributesAux::new().event_mask(EventMask::BUTTON_PRESS),
-    )?;
-    configure_native_window(connection, window, bounds)?;
+    let (lease_sender, lease_events) = mpsc::channel();
+    bind_qt_surface(&surface_id, browser_id, 1);
     Ok(CefInstance {
         child,
         transport,
         incoming,
-        window,
+        surfaces: HashMap::from([(browser_id, surface_id)]),
+        surface_generations: HashMap::from([(browser_id, 1)]),
+        lease_sender,
+        lease_events,
         browser_id,
         next_request_id: 3,
         pending_requests: HashMap::new(),
@@ -634,13 +934,13 @@ pub(crate) fn spawn_cef_browser(
 fn spawn_protocol_reader(
     transport: Transport,
 ) -> (
-    mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
+    mpsc::Receiver<Result<shell_protocol::ReceivedPacket, ProtocolError>>,
     JoinHandle<()>,
 ) {
     let (sender, receiver) = mpsc::channel();
     let thread = std::thread::spawn(move || {
         loop {
-            let received = transport.receive();
+            let received = transport.receive_with_fds();
             let failed = received.is_err();
             if sender.send(received).is_err() || failed {
                 break;
@@ -653,7 +953,7 @@ fn spawn_protocol_reader(
 #[allow(clippy::too_many_arguments)]
 fn initialize_helper(
     transport: &Transport,
-    incoming: &mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
+    incoming: &mpsc::Receiver<Result<shell_protocol::ReceivedPacket, ProtocolError>>,
     child: &mut Child,
     timeout: Duration,
     backend: CefBackend,
@@ -663,7 +963,7 @@ fn initialize_helper(
     profile_id: &str,
     directories: &EngineDirectories,
     browser_id: u64,
-) -> NativeResult<(Window, u64)> {
+) -> NativeResult<u64> {
     transport.send(&wire::Packet {
         request_id: 1,
         body: Some(wire::packet::Body::Hello(wire::Hello {
@@ -673,14 +973,17 @@ fn initialize_helper(
     })?;
     let deadline = Instant::now() + timeout;
     let hello = receive_startup_packet(incoming, child, deadline)?;
-    if hello.request_id != 1 {
+    if !hello.file_descriptors.is_empty() {
+        return Err("HelloReply unexpectedly carried file descriptors".into());
+    }
+    if hello.packet.request_id != 1 {
         return Err(format!(
             "HelloReply used request ID {}, expected 1",
-            hello.request_id
+            hello.packet.request_id
         )
         .into());
     }
-    let reply = match hello.body {
+    let reply = match hello.packet.body {
         Some(wire::packet::Body::HelloReply(reply)) => reply,
         Some(wire::packet::Body::Response(response)) => {
             return Err(format_response_error("protocol negotiation", response).into());
@@ -694,7 +997,7 @@ fn initialize_helper(
         browser_id,
         wire::request::Operation::CreateBrowser(wire::CreateBrowser {
             initial_url: url.to_owned(),
-            x11: Some(wire::X11Target {
+            surface: Some(wire::SurfaceTarget {
                 parent_window: u64::from(parent),
                 viewport: Some(bounds.viewport()),
             }),
@@ -705,12 +1008,12 @@ fn initialize_helper(
     ))?;
 
     let mut create_succeeded = false;
-    let mut window = None;
+    let mut surface_ready = false;
     let mut last_event_sequence = 0;
-    while !create_succeeded || window.is_none() {
+    while !create_succeeded || !surface_ready {
         let received = receive_startup_packet(incoming, child, deadline)?;
-        let request_id = received.request_id;
-        match received.body {
+        let request_id = received.packet.request_id;
+        match received.packet.body {
             Some(wire::packet::Body::Response(response)) => {
                 if request_id != 2 {
                     return Err(format!(
@@ -741,12 +1044,15 @@ fn initialize_helper(
                 }
                 last_event_sequence = event.sequence;
                 match event.value {
-                    Some(wire::event::Value::SurfaceReady(ready)) => {
-                        let raw_window = ready
-                            .x11
-                            .ok_or("helper did not return an X11 surface")?
-                            .window;
-                        window = Some(u32::try_from(raw_window)?);
+                    Some(wire::event::Value::SurfaceReady(_)) => surface_ready = true,
+                    Some(wire::event::Value::AcceleratedFrame(frame)) => {
+                        transport.send(&wire::Packet {
+                            request_id: 0,
+                            body: Some(wire::packet::Body::FrameRelease(wire::FrameRelease {
+                                browser_id,
+                                frame_id: frame.frame_id,
+                            })),
+                        })?;
                     }
                     Some(wire::event::Value::BrowserCrashed(crash)) => {
                         return Err(
@@ -763,10 +1069,7 @@ fn initialize_helper(
             _ => return Err("unexpected packet during browser startup".into()),
         }
     }
-    Ok((
-        window.expect("surface readiness was checked"),
-        last_event_sequence,
-    ))
+    Ok(last_event_sequence)
 }
 
 fn protocol_path(path: &Path) -> NativeResult<String> {
@@ -775,11 +1078,17 @@ fn protocol_path(path: &Path) -> NativeResult<String> {
         .ok_or_else(|| format!("profile path is not valid UTF-8: {}", path.display()).into())
 }
 
+pub(crate) fn clear_qt_surface(surface_id: &str, layer: wire::SurfaceLayer) {
+    if let Ok(surface_id) = CString::new(surface_id) {
+        unsafe { deb_browser_surface_clear(surface_id.as_ptr(), layer as i32) };
+    }
+}
+
 fn receive_startup_packet(
-    incoming: &mpsc::Receiver<Result<wire::Packet, ProtocolError>>,
+    incoming: &mpsc::Receiver<Result<shell_protocol::ReceivedPacket, ProtocolError>>,
     child: &mut Child,
     deadline: Instant,
-) -> NativeResult<wire::Packet> {
+) -> NativeResult<shell_protocol::ReceivedPacket> {
     while Instant::now() < deadline {
         match incoming.recv_timeout(Duration::from_millis(50)) {
             Ok(Ok(received)) => return Ok(received),
@@ -823,7 +1132,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::Resize,
         Capability::Focus,
         Capability::LoadingEvents,
-        Capability::NativeX11Surface,
+        Capability::AcceleratedDmabufSurface,
         Capability::CookieSync,
         Capability::MultipleBrowsers,
         Capability::Visibility,
@@ -865,27 +1174,49 @@ fn format_response_error(context: &str, response: wire::Response) -> String {
 pub(crate) fn sampled_pixel_variants(
     connection: &RustConnection,
     window: Window,
+    bounds: NativeRect,
 ) -> NativeResult<(usize, bool, bool)> {
-    let geometry = connection.get_geometry(window)?.reply()?;
+    connection.configure_window(
+        window,
+        &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+    )?;
+    connection.flush()?;
+    sleep(Duration::from_millis(100));
     let tree = connection.query_tree(window)?.reply()?;
-    let position = connection
+    let window_position = connection
         .translate_coordinates(window, tree.root, 0, 0)?
         .reply()?;
-    let x = position.dst_x.checked_add(4).ok_or("surface x overflow")?;
-    let y = position.dst_y.checked_add(4).ok_or("surface y overflow")?;
+    let local_coordinate = |value: i32, origin: i16, extent: u16| {
+        let translated = value.checked_sub(i32::from(origin))?;
+        if (0..i32::from(extent)).contains(&translated) {
+            Some(translated)
+        } else {
+            (0..i32::from(extent)).contains(&value).then_some(value)
+        }
+    };
+    let geometry = connection.get_geometry(window)?.reply()?;
+    let x = local_coordinate(bounds.x, window_position.dst_x, geometry.width)
+        .and_then(|value| value.checked_add(4))
+        .ok_or("surface x is outside the application window")?;
+    let y = local_coordinate(bounds.y, window_position.dst_y, geometry.height)
+        .and_then(|value| value.checked_add(4))
+        .ok_or("surface y is outside the application window")?;
     if x < 0 || y < 0 {
-        return Err("browser surface is outside the root window".into());
+        return Err(format!(
+            "browser surface at {},{} is outside application window {} at {},{} (local {},{})",
+            bounds.x, bounds.y, window, window_position.dst_x, window_position.dst_y, x, y,
+        )
+        .into());
     }
-    let root_geometry = connection.get_geometry(tree.root)?.reply()?;
-    let available_width = u16::try_from(i32::from(root_geometry.width) - i32::from(x))?;
-    let available_height = u16::try_from(i32::from(root_geometry.height) - i32::from(y))?;
-    let width = geometry
-        .width
+    let x = i16::try_from(x)?;
+    let y = i16::try_from(y)?;
+    let available_width = u16::try_from(i32::from(geometry.width) - i32::from(x))?;
+    let available_height = u16::try_from(i32::from(geometry.height) - i32::from(y))?;
+    let width = u16::try_from(bounds.width)?
         .saturating_sub(8)
         .min(available_width)
         .min(512);
-    let height = geometry
-        .height
+    let height = u16::try_from(bounds.height)?
         .saturating_sub(8)
         .min(available_height)
         .min(512);
@@ -893,15 +1224,7 @@ pub(crate) fn sampled_pixel_variants(
         return Err("browser surface has no drawable area".into());
     }
     let image = connection
-        .get_image(
-            ImageFormat::Z_PIXMAP,
-            tree.root,
-            x,
-            y,
-            width,
-            height,
-            u32::MAX,
-        )?
+        .get_image(ImageFormat::Z_PIXMAP, window, x, y, width, height, u32::MAX)?
         .reply()?;
     let pixels = image.data.chunks_exact(4);
     let has_qt_overlay = pixels
@@ -919,25 +1242,6 @@ pub(crate) fn sampled_pixel_variants(
         has_qt_overlay,
         has_orientation_marker,
     ))
-}
-
-pub(crate) fn configure_native_window(
-    connection: &RustConnection,
-    window: Window,
-    bounds: NativeRect,
-) -> NativeResult<()> {
-    connection.configure_window(
-        window,
-        &ConfigureWindowAux::new()
-            .x(bounds.x)
-            .y(bounds.y)
-            .width(bounds.width)
-            .height(bounds.height)
-            .border_width(0)
-            .stack_mode(StackMode::ABOVE),
-    )?;
-    connection.flush()?;
-    Ok(())
 }
 
 fn stop_child(child: &mut Child) {
@@ -997,7 +1301,8 @@ mod tests {
     #[test]
     fn rejects_a_helper_missing_a_required_capability() {
         let mut capabilities = super::required_capabilities();
-        capabilities.retain(|capability| *capability != wire::Capability::NativeX11Surface as i32);
+        capabilities
+            .retain(|capability| *capability != wire::Capability::AcceleratedDmabufSurface as i32);
         let reply = wire::HelloReply {
             engine: wire::Engine::Chromium as i32,
             engine_version: "test".to_owned(),
@@ -1008,6 +1313,6 @@ mod tests {
         let error = validate_hello_reply(&reply, CefBackend::Chromium)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("NativeX11Surface"));
+        assert!(error.contains("AcceleratedDmabufSurface"));
     }
 }

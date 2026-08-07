@@ -1,23 +1,26 @@
 use cef_dll_sys::{
-    _cef_browser_host_t, _cef_browser_t, _cef_client_t, _cef_frame_t, _cef_task_t, cef_errorcode_t,
-    cef_main_args_t, cef_string_t, cef_termination_status_t, cef_transition_type_t,
+    _cef_browser_host_t, _cef_browser_t, _cef_client_t, _cef_frame_t, _cef_task_t,
+    cef_accelerated_paint_info_common_t, cef_accelerated_paint_info_t,
+    cef_accelerated_paint_native_pixmap_plane_t, cef_color_type_t, cef_errorcode_t,
+    cef_main_args_t, cef_paint_element_type_t, cef_rect_t, cef_size_t, cef_string_t,
+    cef_termination_status_t, cef_transition_type_t,
 };
 use libc::{c_char, c_int, c_void};
 use std::{
+    collections::HashMap,
     error::Error,
     ffi::{CStr, CString},
     fs, mem,
-    os::unix::ffi::OsStrExt,
+    os::{
+        fd::{FromRawFd, IntoRawFd, OwnedFd},
+        unix::ffi::OsStrExt,
+    },
     path::{Path, PathBuf},
     ptr,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
     },
-};
-use x11rb::{
-    connection::Connection,
-    protocol::xproto::{ConfigureWindowAux, ConnectionExt},
 };
 
 use crate::refcount::{add_ref_raw, release_raw};
@@ -37,6 +40,27 @@ struct FirefoxCefCallbacks {
     on_browser_crashed: Option<unsafe extern "C" fn(*mut c_void, i32, *const c_char)>,
     on_before_close: Option<unsafe extern "C" fn(*mut c_void, i32)>,
     on_cookie_changed: Option<unsafe extern "C" fn(*mut c_void, *const FirefoxCefCookie, u8)>,
+    on_accelerated_frame: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            i32,
+            u64,
+            u32,
+            u32,
+            u64,
+            *const FirefoxCefPlane,
+            usize,
+            c_int,
+        ),
+    >,
+}
+
+#[repr(C)]
+struct FirefoxCefPlane {
+    stride: u32,
+    offset: u64,
+    size: u64,
+    fd: c_int,
 }
 
 #[repr(C)]
@@ -60,6 +84,8 @@ pub struct FirefoxCefCookie {
 
 type SetCallbacks = unsafe extern "C" fn(*const FirefoxCefCallbacks);
 type Configure = unsafe extern "C" fn(u32, u64, u32, u32, *const c_char) -> c_int;
+type Resize = unsafe extern "C" fn(u32, u32, u32) -> c_int;
+type ReleaseFrame = unsafe extern "C" fn(u64) -> c_int;
 type Command = unsafe extern "C" fn() -> c_int;
 type BrowserCommand = unsafe extern "C" fn(u32) -> c_int;
 type BrowserBoolCommand = unsafe extern "C" fn(u32, u8) -> c_int;
@@ -82,10 +108,11 @@ struct GeckoApi {
     _libxul: usize,
     set_callbacks: SetCallbacks,
     configure: Configure,
+    resize: Resize,
+    invalidate: BrowserCommand,
+    release_frame: ReleaseFrame,
     navigate: BrowserStringCommand,
     reload: BrowserCommand,
-    focus: BrowserCommand,
-    set_visibility: BrowserBoolCommand,
     send_mouse_move: MouseMoveCommand,
     send_mouse_click: MouseClickCommand,
     send_mouse_wheel: MouseWheelCommand,
@@ -113,10 +140,11 @@ impl GeckoApi {
             _libxul: libxul as usize,
             set_callbacks: unsafe { symbol(libxul, b"firefox_cef_gecko_set_callbacks\0")? },
             configure: unsafe { symbol(libxul, b"firefox_cef_gecko_configure\0")? },
+            resize: unsafe { symbol(libxul, b"firefox_cef_gecko_resize\0")? },
+            invalidate: unsafe { symbol(libxul, b"firefox_cef_gecko_invalidate\0")? },
+            release_frame: unsafe { symbol(libxul, b"firefox_cef_gecko_release_frame\0")? },
             navigate: unsafe { symbol(libxul, b"firefox_cef_gecko_navigate\0")? },
             reload: unsafe { symbol(libxul, b"firefox_cef_gecko_reload\0")? },
-            focus: unsafe { symbol(libxul, b"firefox_cef_gecko_focus\0")? },
-            set_visibility: unsafe { symbol(libxul, b"firefox_cef_gecko_set_visibility\0")? },
             send_mouse_move: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_move\0")? },
             send_mouse_click: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_click\0")? },
             send_mouse_wheel: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_wheel\0")? },
@@ -159,7 +187,6 @@ struct RuntimeConfig {
 
 pub struct BrowserState {
     pub id: i32,
-    pub parent: u32,
     pub width: AtomicU32,
     pub height: AtomicU32,
     pub browser: AtomicPtr<_cef_browser_t>,
@@ -177,6 +204,7 @@ static GECKO: OnceLock<Result<GeckoApi, String>> = OnceLock::new();
 static CONFIG: OnceLock<Mutex<Option<RuntimeConfig>>> = OnceLock::new();
 static NEXT_BROWSER_ID: AtomicU64 = AtomicU64::new(1);
 static STATES: OnceLock<Mutex<Vec<Arc<BrowserState>>>> = OnceLock::new();
+static FRAME_FENCES: OnceLock<Mutex<HashMap<u64, OwnedFd>>> = OnceLock::new();
 
 fn gecko() -> RuntimeResult<&'static GeckoApi> {
     GECKO
@@ -191,6 +219,30 @@ fn config() -> &'static Mutex<Option<RuntimeConfig>> {
 
 fn states() -> &'static Mutex<Vec<Arc<BrowserState>>> {
     STATES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn frame_fences() -> &'static Mutex<HashMap<u64, OwnedFd>> {
+    FRAME_FENCES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn take_accelerated_frame_fence(frame_id: u64) -> c_int {
+    frame_fences()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&frame_id)
+        .map_or(-1, IntoRawFd::into_raw_fd)
+}
+
+pub fn release_accelerated_frame(frame_id: u64) {
+    frame_fences()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&frame_id);
+    if let Ok(api) = gecko()
+        && unsafe { (api.release_frame)(frame_id) } == 0
+    {
+        eprintln!("firefox-cef: Gecko rejected accelerated frame {frame_id} release");
+    }
 }
 
 fn find_state(id: i32) -> Option<Arc<BrowserState>> {
@@ -303,12 +355,19 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
             concat!(
                 "user_pref(\"browser.startup.blankWindow\", false);\n",
                 "user_pref(\"extensions.enabledScopes\", 0);\n",
+                "user_pref(\"gfx.x11-egl.force-enabled\", true);\n",
+                "user_pref(\"gfx.webrender.all\", true);\n",
+                "user_pref(\"layers.acceleration.force-enabled\", true);\n",
+                "user_pref(\"layers.gpu-process.enabled\", false);\n",
+                "user_pref(\"widget.dmabuf.force-enabled\", true);\n",
                 "user_pref(\"browser.cache.disk.parent_directory\", \"{}\");\n",
             ),
             javascript_string(cache.to_string_lossy().as_ref()),
         ),
     )?;
     unsafe { std::env::set_var("FIREFOX_CEF_APP_INI", &app_ini) };
+    unsafe { std::env::set_var("FIREFOX_CEF_DIRECT", "1") };
+    unsafe { std::env::set_var("MOZ_X11_EGL", "1") };
     *config().lock().unwrap_or_else(|error| error.into_inner()) =
         Some(RuntimeConfig { profile, app_ini });
     let callbacks = FirefoxCefCallbacks {
@@ -322,6 +381,7 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
         on_browser_crashed: Some(on_browser_crashed),
         on_before_close: Some(on_before_close),
         on_cookie_changed: Some(on_cookie_changed),
+        on_accelerated_frame: Some(on_accelerated_frame),
     };
     unsafe { (gecko()?.set_callbacks)(&callbacks) };
     Ok(())
@@ -424,7 +484,6 @@ impl BrowserState {
         let id = i32::try_from(id)?;
         let state = Arc::new(Self {
             id,
-            parent,
             width: AtomicU32::new(width.max(2)),
             height: AtomicU32::new(height.max(2)),
             browser: AtomicPtr::new(ptr::null_mut()),
@@ -494,16 +553,9 @@ impl BrowserState {
         api.browser_command(api.reload, self.id, "reload")
     }
 
-    pub fn focus(&self) -> RuntimeResult<()> {
+    pub fn invalidate(&self) -> RuntimeResult<()> {
         let api = gecko()?;
-        api.browser_command(api.focus, self.id, "focus")
-    }
-
-    pub fn set_visible(&self, visible: bool) -> RuntimeResult<()> {
-        if unsafe { (gecko()?.set_visibility)(self.id as u32, u8::from(visible)) } == 0 {
-            return Err(format!("Gecko rejected visibility for browser {}", self.id).into());
-        }
-        Ok(())
+        api.browser_command(api.invalidate, self.id, "invalidate")
     }
 
     pub fn send_mouse_move(
@@ -592,34 +644,42 @@ impl BrowserState {
         Ok(())
     }
 
-    pub fn sync_from_parent(&self, focus: bool) -> RuntimeResult<()> {
-        let (connection, _) = x11rb::connect(None)?;
-        let window = self.window();
-        let parent = if window == 0 {
-            self.parent
-        } else {
-            connection.query_tree(window)?.reply()?.parent
+    pub fn sync_from_parent(&self, _focus: bool) -> RuntimeResult<()> {
+        let client = self.client.load(Ordering::Acquire);
+        let browser = self.browser.load(Ordering::Acquire);
+        if client.is_null() || browser.is_null() {
+            return Err("browser render handler is unavailable".into());
+        }
+        let get_handler = unsafe { (*client).get_render_handler }
+            .ok_or("browser client has no render handler")?;
+        let handler = unsafe { get_handler(client) };
+        if handler.is_null() {
+            return Err("browser client returned no render handler".into());
+        }
+        let mut rect = cef_rect_t {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
         };
-        let geometry = connection.get_geometry(parent)?.reply()?;
-        let width = u32::from(geometry.width).max(2);
-        let height = u32::from(geometry.height).max(2);
+        let Some(get_view_rect) = (unsafe { (*handler).get_view_rect }) else {
+            unsafe { release_raw(handler) };
+            return Err("browser render handler has no view rectangle callback".into());
+        };
+        unsafe { get_view_rect(handler, browser, &mut rect) };
+        unsafe { release_raw(handler) };
+        let width = u32::try_from(rect.width.max(2))?;
+        let height = u32::try_from(rect.height.max(2))?;
+        if self.width.load(Ordering::Acquire) == width
+            && self.height.load(Ordering::Acquire) == height
+        {
+            return Ok(());
+        }
+        if unsafe { (gecko()?.resize)(self.id as u32, width, height) } == 0 {
+            return Err(format!("Gecko rejected resize for browser {}", self.id).into());
+        }
         self.width.store(width, Ordering::Release);
         self.height.store(height, Ordering::Release);
-        if window != 0 {
-            connection.configure_window(
-                window,
-                &ConfigureWindowAux::new()
-                    .x(0)
-                    .y(0)
-                    .width(width)
-                    .height(height)
-                    .border_width(0),
-            )?;
-            connection.flush()?;
-        }
-        if focus {
-            self.focus()?;
-        }
         Ok(())
     }
 
@@ -918,6 +978,110 @@ unsafe extern "C" fn on_load_error(
 unsafe extern "C" fn on_browser_crashed(_context: *mut c_void, id: i32, reason: *const c_char) {
     if let Some(state) = find_state(id) {
         state.notify_crashed(&c_string(reason));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn on_accelerated_frame(
+    _context: *mut c_void,
+    id: i32,
+    frame_id: u64,
+    width: u32,
+    height: u32,
+    modifier: u64,
+    planes: *const FirefoxCefPlane,
+    plane_count: usize,
+    fence_fd: c_int,
+) {
+    let Some(state) = find_state(id) else {
+        release_accelerated_frame(frame_id);
+        return;
+    };
+    if frame_id == 0 || planes.is_null() || !(1..=4).contains(&plane_count) {
+        release_accelerated_frame(frame_id);
+        return;
+    }
+    let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+        release_accelerated_frame(frame_id);
+        return;
+    };
+    let client = state.client.load(Ordering::Acquire);
+    let browser = state.browser.load(Ordering::Acquire);
+    if client.is_null() || browser.is_null() {
+        release_accelerated_frame(frame_id);
+        return;
+    }
+    let Some(get_handler) = (unsafe { (*client).get_render_handler }) else {
+        release_accelerated_frame(frame_id);
+        return;
+    };
+    let handler = unsafe { get_handler(client) };
+    if handler.is_null() {
+        release_accelerated_frame(frame_id);
+        return;
+    }
+    let Some(callback) = (unsafe { (*handler).on_accelerated_paint }) else {
+        unsafe { release_raw(handler) };
+        release_accelerated_frame(frame_id);
+        return;
+    };
+    let source_planes = unsafe { std::slice::from_raw_parts(planes, plane_count) };
+    let mut native_planes: [cef_accelerated_paint_native_pixmap_plane_t; 4] =
+        unsafe { mem::zeroed() };
+    for (target, source) in native_planes.iter_mut().zip(source_planes) {
+        target.stride = source.stride;
+        target.offset = source.offset;
+        target.size = source.size;
+        target.fd = source.fd;
+    }
+    let rect = cef_rect_t {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    let info = cef_accelerated_paint_info_t {
+        size: mem::size_of::<cef_accelerated_paint_info_t>(),
+        planes: native_planes,
+        plane_count: plane_count as c_int,
+        modifier,
+        format: cef_color_type_t::CEF_COLOR_TYPE_BGRA_8888,
+        extra: cef_accelerated_paint_info_common_t {
+            size: mem::size_of::<cef_accelerated_paint_info_common_t>(),
+            timestamp: 0,
+            coded_size: cef_size_t { width, height },
+            visible_rect: rect,
+            content_rect: rect,
+            source_size: cef_size_t { width, height },
+            capture_update_rect: rect,
+            region_capture_rect: rect,
+            capture_counter: frame_id,
+            has_capture_update_rect: 1,
+            has_region_capture_rect: 0,
+            has_source_size: 1,
+            has_capture_counter: 1,
+        },
+    };
+    if fence_fd >= 0 {
+        let duplicated = unsafe { libc::dup(fence_fd) };
+        if duplicated >= 0 {
+            frame_fences()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(frame_id, unsafe { OwnedFd::from_raw_fd(duplicated) });
+        }
+    }
+    unsafe {
+        add_ref_raw(browser);
+        callback(
+            handler,
+            browser,
+            cef_paint_element_type_t::PET_VIEW,
+            1,
+            &rect,
+            &info,
+        );
+        release_raw(handler);
     }
 }
 

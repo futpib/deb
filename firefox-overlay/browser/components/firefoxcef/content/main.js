@@ -33,11 +33,13 @@ function createBrowserElement(browserId) {
   return browser;
 }
 
-function presentBrowser(entry) {
-  const baseWindow = window.docShell.treeOwner.QueryInterface(Ci.nsIBaseWindow);
-  bridge.attachWindow(entry.browserId, baseWindow);
+function repaintBrowser(entry) {
   entry.browser.frameLoader?.requestUpdatePosition();
   window.windowUtils.updateLayerTree();
+}
+
+function presentBrowser(entry) {
+  repaintBrowser(entry);
   entry.browser.focus();
 }
 
@@ -259,6 +261,11 @@ const commandObserver = (subject, topic, command) => {
       break;
     case "visibility":
       setBrowserVisibility(browserId, arguments_[0] == "1");
+      break;
+    case "invalidate":
+      if (entry) {
+        repaintBrowser(entry);
+      }
       break;
     case "close":
       if (entry) {

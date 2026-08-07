@@ -11,7 +11,9 @@ use cef_dll_sys::{
 };
 use libc::{c_char, c_int, c_void};
 use refcount::{CefRefCounted, RefObject, add_ref_raw, release_raw};
-use runtime::{BrowserState, shutdown_all};
+use runtime::{
+    BrowserState, release_accelerated_frame, shutdown_all, take_accelerated_frame_fence,
+};
 use std::{
     ptr,
     sync::{
@@ -25,6 +27,16 @@ const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0
 const CEF_COMMIT_HASH: &[u8] = b"7c1aa68455db1f1fad159c2b83070ad318212b3d\0";
 const CEF_SANDBOX_COMPAT_HASH: &[u8] = b"\0";
 static CONFIGURED_API_VERSION: AtomicI32 = AtomicI32::new(0);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_deb_release_accelerated_frame(frame_id: u64) {
+    release_accelerated_frame(frame_id);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cef_deb_take_accelerated_frame_fence(frame_id: u64) -> c_int {
+    take_accelerated_frame_fence(frame_id)
+}
 
 fn state_from<T: CefRefCounted>(raw: *mut T) -> Arc<BrowserState> {
     unsafe { RefObject::<T, Arc<BrowserState>>::get(raw).state.clone() }
@@ -98,13 +110,7 @@ unsafe extern "C" fn host_is_ready_to_close(host: *mut _cef_browser_host_t) -> c
     i32::from(!state_from(host).is_valid())
 }
 
-unsafe extern "C" fn host_set_focus(host: *mut _cef_browser_host_t, focus: c_int) {
-    if focus != 0
-        && let Err(error) = state_from(host).focus()
-    {
-        eprintln!("firefox-cef: focus failed: {error}");
-    }
-}
+unsafe extern "C" fn host_set_focus(_host: *mut _cef_browser_host_t, _focus: c_int) {}
 
 unsafe extern "C" fn host_send_key_event(
     host: *mut _cef_browser_host_t,
@@ -142,9 +148,14 @@ unsafe extern "C" fn host_notify_resize(host: *mut _cef_browser_host_t) {
     }
 }
 
-unsafe extern "C" fn host_was_hidden(host: *mut _cef_browser_host_t, hidden: c_int) {
-    if let Err(error) = state_from(host).set_visible(hidden == 0) {
-        eprintln!("firefox-cef: visibility update failed: {error}");
+unsafe extern "C" fn host_was_hidden(_host: *mut _cef_browser_host_t, _hidden: c_int) {}
+
+unsafe extern "C" fn host_invalidate(
+    host: *mut _cef_browser_host_t,
+    _type_: cef_dll_sys::cef_paint_element_type_t,
+) {
+    if let Err(error) = state_from(host).invalidate() {
+        eprintln!("firefox-cef: invalidate failed: {error}");
     }
 }
 
@@ -236,6 +247,7 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     host.get_client = Some(host_get_client);
     host.notify_move_or_resize_started = Some(host_notify_resize);
     host.was_hidden = Some(host_was_hidden);
+    host.invalidate = Some(host_invalidate);
     host.send_mouse_move_event = Some(host_send_mouse_move);
     host.send_mouse_click_event = Some(host_send_mouse_click);
     host.send_mouse_wheel_event = Some(host_send_mouse_wheel);
