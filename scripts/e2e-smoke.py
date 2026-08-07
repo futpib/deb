@@ -277,6 +277,28 @@ class Driver:
             f"{accessible_id} to move below {ancestor_id}", probe, timeout
         )
 
+    def wait_for_descendant_id_count(
+        self, ancestor_id, accessible_id_prefix, expected, timeout=20.0
+    ):
+        def probe():
+            ancestor = self.find_id(ancestor_id)
+            if ancestor is None:
+                return None
+            count = 0
+            for accessible in descendants(ancestor):
+                try:
+                    if accessible.get_accessible_id().startswith(accessible_id_prefix):
+                        count += 1
+                except Exception:
+                    continue
+            return ancestor if count == expected else None
+
+        return self.wait_until(
+            f"{ancestor_id} to contain {expected} {accessible_id_prefix} objects",
+            probe,
+            timeout,
+        )
+
     @staticmethod
     def rectangle(accessible):
         component = accessible.get_component_iface()
@@ -374,6 +396,7 @@ class Driver:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        return window
 
     def wait_for_actionable(self, accessible_id):
         def probe():
@@ -411,6 +434,78 @@ class Driver:
         accessible = self.wait_for_actionable(accessible_id)
         self.move_pointer(accessible, focus_window)
         self.xdotool("click", "1")
+
+    def click_button(self, accessible_id, button, focus_window=True):
+        accessible = self.wait_for_actionable(accessible_id)
+        self.move_pointer(accessible, focus_window)
+        self.xdotool("click", str(button))
+
+    def drag(self, source_id, target_id):
+        source = self.wait_for_actionable(source_id)
+        target = self.wait_for_actionable(target_id)
+        self.focus_accessible_window(source)
+        source_rectangle = self.rectangle(source)
+        target_rectangle = self.rectangle(target)
+        source_x = source_rectangle.x + source_rectangle.width // 2
+        source_y = source_rectangle.y + source_rectangle.height // 2
+        target_x = target_rectangle.x + target_rectangle.width // 2
+        target_y = target_rectangle.y + target_rectangle.height // 2
+        self.move_pointer_to(source_x, source_y)
+        self.xdotool("mousedown", "1")
+        self.move_pointer_to((source_x + target_x) // 2, (source_y + target_y) // 2)
+        self.move_pointer_to(target_x, target_y)
+        self.xdotool("mouseup", "1")
+
+    def arrange_windows_side_by_side(self, left_control_id, right_control_id):
+        left = self.wait_for_actionable(left_control_id)
+        right = self.wait_for_actionable(right_control_id)
+        left_window = self.focus_accessible_window(left)
+        right_window = self.focus_accessible_window(right)
+        display_width, display_height = (
+            int(value)
+            for value in self.xdotool("getdisplaygeometry", capture=True).split()
+        )
+        gap = 20
+        left_width = max(900, (display_width - gap) // 2)
+        right_width = max(760, display_width - gap - left_width)
+        if left_width + gap + right_width > display_width:
+            raise SmokeFailure(
+                "the E2E display is too narrow to expose both production windows"
+            )
+        height = max(560, display_height - 80)
+        self.xdotool("windowsize", left_window, str(left_width), str(height))
+        self.xdotool("windowmove", left_window, "0", "0")
+        self.xdotool("windowsize", right_window, str(right_width), str(height))
+        self.xdotool("windowmove", right_window, str(left_width + gap), "0")
+
+        def separated():
+            left_rectangle = self.rectangle(self.find_id(left_control_id))
+            right_rectangle = self.rectangle(self.find_id(right_control_id))
+            return (
+                left_rectangle.x + left_rectangle.width
+                <= right_rectangle.x + gap // 2
+            )
+
+        self.wait_until("the two browser windows to be side by side", separated)
+
+    def wait_for_missing_id(self, accessible_id, timeout=20.0):
+        return self.wait_until(
+            f"accessible object {accessible_id} to disappear",
+            lambda: self.find_id(accessible_id) is None,
+            timeout,
+        )
+
+    def wait_for_horizontal_order(self, left_id, right_id, timeout=20.0):
+        def probe():
+            left = self.find_id(left_id)
+            right = self.find_id(right_id)
+            if left is None or right is None:
+                return None
+            return left if self.rectangle(left).x < self.rectangle(right).x else None
+
+        return self.wait_until(
+            f"{left_id} to appear left of {right_id}", probe, timeout
+        )
 
     def click_surface(self, accessible_id, x_fraction, y_fraction):
         if not 0.0 < x_fraction < 1.0 or not 0.0 < y_fraction < 1.0:
@@ -615,14 +710,19 @@ def main():
                 "deb to appear on AT-SPI", driver.find_application
             )
             driver.wait_for_name("browser.status.1", "Chromium")
-            chromium_initial_marker, chromium_initial_variants = driver.wait_for_surface(
-                "browser.surface.1", "initial Chromium"
-            )
             print("deb-e2e: clicking New Firefox tab through XTEST", flush=True)
-            driver.click("browser.new.firefox.1")
+            driver.click("browser.new-menu.1")
+            driver.click("browser.new.firefox.1", focus_window=False)
             driver.wait_for_id("browser.tab.default.2")
             driver.wait_for_name("browser.status.1", "Gecko")
             driver.wait_for_name("browser.tab.default.2", "New tab · deb")
+            driver.click("browser.tab.default.1")
+            driver.wait_for_name("browser.status.1", "Chromium")
+            chromium_initial_marker, chromium_initial_variants = driver.wait_for_surface(
+                "browser.surface.1", "initial Chromium"
+            )
+            driver.click("browser.tab.default.2")
+            driver.wait_for_name("browser.status.1", "Gecko")
             driver.type_address("browser.address.1", "deb://new-tab/#deb-smoke")
             firefox_internal_marker, firefox_internal_variants = driver.wait_for_surface(
                 "browser.surface.1", "Firefox internal page"
@@ -711,6 +811,16 @@ def main():
                 "browser.surface.1", "retained Firefox"
             )
 
+            print("deb-e2e: reordering tabs through a real pointer drag", flush=True)
+            driver.drag("browser.tab.default.1", "browser.tab.default.2")
+            driver.wait_for_horizontal_order(
+                "browser.tab.default.2", "browser.tab.default.1"
+            )
+            driver.click("browser.tab.default.1")
+            driver.wait_for_name("browser.status.1", "Chromium")
+            driver.click("browser.tab.default.2")
+            driver.wait_for_name("browser.status.1", "Gecko")
+
             print("deb-e2e: switching tabs through both keyboard shortcuts", flush=True)
             driver.send_shortcut("browser.surface.1", "ctrl+shift+Tab")
             driver.wait_for_name("browser.status.1", "Chromium")
@@ -742,9 +852,12 @@ def main():
                 "browser.surface.2", "second-window Chromium"
             )
 
-            print("deb-e2e: moving the live Firefox tab into the second window", flush=True)
-            driver.click("browser.move.1")
-            driver.click("browser.move-target.2", focus_window=False)
+            print(
+                "deb-e2e: dragging the live Firefox tab into the second window",
+                flush=True,
+            )
+            driver.arrange_windows_side_by_side("browser.view.1", "browser.view.2")
+            driver.drag("browser.tab.default.2", "browser.tabs.2")
             driver.wait_for_descendant("browser.tab.default.2", "browser.view.2")
             driver.wait_for_name("browser.status.2", "Gecko")
             driver.wait_for_name(
@@ -760,6 +873,23 @@ def main():
             moved_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.2", "browser.surface.2"
             )
+            print("deb-e2e: closing the other tab with a middle click", flush=True)
+            driver.click_button("browser.tab.default.3", 2)
+            driver.wait_for_missing_id("browser.tab.default.3")
+            driver.wait_for_descendant("browser.tab.default.2", "browser.view.2")
+            print("deb-e2e: detaching Firefox through its real tab menu", flush=True)
+            driver.click_button("browser.tab.default.2", 3)
+            driver.click("browser.detach.default.2", focus_window=False)
+            driver.wait_for_id("browser.view.3")
+            driver.wait_for_descendant("browser.tab.default.2", "browser.view.3")
+            driver.wait_for_descendant_id_count("browser.view.3", "browser.tab.", 1)
+            driver.wait_for_name("browser.status.3", "Gecko")
+            detached_firefox_marker, detached_firefox_variants = (
+                driver.wait_for_surface("browser.surface.3", "detached Firefox")
+            )
+            driver.wait_for_id("browser.tab.default.4")
+            driver.wait_for_descendant("browser.tab.default.4", "browser.view.2")
+            driver.wait_for_name("browser.status.2", "Chromium")
             driver.wait_for_name("browser.status.1", "Chromium")
             driver.wait_for_text("browser.address.1", chromium_url)
             main_after_move_marker, main_after_move_variants = driver.wait_for_surface(
@@ -771,7 +901,7 @@ def main():
 
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                "both engines, trusted page clicks, tab buttons and shortcuts, cookie sync, retained frames, and two windows "
+                "both engines, trusted page clicks, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, and three windows "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -779,6 +909,7 @@ def main():
                 f"retained Chromium {retained_chromium_variants}/{retained_chromium_marker}, "
                 f"retained Firefox {retained_firefox_variants}/{retained_firefox_marker}, "
                 f"second window {second_window_variants}/{second_window_marker}, "
+                f"detached Firefox {detached_firefox_variants}/{detached_firefox_marker}, "
                 f"moved Firefox {moved_firefox_variants}/{moved_firefox_marker}, "
                 f"main after move {main_after_move_variants}/{main_after_move_marker}, "
                 f"page clicks {chromium_click_pixels}/{firefox_click_pixels} pixels, "

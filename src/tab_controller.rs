@@ -65,6 +65,7 @@ pub enum TabCommand {
         bounds: NativeRect,
         label: String,
         initial_url: String,
+        create_initial_tab: bool,
     },
     RemoveWindow(u64),
     Layout(u64, NativeRect),
@@ -79,7 +80,11 @@ pub enum TabCommand {
     Select(u64, u64),
     Close(u64),
     SwitchEngine(u64, TabEngine),
-    Move(u64, u64),
+    Move {
+        tab: u64,
+        window: u64,
+        target_index: Option<usize>,
+    },
     MouseMove {
         window_id: u64,
         x: i32,
@@ -197,6 +202,37 @@ impl Tab {
             crashed: self.crashed,
         }
     }
+}
+
+fn relocate_tab(
+    tabs: &mut Vec<Tab>,
+    tab_id: u64,
+    target_window: u64,
+    target_index: Option<usize>,
+) -> TabResult<u64> {
+    let source_index = tabs
+        .iter()
+        .position(|tab| tab.id == tab_id)
+        .ok_or_else(|| format!("tab {tab_id} does not exist"))?;
+    let mut tab = tabs.remove(source_index);
+    let source_window = tab.window_id;
+    let target_tabs = tabs
+        .iter()
+        .enumerate()
+        .filter(|(_, tab)| tab.window_id == target_window)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let target_index = target_index
+        .unwrap_or(target_tabs.len())
+        .min(target_tabs.len());
+    let insertion_index = target_tabs
+        .get(target_index)
+        .copied()
+        .or_else(|| target_tabs.last().map(|index| index + 1))
+        .unwrap_or(tabs.len());
+    tab.window_id = target_window;
+    tabs.insert(insertion_index, tab);
+    Ok(source_window)
 }
 
 struct BrowserWindow {
@@ -459,7 +495,8 @@ impl Runtime {
                 bounds,
                 label,
                 initial_url,
-            } => self.add_window(id, parent, bounds, label, initial_url),
+                create_initial_tab,
+            } => self.add_window(id, parent, bounds, label, initial_url, create_initial_tab),
             TabCommand::RemoveWindow(id) => self.remove_window(id),
             TabCommand::Layout(id, bounds) => self.layout(id, bounds),
             TabCommand::SetWindowState {
@@ -473,7 +510,11 @@ impl Runtime {
             TabCommand::Select(id, tab) => self.select(id, tab),
             TabCommand::Close(tab) => self.close_tab(tab),
             TabCommand::SwitchEngine(tab, engine) => self.switch_engine(tab, engine),
-            TabCommand::Move(tab, window) => self.move_tab(tab, window),
+            TabCommand::Move {
+                tab,
+                window,
+                target_index,
+            } => self.move_tab(tab, window, target_index),
             TabCommand::MouseMove {
                 window_id,
                 x,
@@ -519,6 +560,7 @@ impl Runtime {
         bounds: NativeRect,
         label: String,
         initial_url: String,
+        create_initial_tab: bool,
     ) -> TabResult<()> {
         if self.windows.contains_key(&id) {
             return Err(format!("window {id} is already registered").into());
@@ -536,9 +578,11 @@ impl Runtime {
                 focused: false,
             },
         );
-        let tab_id = self.add_tab(id, TabEngine::Chromium, initial_url);
-        self.window_mut(id)?.active_tab = tab_id;
-        self.attach_tab(tab_id)?;
+        if create_initial_tab {
+            let tab_id = self.add_tab(id, TabEngine::Chromium, initial_url);
+            self.window_mut(id)?.active_tab = tab_id;
+            self.attach_tab(tab_id)?;
+        }
         self.refresh_visibility()?;
         self.dirty = true;
         Ok(())
@@ -703,6 +747,13 @@ impl Runtime {
             .iter()
             .position(|tab| tab.id == tab_id)
             .ok_or_else(|| format!("tab {tab_id} does not exist"))?;
+        let window_id = self.tabs[index].window_id;
+        let window_index = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.window_id == window_id)
+            .position(|tab| tab.id == tab_id)
+            .expect("the tab exists in its window");
         let tab = self.tabs.remove(index);
         if let Some(browser_id) = tab.browser_id
             && let Some(runtime) = self.engine_mut(tab.engine.backend())
@@ -729,7 +780,7 @@ impl Runtime {
             .windows
             .get(&tab.window_id)
             .is_some_and(|window| window.active_tab == tab_id)
-            && let Some(next) = remaining.first()
+            && let Some(next) = remaining.get(window_index).or_else(|| remaining.last())
         {
             self.window_mut(tab.window_id)?.active_tab = *next;
         }
@@ -768,13 +819,26 @@ impl Runtime {
         Ok(())
     }
 
-    fn move_tab(&mut self, tab_id: u64, target_window: u64) -> TabResult<()> {
+    fn move_tab(
+        &mut self,
+        tab_id: u64,
+        target_window: u64,
+        target_index: Option<usize>,
+    ) -> TabResult<()> {
         self.window(target_window)?;
-        let source = self.tab(tab_id)?.window_id;
+        let source_window = self.tab(tab_id)?.window_id;
+        let source_index = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.window_id == source_window)
+            .position(|tab| tab.id == tab_id)
+            .expect("the tab exists in its source window");
+        let source = relocate_tab(&mut self.tabs, tab_id, target_window, target_index)?;
+        debug_assert_eq!(source, source_window);
         if source == target_window {
+            self.dirty = true;
             return Ok(());
         }
-        self.tab_mut(tab_id)?.window_id = target_window;
         self.window_mut(target_window)?.active_tab = tab_id;
         let source_tabs = self
             .tabs
@@ -788,7 +852,10 @@ impl Runtime {
             self.window_mut(source)?.active_tab = replacement;
             self.attach_tab(replacement)?;
         } else if self.window(source)?.active_tab == tab_id {
-            self.window_mut(source)?.active_tab = source_tabs[0];
+            self.window_mut(source)?.active_tab = *source_tabs
+                .get(source_index)
+                .or_else(|| source_tabs.last())
+                .expect("the source window still has tabs");
         }
         self.refresh_visibility()?;
         self.dirty = true;
@@ -978,7 +1045,11 @@ impl Runtime {
                 .map(|window| WindowSnapshot {
                     id: window.id.to_string(),
                     label: &window.label,
-                    active_tab_id: window.active_tab.to_string(),
+                    active_tab_id: if window.active_tab != 0 {
+                        window.active_tab.to_string()
+                    } else {
+                        String::new()
+                    },
                     tabs: self
                         .tabs
                         .iter()
@@ -1056,7 +1127,7 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{CookieMutation, TabEngine, reconcile_mutation};
+    use super::{CookieMutation, Tab, TabEngine, reconcile_mutation, relocate_tab};
     use crate::cookie_store::{CanonicalCookie, CookieIdentity};
     use shell_protocol::wire;
     use std::collections::HashMap;
@@ -1079,6 +1150,52 @@ mod tests {
             priority: wire::CookiePriority::Medium as i32,
             last_update: 3,
         }
+    }
+
+    fn tab(id: u64, window_id: u64) -> Tab {
+        Tab {
+            id,
+            window_id,
+            engine: TabEngine::Chromium,
+            browser_id: None,
+            url: String::new(),
+            title: String::new(),
+            status: String::new(),
+            loading: false,
+            crashed: false,
+        }
+    }
+
+    #[test]
+    fn reorders_tabs_within_their_window() {
+        let mut tabs = vec![tab(1, 7), tab(2, 7), tab(3, 7)];
+
+        assert_eq!(relocate_tab(&mut tabs, 1, 7, Some(2)).unwrap(), 7);
+        assert_eq!(
+            tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+    }
+
+    #[test]
+    fn appends_a_moved_tab_to_the_target_window() {
+        let mut tabs = vec![tab(1, 7), tab(2, 7), tab(3, 9)];
+
+        assert_eq!(relocate_tab(&mut tabs, 2, 9, None).unwrap(), 7);
+        assert_eq!(
+            tabs.iter()
+                .filter(|tab| tab.window_id == 7)
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(
+            tabs.iter()
+                .filter(|tab| tab.window_id == 9)
+                .map(|tab| tab.id)
+                .collect::<Vec<_>>(),
+            vec![3, 2]
+        );
     }
 
     #[test]

@@ -153,6 +153,7 @@ impl Backend {
         label: String,
         visible: bool,
         focused: bool,
+        create_initial_tab: bool,
     ) {
         let Ok(window_id) = window_id.parse::<u64>() else {
             return;
@@ -191,6 +192,7 @@ impl Backend {
                     bounds,
                     label,
                     initial_url: self.url.clone(),
+                    create_initial_tab,
                 });
             } else if self.window_bounds.get(&window_id) != Some(&bounds) {
                 let _ = controller.send(TabCommand::Layout(window_id, bounds));
@@ -274,7 +276,30 @@ impl Backend {
             tab_id.parse::<u64>(),
             target_window_id.parse::<u64>(),
         ) {
-            let _ = controller.send(TabCommand::Move(tab_id, target_window_id));
+            let _ = controller.send(TabCommand::Move {
+                tab: tab_id,
+                window: target_window_id,
+                target_index: None,
+            });
+        }
+    }
+
+    #[qslot]
+    fn reorder_tab(&mut self, window_id: String, tab_id: String, target_index: i32) {
+        if target_index < 0 {
+            return;
+        }
+        if let (Some(controller), Ok(window_id), Ok(tab_id), Ok(target_index)) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            tab_id.parse::<u64>(),
+            usize::try_from(target_index),
+        ) {
+            let _ = controller.send(TabCommand::Move {
+                tab: tab_id,
+                window: window_id,
+                target_index: Some(target_index),
+            });
         }
     }
 
@@ -562,6 +587,11 @@ fn main() {
     if std::env::var_os("QT_XCB_GL_INTEGRATION").is_none() {
         unsafe {
             std::env::set_var("QT_XCB_GL_INTEGRATION", "xcb_egl");
+        }
+    }
+    if std::env::var_os("QT_QUICK_CONTROLS_STYLE").is_none() {
+        unsafe {
+            std::env::set_var("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop");
         }
     }
     unsafe {

@@ -45,7 +45,7 @@ Linux Firefox links its allocator glue into the launcher rather than shipping it
 
 - Linux desktop with an X11 display server, EGL, OpenGL, and DMA-BUF import support
 - Rust with Edition 2024 support
-- Qt 6.10 or newer Base and Declarative development files
+- Qt 6.10 or newer Base and Declarative development files, plus KDE's desktop Qt Quick Controls style
 - Enough disk and memory for a full Chromium/CEF build
 - Firefox build prerequisites and enough space for a full Firefox object tree
 - `pkg-config`, protobuf, a C/C++ toolchain, Python, PyGObject, Pillow, AT-SPI, `xdotool`, Node.js, and the Firefox-provided build toolchains
@@ -53,7 +53,7 @@ Linux Firefox links its allocator glue into the launcher rather than shipping it
 On Arch Linux, the core host packages can be installed with:
 
 ```sh
-paru -S --needed at-spi2-core base-devel libx11 libdrm mesa mesa-utils pkgconf protobuf python-gobject python-pillow qt6-base qt6-declarative xdotool xorg-xdpyinfo
+paru -S --needed at-spi2-core base-devel libx11 libdrm mesa mesa-utils pkgconf protobuf python-gobject python-pillow qqc2-desktop-style qt6-base qt6-declarative xdotool xorg-xdpyinfo
 ```
 
 If Firefox's build reports another missing prerequisite, run `./mach bootstrap` in the pinned `firefox` submodule and select the desktop Firefox build environment.
@@ -83,7 +83,7 @@ Run the application:
 cargo run -p deb
 ```
 
-It opens `deb://new-tab/` in a Chromium tab. Create Chromium or Firefox tabs with the two add-tab buttons, switch tabs with their buttons or `Ctrl+Tab` / `Ctrl+Shift+Tab`, use the engine picker to reload the current URL in the other engine, open another top-level window with **New window**, and move a live tab between windows from **Move tab**. Windows belonging to the same profile share its controller and helper pair. Use **Add profile** to create another isolated workspace in the same running application.
+It opens `deb://new-tab/` in a Chromium tab. The KDE-styled tab strip follows Konsole's desktop behavior: drag tabs to reorder them or move them between windows, drag outside every deb window or use the tab menu to detach one, middle-click or use the per-tab close button to close one, and use the new-tab menu to choose Chromium or Firefox. `Ctrl+Tab` / `Ctrl+Shift+Tab` and `Ctrl+PgDown` / `Ctrl+PgUp` cycle tabs, `Ctrl+Shift+T` opens another tab with the active engine, and `Ctrl+W` closes the active tab. The engine picker reloads the current URL in the other engine. Windows belonging to the same profile share its controller and helper pair. Use **Add profile** to create another isolated workspace in the same running application.
 
 ## Profiles and XDG storage
 
@@ -165,7 +165,7 @@ For the normal inner loop after changing Rust, QML, or the adapter, run:
 scripts/smoke-test.sh
 ```
 
-This requires native Xorg with hardware-accelerated OpenGL; it rejects XWayland and software renderers because those paths cannot prove the supported DMA-BUF presentation path. It performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches the unmodified `deb` application with isolated temporary XDG directories. An external driver locates production controls by their Qt accessibility IDs over AT-SPI and sends real mouse and keyboard input through XTEST. It waits for both engines' initial loads, navigates both through the address field, and physically clicks a fixed target inside each browser surface. The page accepts only a trusted DOM event and must change both its title and a large screen marker before the test continues. The localhost page also sets a cookie in Chromium, and the Firefox page must visibly confirm that it arrived through deb's synchronization path. The driver switches tabs through their real buttons and through both `Ctrl+Tab` directions, requiring the active URL, engine status, and engine-specific final-screen marker after every switch. It also proves that real Qt tooltips compose over each engine, opens a second production window, and moves the live Firefox tab into it. Both engines' navigated, retained, and moved DMA-BUF frames must contain the page marker and nontrivial pixels; both engine-native profile/cache trees and the canonical SQLite cookie store must also exist. Failures preserve a screenshot, accessibility-tree dump, driver log, and application log in the reported temporary directory.
+This requires native Xorg with hardware-accelerated OpenGL; it rejects XWayland and software renderers because those paths cannot prove the supported DMA-BUF presentation path. It performs an incremental workspace build, atomically restages the Rust helper and Gecko-backed `libcef.so`, and launches the unmodified `deb` application with isolated temporary XDG directories. An external driver locates production controls by their Qt accessibility IDs over AT-SPI and sends real mouse and keyboard input through XTEST. It waits for both engines' initial loads, navigates both through the address field, and physically clicks a fixed target inside each browser surface. The page accepts only a trusted DOM event and must change both its title and a large screen marker before the test continues. The localhost page also sets a cookie in Chromium, and the Firefox page must visibly confirm that it arrived through deb's synchronization path. The driver switches tabs through their real buttons and through both `Ctrl+Tab` directions, requires the active URL, engine status, and engine-specific final-screen marker after every switch, reorders tabs with a pointer drag, drags a live Firefox tab into a second production window, closes the other tab with a middle click, and detaches Firefox into a third placeholder-free window through its tab menu. It also proves that real Qt tooltips compose over each engine. Both engines' navigated, retained, moved, and detached DMA-BUF frames must contain the page marker and nontrivial pixels; both engine-native profile/cache trees and the canonical SQLite cookie store must also exist. Failures preserve a screenshot, accessibility-tree dump, driver log, and application log in the reported temporary directory.
 
 `scripts/build-firefox-cef.sh` runs the same smoke test automatically after either a full Gecko build or a cached Rust-only rebuild. `scripts/smoke-test.sh --no-build` is available when the binaries and staged runtime are already current.
 

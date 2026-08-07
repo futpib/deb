@@ -1,8 +1,9 @@
 pragma ComponentBehavior: Bound
 
 import QtQuick
-import QtQuick.Controls.Fusion
+import QtQuick.Controls
 import QtQuick.Layouts
+import QtQuick.Window
 import deb
 import deb_native
 
@@ -30,16 +31,43 @@ ApplicationWindow {
         return String(nextViewId++)
     }
 
-    function openDetachedWindow(backendObject, profileId, profileName) {
+    function openDetachedWindow(backendObject, profileId, profileName, tabId) {
         const browserWindow = detachedWindowComponent.createObject(root, {
             "backendObject": backendObject,
             "profileId": profileId,
             "profileName": profileName,
-            "viewId": allocateViewId()
+            "viewId": allocateViewId(),
+            "adoptTabId": tabId ?? ""
         })
         detachedWindows = detachedWindows.concat([browserWindow])
         browserWindow.show()
         return browserWindow
+    }
+
+    function containsGlobalPoint(windowObject, globalPoint) {
+        return windowObject.visible
+            && globalPoint.x >= windowObject.x
+            && globalPoint.y >= windowObject.y
+            && globalPoint.x < windowObject.x + windowObject.width
+            && globalPoint.y < windowObject.y + windowObject.height
+    }
+
+    function windowTargetAt(backendObject, globalPoint) {
+        for (const browserWindow of detachedWindows) {
+            if (browserWindow.backendObject === backendObject
+                    && containsGlobalPoint(browserWindow, globalPoint)) {
+                return browserWindow.viewId
+            }
+        }
+        if (containsGlobalPoint(root, globalPoint)) {
+            for (let index = 0; index < profileRepeater.count; ++index) {
+                const workspace = profileRepeater.itemAt(index)
+                if (workspace.visible && workspace.backendObject === backendObject) {
+                    return workspace.viewId
+                }
+            }
+        }
+        return ""
     }
 
     function releaseDetachedWindow(browserWindow) {
@@ -173,6 +201,7 @@ ApplicationWindow {
             required property string profileId
             required property string profileName
             required property string viewId
+            required property string adoptTabId
             objectName: `window.${viewId}`
             width: 1280
             height: 760
@@ -190,6 +219,7 @@ ApplicationWindow {
                 windowLabel: detachedWindow.title
                 viewVisible: detachedWindow.visible
                 viewFocused: detachedWindow.active
+                adoptTabId: detachedWindow.adoptTabId
             }
 
             onClosing: function(close) {
@@ -218,6 +248,7 @@ ApplicationWindow {
         readonly property string profileId: profilesModel.get(index).profileId
         readonly property string profileName: profilesModel.get(index).profileName
         readonly property string viewId: profilesModel.get(index).profileViewId
+        readonly property var backendObject: backend
         Backend {
             id: backend
             profileId: workspace.profileId
@@ -232,6 +263,7 @@ ApplicationWindow {
             windowLabel: `${workspace.profileName} · main window`
             viewVisible: workspace.visible && root.visible
             viewFocused: root.active && workspace.visible
+            adoptTabId: ""
         }
 
         function stop() {
@@ -239,6 +271,350 @@ ApplicationWindow {
         }
 
         Component.onDestruction: stop()
+    }
+
+    component BrowserTabStrip: Frame {
+        id: tabStripControl
+        required property var host
+        required property var tabsModel
+        required property var moveTargetsModel
+        padding: 0
+        implicitHeight: 38
+
+        function indexAtGlobal(globalPoint) {
+            const local = tabList.mapFromGlobal(globalPoint.x, globalPoint.y)
+            if (local.x < 0 || local.y < 0 || local.x >= tabList.width
+                    || local.y >= tabList.height || tabsModel.count === 0) {
+                return -1
+            }
+            const index = tabList.indexAt(
+                local.x + tabList.contentX,
+                local.y + tabList.contentY
+            )
+            return index >= 0 ? index : tabsModel.count - 1
+        }
+
+        background: Rectangle {
+            color: tabStripControl.palette.window
+            border.color: tabStripControl.palette.mid
+        }
+
+        contentItem: RowLayout {
+            spacing: 0
+
+            ToolButton {
+                objectName: `browser.new.default.${tabStripControl.host.viewId}`
+                Accessible.id: objectName
+                Accessible.name: "Open a new tab"
+                icon.name: "tab-new"
+                text: "+"
+                display: AbstractButton.IconOnly
+                Layout.fillHeight: true
+                ToolTip.visible: hovered
+                ToolTip.text: `Open a new ${tabStripControl.host.activeEngine()} tab`
+                onClicked: tabStripControl.host.backendObject.new_tab(
+                    tabStripControl.host.viewId,
+                    tabStripControl.host.activeEngine()
+                )
+            }
+
+            ToolButton {
+                objectName: `browser.new-menu.${tabStripControl.host.viewId}`
+                Accessible.id: objectName
+                Accessible.name: "Choose new tab engine"
+                text: "▾"
+                Layout.fillHeight: true
+                Layout.preferredWidth: 22
+                onClicked: newTabMenu.open()
+
+                Menu {
+                    id: newTabMenu
+
+                    MenuItem {
+                        objectName: `browser.new.chromium.${tabStripControl.host.viewId}`
+                        Accessible.id: objectName
+                        Accessible.name: text
+                        text: "New Chromium Tab"
+                        icon.name: "tab-new"
+                        onTriggered: tabStripControl.host.backendObject.new_tab(
+                            tabStripControl.host.viewId, "chromium"
+                        )
+                    }
+
+                    MenuItem {
+                        objectName: `browser.new.firefox.${tabStripControl.host.viewId}`
+                        Accessible.id: objectName
+                        Accessible.name: text
+                        text: "New Firefox Tab"
+                        icon.name: "tab-new"
+                        onTriggered: tabStripControl.host.backendObject.new_tab(
+                            tabStripControl.host.viewId, "firefox"
+                        )
+                    }
+                }
+            }
+
+            ListView {
+                id: tabList
+                objectName: `browser.tabs.${tabStripControl.host.viewId}`
+                Accessible.id: objectName
+                Accessible.role: Accessible.PageTabList
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                orientation: ListView.Horizontal
+                boundsBehavior: Flickable.StopAtBounds
+                clip: true
+                model: tabStripControl.tabsModel
+
+                TapHandler {
+                    acceptedButtons: Qt.LeftButton
+                    onDoubleTapped: function(eventPoint) {
+                        const index = tabList.indexAt(
+                            eventPoint.position.x + tabList.contentX,
+                            eventPoint.position.y + tabList.contentY
+                        )
+                        if (index < 0) {
+                            tabStripControl.host.backendObject.new_tab(
+                                tabStripControl.host.viewId,
+                                tabStripControl.host.activeEngine()
+                            )
+                        }
+                    }
+                }
+
+                delegate: TabButton {
+                    id: tabDelegate
+                    required property int index
+                    required property string tabId
+                    required property string engine
+                    required property string tabUrl
+                    required property string tabTitle
+                    required property string tabStatus
+                    required property bool loading
+                    required property bool crashed
+                    property bool dragStarted: false
+                    objectName: `browser.tab.${tabStripControl.host.profileId}.${tabId}`
+                    Accessible.id: objectName
+                    Accessible.name: tabTitle || tabUrl
+                    Accessible.description: `${engine} tab at ${tabUrl}`
+                    Accessible.selected: checked
+                    checked: tabId === tabStripControl.host.activeTabId
+                    width: Math.max(
+                        150,
+                        Math.min(260, tabList.width / Math.max(1, tabStripControl.tabsModel.count))
+                    )
+                    height: tabList.height
+                    z: tabDrag.active ? 2 : 0
+                    onClicked: tabStripControl.host.requestTabSelection(tabId)
+
+                    contentItem: RowLayout {
+                        spacing: 5
+
+                        Label {
+                            text: tabDelegate.crashed
+                                ? "!"
+                                : tabDelegate.loading
+                                    ? "↻"
+                                    : tabDelegate.engine === "firefox" ? "F" : "C"
+                            color: tabDelegate.crashed
+                                ? tabDelegate.palette.brightText
+                                : tabDelegate.palette.buttonText
+                            font.bold: true
+                            horizontalAlignment: Text.AlignHCenter
+                            Layout.preferredWidth: 14
+                        }
+
+                        Label {
+                            text: tabDelegate.tabTitle || tabDelegate.tabUrl
+                            color: tabDelegate.palette.buttonText
+                            elide: Text.ElideLeft
+                            verticalAlignment: Text.AlignVCenter
+                            Layout.fillWidth: true
+                        }
+
+                        ToolButton {
+                            objectName: `browser.tab-close.${tabStripControl.host.profileId}.${tabDelegate.tabId}`
+                            Accessible.id: objectName
+                            Accessible.name: `Close ${tabDelegate.tabTitle || tabDelegate.tabUrl}`
+                            icon.name: "tab-close"
+                            text: "×"
+                            display: AbstractButton.IconOnly
+                            flat: true
+                            implicitWidth: 24
+                            implicitHeight: 24
+                            onClicked: tabStripControl.host.backendObject.close_tab(tabDelegate.tabId)
+                        }
+                    }
+
+                    transform: Translate {
+                        x: tabDrag.active ? tabDrag.translation.x : 0
+                        y: tabDrag.active ? tabDrag.translation.y : 0
+                    }
+
+                    DragHandler {
+                        id: tabDrag
+                        target: null
+                        acceptedButtons: Qt.LeftButton
+
+                        onActiveChanged: {
+                            if (active) {
+                                tabDelegate.dragStarted = true
+                            } else if (tabDelegate.dragStarted) {
+                                tabDelegate.dragStarted = false
+                                const sourceWindow = tabDelegate.Window.window
+                                const globalPoint = sourceWindow.contentItem.mapToGlobal(
+                                    centroid.scenePosition.x,
+                                    centroid.scenePosition.y
+                                )
+                                tabStripControl.host.finishTabDrag(tabDelegate.tabId, globalPoint)
+                            }
+                        }
+                    }
+
+                    TapHandler {
+                        acceptedButtons: Qt.MiddleButton
+                        onTapped: tabStripControl.host.backendObject.close_tab(tabDelegate.tabId)
+                    }
+
+                    TapHandler {
+                        acceptedButtons: Qt.RightButton
+                        onTapped: tabMenu.popup()
+                    }
+
+                    ToolTip.visible: tabDelegate.hovered && !tabDrag.active
+                    ToolTip.text: `${tabDelegate.tabUrl}\n${tabDelegate.tabStatus}`
+
+                    Menu {
+                        id: tabMenu
+
+                        MenuItem {
+                            text: "Reload Tab"
+                            icon.name: "view-refresh"
+                            onTriggered: {
+                                tabStripControl.host.requestTabSelection(tabDelegate.tabId)
+                                Qt.callLater(function() {
+                                    tabStripControl.host.backendObject.reload(tabStripControl.host.viewId)
+                                })
+                            }
+                        }
+
+                        Menu {
+                            title: "Open With Engine"
+
+                            MenuItem {
+                                text: "Chromium"
+                                checkable: true
+                                checked: tabDelegate.engine === "chromium"
+                                onTriggered: tabStripControl.host.backendObject.switch_engine(
+                                    tabDelegate.tabId, "chromium"
+                                )
+                            }
+
+                            MenuItem {
+                                text: "Firefox"
+                                checkable: true
+                                checked: tabDelegate.engine === "firefox"
+                                onTriggered: tabStripControl.host.backendObject.switch_engine(
+                                    tabDelegate.tabId, "firefox"
+                                )
+                            }
+                        }
+
+                        Menu {
+                            objectName: `browser.move-menu.${tabStripControl.host.profileId}.${tabDelegate.tabId}`
+                            title: "Move Tab To Window"
+                            enabled: tabStripControl.moveTargetsModel.count > 0
+
+                            Repeater {
+                                model: tabStripControl.moveTargetsModel
+
+                                MenuItem {
+                                    required property string targetId
+                                    required property string targetLabel
+                                    objectName: `browser.move-target.${targetId}`
+                                    Accessible.id: objectName
+                                    Accessible.name: `Move tab to ${targetLabel}`
+                                    text: targetLabel
+                                    onTriggered: tabStripControl.host.backendObject.move_tab(
+                                        tabDelegate.tabId, targetId
+                                    )
+                                }
+                            }
+                        }
+
+                        MenuItem {
+                            objectName: `browser.detach.${tabStripControl.host.profileId}.${tabDelegate.tabId}`
+                            Accessible.id: objectName
+                            Accessible.name: text
+                            text: "Detach Tab"
+                            icon.name: "tab-detach"
+                            onTriggered: tabStripControl.host.detachTab(tabDelegate.tabId)
+                        }
+
+                        MenuSeparator {
+                        }
+
+                        MenuItem {
+                            text: "Close Tab"
+                            icon.name: "tab-close"
+                            onTriggered: tabStripControl.host.backendObject.close_tab(tabDelegate.tabId)
+                        }
+                    }
+                }
+
+                ScrollIndicator.horizontal: ScrollIndicator {
+                }
+            }
+
+            ToolButton {
+                objectName: `browser.search-tabs.${tabStripControl.host.viewId}`
+                Accessible.id: objectName
+                Accessible.name: "Search tabs"
+                icon.name: "quickopen"
+                text: "⌄"
+                display: AbstractButton.IconOnly
+                Layout.fillHeight: true
+                enabled: tabStripControl.tabsModel.count > 0
+                ToolTip.visible: hovered
+                ToolTip.text: "List all tabs"
+                onClicked: tabsMenu.open()
+
+                Menu {
+                    id: tabsMenu
+
+                    Repeater {
+                        model: tabStripControl.tabsModel
+
+                        MenuItem {
+                            required property string tabId
+                            required property string engine
+                            required property string tabUrl
+                            required property string tabTitle
+                            text: `${engine === "firefox" ? "F" : "C"}  ${tabTitle || tabUrl}`
+                            checkable: true
+                            checked: tabId === tabStripControl.host.activeTabId
+                            onTriggered: tabStripControl.host.requestTabSelection(tabId)
+                        }
+                    }
+                }
+            }
+
+            ToolButton {
+                objectName: `browser.close.${tabStripControl.host.viewId}`
+                Accessible.id: objectName
+                Accessible.name: "Close this tab"
+                icon.name: "tab-close"
+                text: "×"
+                display: AbstractButton.IconOnly
+                Layout.fillHeight: true
+                enabled: tabStripControl.host.activeTabId.length > 0
+                ToolTip.visible: hovered
+                ToolTip.text: "Close this tab"
+                onClicked: tabStripControl.host.backendObject.close_tab(
+                    tabStripControl.host.activeTabId
+                )
+            }
+        }
     }
 
     component BrowserView: Item {
@@ -250,6 +626,7 @@ ApplicationWindow {
         required property string windowLabel
         required property bool viewVisible
         required property bool viewFocused
+        required property string adoptTabId
         property bool rebuildingTabs: false
         property bool registered: false
         property string activeTabId: ""
@@ -285,6 +662,125 @@ ApplicationWindow {
             requestTabSelection(tabsModel.get(targetIndex).tabId)
         }
 
+        function activeEngine() {
+            for (let index = 0; index < tabsModel.count; ++index) {
+                const tab = tabsModel.get(index)
+                if (tab.tabId === activeTabId) {
+                    return tab.engine
+                }
+            }
+            return "chromium"
+        }
+
+        function findTabIndex(tabId) {
+            for (let index = 0; index < tabsModel.count; ++index) {
+                if (tabsModel.get(index).tabId === tabId) {
+                    return index
+                }
+            }
+            return -1
+        }
+
+        function updateTab(index, tab) {
+            const roles = {
+                "engine": tab.engine,
+                "tabUrl": tab.url,
+                "tabTitle": tab.title,
+                "tabStatus": tab.status,
+                "loading": tab.loading,
+                "crashed": tab.crashed
+            }
+            for (const role of Object.keys(roles)) {
+                if (tabsModel.get(index)[role] !== roles[role]) {
+                    tabsModel.setProperty(index, role, roles[role])
+                }
+            }
+        }
+
+        function reconcileTabs(tabs) {
+            for (let targetIndex = 0; targetIndex < tabs.length; ++targetIndex) {
+                const tab = tabs[targetIndex]
+                let currentIndex = findTabIndex(tab.id)
+                if (currentIndex < 0) {
+                    tabsModel.insert(targetIndex, {
+                        "tabId": tab.id,
+                        "engine": tab.engine,
+                        "tabUrl": tab.url,
+                        "tabTitle": tab.title,
+                        "tabStatus": tab.status,
+                        "loading": tab.loading,
+                        "crashed": tab.crashed
+                    })
+                    currentIndex = targetIndex
+                } else if (currentIndex !== targetIndex) {
+                    tabsModel.move(currentIndex, targetIndex, 1)
+                    currentIndex = targetIndex
+                }
+                updateTab(currentIndex, tab)
+            }
+            while (tabsModel.count > tabs.length) {
+                tabsModel.remove(tabsModel.count - 1)
+            }
+        }
+
+        function reconcileMoveTargets(windows) {
+            const targets = windows.filter(candidate => candidate.id !== viewId)
+            for (let targetIndex = 0; targetIndex < targets.length; ++targetIndex) {
+                const target = targets[targetIndex]
+                let currentIndex = -1
+                for (let index = 0; index < moveTargetsModel.count; ++index) {
+                    if (moveTargetsModel.get(index).targetId === target.id) {
+                        currentIndex = index
+                        break
+                    }
+                }
+                if (currentIndex < 0) {
+                    moveTargetsModel.insert(targetIndex, {
+                        "targetId": target.id,
+                        "targetLabel": target.label
+                    })
+                } else {
+                    if (currentIndex !== targetIndex) {
+                        moveTargetsModel.move(currentIndex, targetIndex, 1)
+                    }
+                    if (moveTargetsModel.get(targetIndex).targetLabel !== target.label) {
+                        moveTargetsModel.setProperty(targetIndex, "targetLabel", target.label)
+                    }
+                }
+            }
+            while (moveTargetsModel.count > targets.length) {
+                moveTargetsModel.remove(moveTargetsModel.count - 1)
+            }
+        }
+
+        function reorderTab(tabId, targetIndex) {
+            const currentIndex = findTabIndex(tabId)
+            if (currentIndex < 0 || targetIndex < 0 || targetIndex >= tabsModel.count
+                    || currentIndex === targetIndex) {
+                return
+            }
+            tabsModel.move(currentIndex, targetIndex, 1)
+            backendObject.reorder_tab(viewId, tabId, targetIndex)
+        }
+
+        function detachTab(tabId) {
+            root.openDetachedWindow(backendObject, profileId, profileName, tabId)
+        }
+
+        function finishTabDrag(tabId, globalPoint) {
+            const targetWindow = root.windowTargetAt(backendObject, globalPoint)
+            if (targetWindow === viewId) {
+                const targetIndex = tabStrip.indexAtGlobal(globalPoint)
+                if (targetIndex >= 0) {
+                    reorderTab(tabId, targetIndex)
+                }
+            } else if (targetWindow.length > 0) {
+                backendObject.move_tab(tabId, targetWindow)
+            } else {
+                detachTab(tabId)
+            }
+        }
+
         ListModel {
             id: tabsModel
         }
@@ -307,6 +803,36 @@ ApplicationWindow {
             onActivated: browserView.selectRelativeTab(-1)
         }
 
+        Shortcut {
+            sequence: "Ctrl+PgDown"
+            context: Qt.WindowShortcut
+            enabled: browserView.viewVisible && tabsModel.count > 1
+            onActivated: browserView.selectRelativeTab(1)
+        }
+
+        Shortcut {
+            sequence: "Ctrl+PgUp"
+            context: Qt.WindowShortcut
+            enabled: browserView.viewVisible && tabsModel.count > 1
+            onActivated: browserView.selectRelativeTab(-1)
+        }
+
+        Shortcut {
+            sequence: "Ctrl+Shift+T"
+            context: Qt.WindowShortcut
+            enabled: browserView.viewVisible
+            onActivated: browserView.backendObject.new_tab(
+                browserView.viewId, browserView.activeEngine()
+            )
+        }
+
+        Shortcut {
+            sequence: "Ctrl+W"
+            context: Qt.WindowShortcut
+            enabled: browserView.viewVisible && browserView.activeTabId.length > 0
+            onActivated: browserView.backendObject.close_tab(browserView.activeTabId)
+        }
+
         Connections {
             target: browserView.backendObject
 
@@ -320,35 +846,19 @@ ApplicationWindow {
             const windows = state.windows ?? []
             const ownWindow = windows.find(candidate => candidate.id === viewId)
             rebuildingTabs = true
-            tabsModel.clear()
-            moveTargetsModel.clear()
-            for (const candidate of windows) {
-                if (candidate.id !== viewId) {
-                    moveTargetsModel.append({
-                        "targetId": candidate.id,
-                        "targetLabel": candidate.label
-                    })
-                }
-            }
+            reconcileMoveTargets(windows)
             if (ownWindow === undefined) {
                 activeTabId = ""
                 currentUrl = ""
+                reconcileTabs([])
                 rebuildingTabs = false
                 return
             }
             activeTabId = ownWindow.activeTabId
+            reconcileTabs(ownWindow.tabs)
             let activeIndex = -1
             for (let tabIndex = 0; tabIndex < ownWindow.tabs.length; ++tabIndex) {
                 const tab = ownWindow.tabs[tabIndex]
-                tabsModel.append({
-                    "tabId": tab.id,
-                    "engine": tab.engine,
-                    "tabUrl": tab.url,
-                    "tabTitle": tab.title,
-                    "tabStatus": tab.status,
-                    "loading": tab.loading,
-                    "crashed": tab.crashed
-                })
                 if (tab.id === activeTabId) {
                     activeIndex = tabIndex
                     currentUrl = tab.url
@@ -356,8 +866,10 @@ ApplicationWindow {
                 }
             }
             if (activeIndex >= 0) {
-                browserTabs.currentIndex = activeIndex
                 enginePicker.currentIndex = tabsModel.get(activeIndex).engine === "firefox" ? 1 : 0
+            } else {
+                currentUrl = ""
+                currentStatus = "Waiting for a tab…"
             }
             rebuildingTabs = false
         }
@@ -367,6 +879,7 @@ ApplicationWindow {
                 return
             }
             const globalOrigin = nativeSurface.mapToGlobal(1, 1)
+            const firstRegistration = !registered
             backendObject.sync_geometry(
                 viewId,
                 browserSurface.nativeParentWindow,
@@ -376,9 +889,14 @@ ApplicationWindow {
                 Math.round(nativeSurface.height),
                 windowLabel,
                 viewVisible,
-                viewFocused
+                viewFocused,
+                adoptTabId.length === 0
             )
             registered = true
+            if (firstRegistration && adoptTabId.length > 0) {
+                backendObject.move_tab(adoptTabId, viewId)
+                adoptTabId = ""
+            }
         }
 
         ColumnLayout {
@@ -394,54 +912,12 @@ ApplicationWindow {
                     anchors.rightMargin: 10
                     spacing: 4
 
-                    RowLayout {
+                    BrowserTabStrip {
+                        id: tabStrip
                         Layout.fillWidth: true
-                        spacing: 4
-
-                        TabBar {
-                            id: browserTabs
-                            objectName: `browser.tabs.${browserView.viewId}`
-                            Accessible.id: objectName
-                            Layout.fillWidth: true
-
-                            Repeater {
-                                model: tabsModel
-
-                                TabButton {
-                                    required property string tabId
-                                    required property string engine
-                                    required property string tabUrl
-                                    required property string tabTitle
-                                    required property string tabStatus
-                                    objectName: `browser.tab.${browserView.profileId}.${tabId}`
-                                    Accessible.id: objectName
-                                    Accessible.name: tabTitle || tabUrl
-                                    Accessible.description: `${engine} tab at ${tabUrl}`
-                                    Accessible.selected: checked
-                                    text: `${engine === "firefox" ? "🦊" : "◉"} ${tabTitle || tabUrl}`
-                                    width: Math.max(150, Math.min(260, implicitWidth))
-                                    ToolTip.visible: hovered
-                                    ToolTip.text: `${tabUrl}\n${tabStatus}`
-                                    onClicked: browserView.requestTabSelection(tabId)
-                                }
-                            }
-                        }
-
-                        Button {
-                            objectName: `browser.new.chromium.${browserView.viewId}`
-                            Accessible.id: objectName
-                            Accessible.name: "New Chromium tab"
-                            text: "+ Chromium"
-                            onClicked: browserView.backendObject.new_tab(browserView.viewId, "chromium")
-                        }
-
-                        Button {
-                            objectName: `browser.new.firefox.${browserView.viewId}`
-                            Accessible.id: objectName
-                            Accessible.name: "New Firefox tab"
-                            text: "+ Firefox"
-                            onClicked: browserView.backendObject.new_tab(browserView.viewId, "firefox")
-                        }
+                        host: browserView
+                        tabsModel: tabsModel
+                        moveTargetsModel: moveTargetsModel
                     }
 
                     RowLayout {
@@ -494,15 +970,6 @@ ApplicationWindow {
                         }
 
                         Button {
-                            objectName: `browser.close.${browserView.viewId}`
-                            Accessible.id: objectName
-                            Accessible.name: text
-                            text: "Close tab"
-                            enabled: browserView.activeTabId.length > 0
-                            onClicked: browserView.backendObject.close_tab(browserView.activeTabId)
-                        }
-
-                        Button {
                             objectName: `browser.new-window.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.name: text
@@ -512,37 +979,6 @@ ApplicationWindow {
                                 browserView.profileId,
                                 browserView.profileName
                             )
-                        }
-
-                        Button {
-                            id: moveButton
-                            objectName: `browser.move.${browserView.viewId}`
-                            Accessible.id: objectName
-                            Accessible.name: text
-                            text: "Move tab"
-                            enabled: browserView.activeTabId.length > 0 && moveTargetsModel.count > 0
-                            onClicked: moveMenu.open()
-
-                            Menu {
-                                id: moveMenu
-
-                                Repeater {
-                                    model: moveTargetsModel
-
-                                    MenuItem {
-                                        required property string targetId
-                                        required property string targetLabel
-                                        objectName: `browser.move-target.${targetId}`
-                                        Accessible.id: objectName
-                                        Accessible.name: `Move tab to ${targetLabel}`
-                                        text: targetLabel
-                                        onTriggered: browserView.backendObject.move_tab(
-                                            browserView.activeTabId,
-                                            targetId
-                                        )
-                                    }
-                                }
-                            }
                         }
 
                         Label {
