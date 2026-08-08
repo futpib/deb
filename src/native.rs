@@ -364,6 +364,24 @@ impl CefInstance {
         Ok(())
     }
 
+    fn send_browser_input(
+        &mut self,
+        browser_id: u64,
+        operation: wire::request::Operation,
+        description: &'static str,
+    ) -> NativeResult<()> {
+        if self.ready_browsers.contains(&browser_id) {
+            self.transport
+                .send(&request_packet(0, browser_id, operation))?;
+        } else {
+            self.deferred_browser_requests
+                .entry(browser_id)
+                .or_default()
+                .push_back((operation, description));
+        }
+        Ok(())
+    }
+
     fn send_process_request(
         &mut self,
         operation: wire::request::Operation,
@@ -460,7 +478,7 @@ impl CefInstance {
         modifiers: u32,
         leaving: bool,
     ) -> NativeResult<()> {
-        self.send_browser_request(
+        self.send_browser_input(
             browser_id,
             wire::request::Operation::MouseMove(wire::MouseMove {
                 x,
@@ -483,7 +501,7 @@ impl CefInstance {
         mouse_up: bool,
         click_count: u32,
     ) -> NativeResult<()> {
-        self.send_browser_request(
+        self.send_browser_input(
             browser_id,
             wire::request::Operation::MouseClick(wire::MouseClick {
                 x,
@@ -506,7 +524,7 @@ impl CefInstance {
         delta_x: i32,
         delta_y: i32,
     ) -> NativeResult<()> {
-        self.send_browser_request(
+        self.send_browser_input(
             browser_id,
             wire::request::Operation::MouseWheel(wire::MouseWheel {
                 x,
@@ -524,10 +542,22 @@ impl CefInstance {
         browser_id: u64,
         event: wire::KeyEvent,
     ) -> NativeResult<()> {
-        self.send_browser_request(
+        self.send_browser_input(
             browser_id,
             wire::request::Operation::KeyEvent(event),
             "key event",
+        )
+    }
+
+    pub(crate) fn send_touch_event(
+        &mut self,
+        browser_id: u64,
+        event: wire::TouchEvent,
+    ) -> NativeResult<()> {
+        self.send_browser_input(
+            browser_id,
+            wire::request::Operation::TouchEvent(event),
+            "touch event",
         )
     }
 
@@ -1276,6 +1306,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::PointerInput,
         Capability::KeyboardInput,
         Capability::CursorEvents,
+        Capability::TouchInput,
     ]
     .into_iter()
     .map(|capability| capability as i32)

@@ -10,20 +10,22 @@ use qtbridge::{QmlMethodInvoker, invoke_method};
 use serde::Serialize;
 use shell_protocol::wire;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
+    fmt,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        mpsc::RecvTimeoutError,
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use x11rb::{protocol::xproto::Window, rust_connection::RustConnection};
 
 type TabResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 static NEXT_BROWSER_ID: AtomicU64 = AtomicU64::new(1);
+const COMMAND_QUEUE_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -113,6 +115,10 @@ pub enum TabCommand {
         window_id: u64,
         event: wire::KeyEvent,
     },
+    TouchEvent {
+        window_id: u64,
+        event: wire::TouchEvent,
+    },
     Stop,
 }
 
@@ -134,19 +140,223 @@ impl TabCommand {
             Self::MouseClick { .. } => "mouse-click",
             Self::MouseWheel { .. } => "mouse-wheel",
             Self::KeyEvent { .. } => "key-event",
+            Self::TouchEvent { .. } => "touch-event",
             Self::Stop => "stop",
         }
     }
 }
 
+struct CommandQueueState {
+    commands: VecDeque<TabCommand>,
+    receiver_alive: bool,
+}
+
+struct CommandQueue {
+    state: Mutex<CommandQueueState>,
+    ready: Condvar,
+}
+
+struct CommandSender {
+    queue: Arc<CommandQueue>,
+}
+
+struct CommandReceiver {
+    queue: Arc<CommandQueue>,
+}
+
+#[derive(Debug)]
+pub struct CommandSendError;
+
+impl fmt::Display for CommandSendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("tab controller stopped")
+    }
+}
+
+impl Error for CommandSendError {}
+
+fn is_coalescible(command: &TabCommand) -> bool {
+    match command {
+        TabCommand::MouseMove { leaving, .. } => !leaving,
+        TabCommand::MouseWheel { .. } => true,
+        TabCommand::TouchEvent { event, .. } => {
+            event.event_type == wire::TouchEventType::Moved as i32
+        }
+        _ => false,
+    }
+}
+
+fn coalesce_command(queued: &mut TabCommand, incoming: &TabCommand) -> bool {
+    match (queued, incoming) {
+        (
+            TabCommand::MouseMove {
+                window_id: queued_window,
+                x: queued_x,
+                y: queued_y,
+                modifiers: queued_modifiers,
+                leaving: false,
+            },
+            TabCommand::MouseMove {
+                window_id,
+                x,
+                y,
+                modifiers,
+                leaving: false,
+            },
+        ) if queued_window == window_id => {
+            *queued_x = *x;
+            *queued_y = *y;
+            *queued_modifiers = *modifiers;
+            true
+        }
+        (
+            TabCommand::MouseWheel {
+                window_id: queued_window,
+                x: queued_x,
+                y: queued_y,
+                modifiers: queued_modifiers,
+                delta_x: queued_delta_x,
+                delta_y: queued_delta_y,
+            },
+            TabCommand::MouseWheel {
+                window_id,
+                x,
+                y,
+                modifiers,
+                delta_x,
+                delta_y,
+            },
+        ) if queued_window == window_id && queued_modifiers == modifiers => {
+            *queued_x = *x;
+            *queued_y = *y;
+            *queued_delta_x = queued_delta_x.saturating_add(*delta_x);
+            *queued_delta_y = queued_delta_y.saturating_add(*delta_y);
+            true
+        }
+        (
+            TabCommand::TouchEvent {
+                window_id: queued_window,
+                event: queued_event,
+            },
+            TabCommand::TouchEvent { window_id, event },
+        ) if queued_window == window_id
+            && queued_event.id == event.id
+            && queued_event.pointer_type == event.pointer_type
+            && queued_event.event_type == wire::TouchEventType::Moved as i32
+            && event.event_type == wire::TouchEventType::Moved as i32 =>
+        {
+            *queued_event = *event;
+            true
+        }
+        _ => false,
+    }
+}
+
+fn command_queue() -> (CommandSender, CommandReceiver) {
+    let queue = Arc::new(CommandQueue {
+        state: Mutex::new(CommandQueueState {
+            commands: VecDeque::with_capacity(COMMAND_QUEUE_CAPACITY),
+            receiver_alive: true,
+        }),
+        ready: Condvar::new(),
+    });
+    (
+        CommandSender {
+            queue: Arc::clone(&queue),
+        },
+        CommandReceiver { queue },
+    )
+}
+
+impl CommandSender {
+    fn send(&self, command: TabCommand) -> Result<(), CommandSendError> {
+        let incoming_coalescible = is_coalescible(&command);
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if !state.receiver_alive {
+            return Err(CommandSendError);
+        }
+        if let Some(queued) = state.commands.back_mut()
+            && coalesce_command(queued, &command)
+        {
+            return Ok(());
+        }
+        while state.commands.len() >= COMMAND_QUEUE_CAPACITY {
+            if let Some(index) = state.commands.iter().position(is_coalescible) {
+                state.commands.remove(index);
+                break;
+            }
+            if incoming_coalescible {
+                return Ok(());
+            }
+            state = self
+                .queue
+                .ready
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+            if !state.receiver_alive {
+                return Err(CommandSendError);
+            }
+        }
+        state.commands.push_back(command);
+        self.queue.ready.notify_one();
+        Ok(())
+    }
+}
+
+impl CommandReceiver {
+    fn recv_timeout(&self, timeout: Duration) -> Result<TabCommand, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(command) = state.commands.pop_front() {
+                self.queue.ready.notify_all();
+                return Ok(command);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            let (next_state, result) = self
+                .queue
+                .ready
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next_state;
+            if result.timed_out() && state.commands.is_empty() {
+                return Err(RecvTimeoutError::Timeout);
+            }
+        }
+    }
+}
+
+impl Drop for CommandReceiver {
+    fn drop(&mut self) {
+        let mut state = self
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.receiver_alive = false;
+        self.queue.ready.notify_all();
+    }
+}
+
 pub struct TabController {
     profile_id: String,
-    sender: Sender<TabCommand>,
+    sender: CommandSender,
     thread: JoinHandle<()>,
 }
 
 impl TabController {
-    pub fn send(&self, command: TabCommand) -> Result<(), mpsc::SendError<TabCommand>> {
+    pub fn send(&self, command: TabCommand) -> Result<(), CommandSendError> {
         self.sender.send(command)
     }
 
@@ -171,7 +381,7 @@ pub fn spawn(
     directories: ProfileDirectories,
     invoker: QmlMethodInvoker,
 ) -> TabController {
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = command_queue();
     let invoker = Arc::new(Mutex::new(invoker));
     let controller_profile_id = profile_id.clone();
     let thread = std::thread::spawn({
@@ -488,7 +698,7 @@ struct Runtime {
     profile_id: String,
     directories: ProfileDirectories,
     invoker: Arc<Mutex<QmlMethodInvoker>>,
-    receiver: Receiver<TabCommand>,
+    receiver: CommandReceiver,
     connection: RustConnection,
     windows: HashMap<u64, BrowserWindow>,
     tabs: Vec<Tab>,
@@ -504,7 +714,7 @@ impl Runtime {
         profile_id: String,
         directories: ProfileDirectories,
         invoker: Arc<Mutex<QmlMethodInvoker>>,
-        receiver: Receiver<TabCommand>,
+        receiver: CommandReceiver,
     ) -> TabResult<Self> {
         let (connection, _) = x11rb::connect(None)?;
         let cookie_sync = CookieSync::new(&directories.shared_data)?;
@@ -613,6 +823,10 @@ impl Runtime {
             TabCommand::KeyEvent { window_id, event } => self
                 .with_active_process(window_id, |process, browser| {
                     process.send_key_event(browser, event)
+                }),
+            TabCommand::TouchEvent { window_id, event } => self
+                .with_active_process(window_id, |process, browser| {
+                    process.send_touch_event(browser, event)
                 }),
             TabCommand::Stop => Ok(()),
         }
@@ -1300,11 +1514,12 @@ impl Runtime {
 #[cfg(test)]
 mod tests {
     use super::{
-        CookieMutation, Tab, TabEngine, reconcile_mutation, relocate_tab, tab_failure_message,
+        COMMAND_QUEUE_CAPACITY, CookieMutation, Tab, TabCommand, TabEngine, command_queue,
+        reconcile_mutation, relocate_tab, tab_failure_message,
     };
     use crate::cookie_store::{CanonicalCookie, CookieIdentity};
     use shell_protocol::wire;
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     fn cookie(value: &str) -> wire::Cookie {
         wire::Cookie {
@@ -1338,6 +1553,83 @@ mod tests {
             loading: false,
             crashed: false,
         }
+    }
+
+    fn touch(event_type: wire::TouchEventType, x: f32) -> TabCommand {
+        TabCommand::TouchEvent {
+            window_id: 7,
+            event: wire::TouchEvent {
+                id: 3,
+                x,
+                y: 20.0,
+                radius_x: 4.0,
+                radius_y: 5.0,
+                rotation_angle: 0.25,
+                pressure: 0.75,
+                event_type: event_type as i32,
+                modifiers: 2,
+                pointer_type: wire::PointerDeviceType::Touch as i32,
+            },
+        }
+    }
+
+    #[test]
+    fn coalesces_touch_moves_without_crossing_lifecycle_boundaries() {
+        let (sender, receiver) = command_queue();
+        sender
+            .send(touch(wire::TouchEventType::Pressed, 10.0))
+            .unwrap();
+        sender
+            .send(touch(wire::TouchEventType::Moved, 11.0))
+            .unwrap();
+        sender
+            .send(touch(wire::TouchEventType::Moved, 12.0))
+            .unwrap();
+        sender
+            .send(touch(wire::TouchEventType::Released, 12.0))
+            .unwrap();
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::ZERO),
+            Ok(TabCommand::TouchEvent { event, .. })
+                if event.event_type == wire::TouchEventType::Pressed as i32
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::ZERO),
+            Ok(TabCommand::TouchEvent { event, .. })
+                if event.event_type == wire::TouchEventType::Moved as i32 && event.x == 12.0
+        ));
+        assert!(matches!(
+            receiver.recv_timeout(Duration::ZERO),
+            Ok(TabCommand::TouchEvent { event, .. })
+                if event.event_type == wire::TouchEventType::Released as i32
+        ));
+    }
+
+    #[test]
+    fn bounds_motion_backlog_and_retains_the_newest_state() {
+        let (sender, _receiver) = command_queue();
+        for index in 0..(COMMAND_QUEUE_CAPACITY * 2) {
+            sender
+                .send(TabCommand::MouseMove {
+                    window_id: (index % 2) as u64,
+                    x: index as i32,
+                    y: 0,
+                    modifiers: 0,
+                    leaving: false,
+                })
+                .unwrap();
+        }
+        let state = sender
+            .queue
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert_eq!(state.commands.len(), COMMAND_QUEUE_CAPACITY);
+        assert!(matches!(
+            state.commands.back(),
+            Some(TabCommand::MouseMove { x, .. }) if *x == (COMMAND_QUEUE_CAPACITY * 2 - 1) as i32
+        ));
     }
 
     #[test]

@@ -23,6 +23,7 @@ enum Capability {
   CAPABILITY_POINTER_INPUT = 11;
   CAPABILITY_KEYBOARD_INPUT = 12;
   CAPABILITY_CURSOR_EVENTS = 13;
+  CAPABILITY_TOUCH_INPUT = 14;
 }
 
 enum MouseButton {
@@ -37,6 +38,21 @@ enum KeyEventType {
   KEY_EVENT_TYPE_RAW_KEY_DOWN = 1;
   KEY_EVENT_TYPE_CHARACTER = 2;
   KEY_EVENT_TYPE_KEY_UP = 3;
+}
+
+enum TouchEventType {
+  TOUCH_EVENT_TYPE_UNSPECIFIED = 0;
+  TOUCH_EVENT_TYPE_RELEASED = 1;
+  TOUCH_EVENT_TYPE_PRESSED = 2;
+  TOUCH_EVENT_TYPE_MOVED = 3;
+  TOUCH_EVENT_TYPE_CANCELLED = 4;
+}
+
+enum PointerDeviceType {
+  POINTER_DEVICE_TYPE_UNSPECIFIED = 0;
+  POINTER_DEVICE_TYPE_TOUCH = 1;
+  POINTER_DEVICE_TYPE_PEN = 2;
+  POINTER_DEVICE_TYPE_ERASER = 3;
 }
 
 message Packet {
@@ -84,6 +100,7 @@ message Request {
     MouseClick mouse_click = 22;
     MouseWheel mouse_wheel = 23;
     KeyEvent key_event = 24;
+    TouchEvent touch_event = 25;
   }
 }
 
@@ -169,6 +186,19 @@ message MouseWheel {
   uint32 modifiers = 3;
   int32 delta_x = 4;
   int32 delta_y = 5;
+}
+
+message TouchEvent {
+  int32 id = 1;
+  float x = 2;
+  float y = 3;
+  float radius_x = 4;
+  float radius_y = 5;
+  float rotation_angle = 6;
+  float pressure = 7;
+  TouchEventType event_type = 8;
+  uint32 modifiers = 9;
+  PointerDeviceType pointer_type = 10;
 }
 
 message KeyEvent {

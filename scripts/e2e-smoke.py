@@ -3,12 +3,14 @@
 import argparse
 import ctypes
 import ctypes.util
+import fcntl
 import hashlib
 import http.server
 import os
 import secrets
 import signal
 import subprocess
+import struct
 import sys
 import threading
 import time
@@ -80,6 +82,174 @@ class XCursorProbe:
             self.x11.XFree(pointer)
 
 
+class InputId(ctypes.Structure):
+    _fields_ = [
+        ("bustype", ctypes.c_ushort),
+        ("vendor", ctypes.c_ushort),
+        ("product", ctypes.c_ushort),
+        ("version", ctypes.c_ushort),
+    ]
+
+
+class UInputSetup(ctypes.Structure):
+    _fields_ = [
+        ("id", InputId),
+        ("name", ctypes.c_char * 80),
+        ("ff_effects_max", ctypes.c_uint),
+    ]
+
+
+class InputAbsInfo(ctypes.Structure):
+    _fields_ = [
+        ("value", ctypes.c_int),
+        ("minimum", ctypes.c_int),
+        ("maximum", ctypes.c_int),
+        ("fuzz", ctypes.c_int),
+        ("flat", ctypes.c_int),
+        ("resolution", ctypes.c_int),
+    ]
+
+
+class UInputAbsSetup(ctypes.Structure):
+    _fields_ = [
+        ("code", ctypes.c_ushort),
+        ("padding", ctypes.c_ushort),
+        ("absinfo", InputAbsInfo),
+    ]
+
+
+class VirtualTouchscreen:
+    EV_SYN = 0
+    EV_KEY = 1
+    EV_ABS = 3
+    SYN_REPORT = 0
+    BTN_TOUCH = 0x14A
+    ABS_X = 0
+    ABS_Y = 1
+    ABS_MT_SLOT = 0x2F
+    ABS_MT_POSITION_X = 0x35
+    ABS_MT_POSITION_Y = 0x36
+    ABS_MT_TRACKING_ID = 0x39
+    ABS_MT_PRESSURE = 0x3A
+    INPUT_PROP_DIRECT = 1
+
+    @staticmethod
+    def ioctl(direction, number, size=0):
+        return (direction << 30) | (size << 16) | (ord("U") << 8) | number
+
+    UI_DEV_CREATE = ioctl.__func__(0, 1)
+    UI_DEV_DESTROY = ioctl.__func__(0, 2)
+    UI_DEV_SETUP = ioctl.__func__(1, 3, ctypes.sizeof(UInputSetup))
+    UI_ABS_SETUP = ioctl.__func__(1, 4, ctypes.sizeof(UInputAbsSetup))
+    UI_SET_EVBIT = ioctl.__func__(1, 100, ctypes.sizeof(ctypes.c_int))
+    UI_SET_KEYBIT = ioctl.__func__(1, 101, ctypes.sizeof(ctypes.c_int))
+    UI_SET_PROPBIT = ioctl.__func__(1, 110, ctypes.sizeof(ctypes.c_int))
+
+    def __init__(self, width, height):
+        try:
+            self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as error:
+            raise SmokeFailure(
+                "raw touch E2E needs write access to /dev/uinput; "
+                "grant it to the test user or run the smoke test with suitable privileges"
+            ) from error
+        self.width = width
+        self.height = height
+        try:
+            self.set_bit(self.UI_SET_EVBIT, self.EV_SYN)
+            self.set_bit(self.UI_SET_EVBIT, self.EV_KEY)
+            self.set_bit(self.UI_SET_EVBIT, self.EV_ABS)
+            self.set_bit(self.UI_SET_KEYBIT, self.BTN_TOUCH)
+            self.set_bit(self.UI_SET_PROPBIT, self.INPUT_PROP_DIRECT)
+            self.set_axis(self.ABS_X, width - 1)
+            self.set_axis(self.ABS_Y, height - 1)
+            self.set_axis(self.ABS_MT_SLOT, 9)
+            self.set_axis(self.ABS_MT_POSITION_X, width - 1)
+            self.set_axis(self.ABS_MT_POSITION_Y, height - 1)
+            self.set_axis(self.ABS_MT_TRACKING_ID, 65535)
+            self.set_axis(self.ABS_MT_PRESSURE, 1024)
+            setup = UInputSetup(
+                id=InputId(bustype=3, vendor=0x1D6B, product=0xD3B, version=1),
+                name=b"deb-e2e-raw-touchscreen",
+                ff_effects_max=0,
+            )
+            fcntl.ioctl(self.fd, self.UI_DEV_SETUP, bytes(setup))
+            fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+        except Exception:
+            os.close(self.fd)
+            self.fd = None
+            raise
+        time.sleep(1.0)
+
+    def set_bit(self, operation, value):
+        fcntl.ioctl(self.fd, operation, struct.pack("i", value))
+
+    def set_axis(self, code, maximum):
+        setup = UInputAbsSetup(
+            code=code,
+            absinfo=InputAbsInfo(
+                value=0,
+                minimum=0,
+                maximum=maximum,
+                fuzz=0,
+                flat=0,
+                resolution=1,
+            ),
+        )
+        fcntl.ioctl(self.fd, self.UI_ABS_SETUP, bytes(setup))
+
+    def emit(self, event_type, code, value):
+        os.write(self.fd, struct.pack("@llHHi", 0, 0, event_type, code, value))
+
+    def sync(self):
+        self.emit(self.EV_SYN, self.SYN_REPORT, 0)
+
+    def begin(self, slot, tracking_id, x, y, primary=False):
+        self.emit(self.EV_ABS, self.ABS_MT_SLOT, slot)
+        self.emit(self.EV_ABS, self.ABS_MT_TRACKING_ID, tracking_id)
+        self.emit(self.EV_ABS, self.ABS_MT_POSITION_X, x)
+        self.emit(self.EV_ABS, self.ABS_MT_POSITION_Y, y)
+        self.emit(self.EV_ABS, self.ABS_MT_PRESSURE, 768)
+        if primary:
+            self.emit(self.EV_ABS, self.ABS_X, x)
+            self.emit(self.EV_ABS, self.ABS_Y, y)
+            self.emit(self.EV_KEY, self.BTN_TOUCH, 1)
+        self.sync()
+
+    def move_pair(self, first, second):
+        for slot, (x, y) in enumerate((first, second)):
+            self.emit(self.EV_ABS, self.ABS_MT_SLOT, slot)
+            self.emit(self.EV_ABS, self.ABS_MT_POSITION_X, x)
+            self.emit(self.EV_ABS, self.ABS_MT_POSITION_Y, y)
+            self.emit(self.EV_ABS, self.ABS_MT_PRESSURE, 768)
+            if slot == 0:
+                self.emit(self.EV_ABS, self.ABS_X, x)
+                self.emit(self.EV_ABS, self.ABS_Y, y)
+        self.sync()
+
+    def pinch(self, x, y):
+        self.begin(0, 100, x - 24, y, primary=True)
+        self.begin(1, 101, x + 24, y)
+        for distance in (40, 60, 80, 100):
+            self.move_pair((x - distance, y), (x + distance, y))
+            time.sleep(0.04)
+        self.emit(self.EV_ABS, self.ABS_MT_SLOT, 1)
+        self.emit(self.EV_ABS, self.ABS_MT_TRACKING_ID, -1)
+        self.emit(self.EV_ABS, self.ABS_MT_SLOT, 0)
+        self.emit(self.EV_ABS, self.ABS_MT_TRACKING_ID, -1)
+        self.emit(self.EV_KEY, self.BTN_TOUCH, 0)
+        self.sync()
+
+    def close(self):
+        if self.fd is None:
+            return
+        try:
+            fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        finally:
+            os.close(self.fd)
+            self.fd = None
+
+
 class E2ESite:
     def __init__(self):
         self.cookie_name = "deb_e2e_cross_engine"
@@ -148,6 +318,7 @@ html, body {{ width: 100%; height: 100%; margin: 0; }}
 body {{
   display: grid;
   place-items: center;
+  touch-action: none;
   color: white;
   background: linear-gradient(135deg, #172033, #51246d 48%, #a23b72);
   font: 24px sans-serif;
@@ -181,6 +352,7 @@ body.complete {{ background: linear-gradient(135deg, #123020, #176b3a, #49a078);
 }}
 body.chromium.clicked #click-target {{ color: #101522; background: #ff00ff; }}
 body.firefox.clicked #click-target {{ color: #101522; background: #00ffff; }}
+body.touched #marker {{ background: #ff8c00; }}
 </style>
 </head>
 <body class="{engine}">
@@ -194,6 +366,16 @@ const token = {self.token!r};
 const status = document.getElementById("status");
 const clickTarget = document.getElementById("click-target");
 const clickTitle = {f"deb-e2e {engine} click received {self.token}"!r};
+const touchTitle = {f"deb-e2e {engine} raw gesture received {self.token}"!r};
+let initialTouchDistance = null;
+let rawGestureMoved = false;
+let rawGestureTrusted = true;
+function touchDistance(touches) {{
+  return Math.hypot(
+    touches[0].clientX - touches[1].clientX,
+    touches[0].clientY - touches[1].clientY
+  );
+}}
 function hasCookie() {{
   return document.cookie.split("; ").includes(`${{cookieName}}=${{token}}`);
 }}
@@ -207,6 +389,32 @@ clickTarget.addEventListener("click", event => {{
   status.textContent = "The page received a trusted browser click";
   document.body.classList.add("clicked");
 }});
+document.addEventListener("touchstart", event => {{
+  rawGestureTrusted = rawGestureTrusted && event.isTrusted;
+  if (event.touches.length === 2) {{
+    initialTouchDistance = touchDistance(event.touches);
+  }}
+  event.preventDefault();
+}}, {{ passive: false }});
+document.addEventListener("touchmove", event => {{
+  rawGestureTrusted = rawGestureTrusted && event.isTrusted;
+  if (event.touches.length === 2 && initialTouchDistance !== null) {{
+    rawGestureMoved = rawGestureMoved ||
+      Math.abs(touchDistance(event.touches) - initialTouchDistance) > 40;
+  }}
+  event.preventDefault();
+}}, {{ passive: false }});
+document.addEventListener("touchend", event => {{
+  rawGestureTrusted = rawGestureTrusted && event.isTrusted;
+  if (event.touches.length === 0 && rawGestureMoved) {{
+    document.title = rawGestureTrusted
+      ? touchTitle
+      : `deb-e2e {engine} rejected untrusted touch ${{token}}`;
+    status.textContent = "The page received a trusted raw two-contact gesture";
+    document.body.classList.add("touched");
+  }}
+  event.preventDefault();
+}}, {{ passive: false }});
 </script>
 </body>
 </html>
@@ -640,6 +848,15 @@ class Driver:
         self.move_pointer_to(x, y)
         self.xdotool("click", "1")
 
+    def raw_pinch_surface(self, accessible_id, touchscreen):
+        surface = self.wait_for_id(accessible_id)
+        rectangle = self.rectangle(surface)
+        self.focus_accessible_window(surface)
+        touchscreen.pinch(
+            rectangle.x + rectangle.width // 2,
+            rectangle.y + rectangle.height // 2,
+        )
+
     def move_over_surface(self, accessible_id, x_fraction, y_fraction):
         if not 0.0 < x_fraction < 1.0 or not 0.0 < y_fraction < 1.0:
             raise SmokeFailure("surface hover fractions must be inside the viewport")
@@ -884,12 +1101,28 @@ def parse_arguments():
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--log", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--require-touch", action="store_true")
     return parser.parse_args()
 
 
 def main():
     arguments = parse_arguments()
     arguments.artifacts.mkdir(parents=True, exist_ok=True)
+    touchscreen = None
+    if arguments.require_touch or os.access("/dev/uinput", os.W_OK):
+        geometry = subprocess.run(
+            ["xdotool", "getdisplaygeometry"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout.split()
+        touchscreen = VirtualTouchscreen(int(geometry[0]), int(geometry[1]))
+    else:
+        print(
+            "deb-e2e: raw touch gesture coverage skipped because /dev/uinput is not writable",
+            flush=True,
+        )
     site = E2ESite()
     site.start()
     with arguments.log.open("wb") as log:
@@ -944,6 +1177,16 @@ def main():
             chromium_cursors = driver.verify_page_cursors(
                 "browser.surface.1", "Chromium"
             )
+            if touchscreen is not None:
+                print(
+                    "deb-e2e: sending a raw two-contact Chromium gesture through uinput",
+                    flush=True,
+                )
+                driver.raw_pinch_surface("browser.surface.1", touchscreen)
+                driver.wait_for_name(
+                    "browser.tab.default.1",
+                    f"deb-e2e chromium raw gesture received {site.token}",
+                )
             print("deb-e2e: clicking the Chromium page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
@@ -978,6 +1221,16 @@ def main():
             firefox_cursors = driver.verify_page_cursors(
                 "browser.surface.1", "Firefox"
             )
+            if touchscreen is not None:
+                print(
+                    "deb-e2e: sending a raw two-contact Firefox gesture through uinput",
+                    flush=True,
+                )
+                driver.raw_pinch_surface("browser.surface.1", touchscreen)
+                driver.wait_for_name(
+                    "browser.tab.default.2",
+                    f"deb-e2e firefox raw gesture received {site.token}",
+                )
             print("deb-e2e: clicking the Firefox page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
@@ -1154,9 +1407,14 @@ def main():
             driver.wait_for_name("browser.status.3", selected_engine)
             driver.assert_no_process_failures("rapid Ctrl+Tab stress")
 
+            touch_summary = (
+                " and trusted raw two-contact gestures"
+                if touchscreen is not None
+                else ""
+            )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                "both engines, trusted page clicks, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
+                f"both engines, trusted page clicks{touch_summary}, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -1182,6 +1440,8 @@ def main():
         finally:
             stop_process(process)
             site.stop()
+            if touchscreen is not None:
+                touchscreen.close()
 
 
 if __name__ == "__main__":

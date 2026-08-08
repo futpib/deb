@@ -7,15 +7,18 @@ pushd "$script_directory/.." >/dev/null
 project_root=$PWD
 popd >/dev/null
 build_rust=1
+require_touch=0
 
-case "${1:-}" in
-  "") ;;
+for argument in "$@"; do
+  case "$argument" in
   --no-build) build_rust=0 ;;
+  --require-touch) require_touch=1 ;;
   *)
-    echo "Usage: $0 [--no-build]" >&2
+    echo "Usage: $0 [--no-build] [--require-touch]" >&2
     exit 2
     ;;
-esac
+  esac
+done
 
 for command in glxinfo python3 timeout rg xdotool xdpyinfo; do
   if ! command -v "$command" >/dev/null; then
@@ -36,6 +39,10 @@ if rg -q '^    XWAYLAND$' <<<"$display_info"; then
 fi
 if ! rg -q '^    XTEST$' <<<"$display_info"; then
   echo "The E2E smoke test requires the XTEST extension" >&2
+  exit 1
+fi
+if ((require_touch)) && [[ ! -w /dev/uinput ]]; then
+  echo "Raw touch E2E requires write access to /dev/uinput" >&2
   exit 1
 fi
 gl_info=$(glxinfo -B)
@@ -69,6 +76,10 @@ trap cleanup EXIT
 app_log="$test_root/deb.log"
 driver_log="$test_root/e2e.log"
 artifacts="$test_root/artifacts"
+touch_arguments=()
+if ((require_touch)); then
+  touch_arguments+=(--require-touch)
+fi
 SECONDS=0
 set +e
 timeout --signal=TERM --kill-after=20s 180s \
@@ -81,7 +92,8 @@ timeout --signal=TERM --kill-after=20s 180s \
   python3 "$script_directory/e2e-smoke.py" \
     --binary "$project_root/target/debug/deb" \
     --log "$app_log" \
-    --artifacts "$artifacts" >"$driver_log" 2>&1
+    --artifacts "$artifacts" \
+    "${touch_arguments[@]}" >"$driver_log" 2>&1
 status=$?
 
 if ((status != 0)); then

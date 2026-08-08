@@ -20,7 +20,9 @@
 #include <QQuickWindow>
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
+#include <QTouchEvent>
 #include <QWheelEvent>
+#include <QtMath>
 
 #include <QtGui/qopenglcontext_platform.h>
 #include <QtQuick/qsgtexture_platform.h>
@@ -327,6 +329,33 @@ int cefButton(Qt::MouseButton button) {
     }
 }
 
+int wirePointerType(QPointingDevice::PointerType type) {
+    switch (type) {
+    case QPointingDevice::PointerType::Pen:
+        return 2;
+    case QPointingDevice::PointerType::Eraser:
+        return 3;
+    default:
+        return 1;
+    }
+}
+
+int wireTouchEventType(QEventPoint::State state, bool cancelled) {
+    if (cancelled) {
+        return 4;
+    }
+    switch (state) {
+    case QEventPoint::State::Pressed:
+        return 2;
+    case QEventPoint::State::Updated:
+        return 3;
+    case QEventPoint::State::Released:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 class ImportedFrame {
 public:
     ~ImportedFrame() {
@@ -619,6 +648,7 @@ BrowserSurface::BrowserSurface(QQuickItem *parent)
     setFlag(ItemAcceptsInputMethod, true);
     setAcceptedMouseButtons(Qt::AllButtons);
     setAcceptHoverEvents(true);
+    setAcceptTouchEvents(true);
     setActiveFocusOnTab(true);
     connect(this, &QQuickItem::windowChanged, this,
             [this](QQuickWindow *window) {
@@ -822,6 +852,29 @@ void BrowserSurface::mouseDoubleClickEvent(QMouseEvent *event) {
 void BrowserSurface::mouseReleaseEvent(QMouseEvent *event) {
     sendButton(event->position(), event->button(), true, event->buttons(),
                event->modifiers(), clickCount_);
+    event->accept();
+}
+
+void BrowserSurface::touchEvent(QTouchEvent *event) {
+    if (event->isBeginEvent()) {
+        forceActiveFocus(Qt::MouseFocusReason);
+    }
+    const bool cancelled = event->type() == QEvent::TouchCancel;
+    const int modifiers = cefModifiers(event->modifiers(), Qt::NoButton);
+    const int pointerType = wirePointerType(event->pointerType());
+    for (const QEventPoint &point : event->points()) {
+        const int eventType = wireTouchEventType(point.state(), cancelled);
+        if (eventType == 0) {
+            continue;
+        }
+        const QSizeF diameter = point.ellipseDiameters();
+        emit touchContact(
+            point.id(), point.position().x(), point.position().y(),
+            diameter.width() / 2.0, diameter.height() / 2.0,
+            qDegreesToRadians(point.rotation()),
+            qBound(0.0, point.pressure(), 1.0), eventType, modifiers,
+            pointerType);
+    }
     event->accept();
 }
 

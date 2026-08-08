@@ -5,6 +5,7 @@
 #include "FirefoxCefBridge.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -14,6 +15,7 @@
 #include <vector>
 
 #include "XREChildData.h"
+#include "InputData.h"
 #include "mozilla/Bootstrap.h"
 #include "mozilla/ClearOnShutdown.h"
 #include "mozilla/MouseEvents.h"
@@ -23,6 +25,7 @@
 #include "mozilla/StaticMutex.h"
 #include "mozilla/StaticPtr.h"
 #include "mozilla/TextEvents.h"
+#include "mozilla/TouchEvents.h"
 #include "mozilla/dom/MouseEventBinding.h"
 #include "mozilla/dom/WheelEventBinding.h"
 #include "nsArrayUtils.h"
@@ -116,6 +119,7 @@ std::map<nsIWidget *, uint32_t> sWidgetBrowsers;
 std::unordered_set<uint32_t> sReadyBrowsers;
 std::unordered_set<uint32_t> sAfterCreatedBrowsers;
 std::unordered_set<uint32_t> sBeforeCloseBrowsers;
+std::map<uint64_t, mozilla::MultiTouchInput> sTouchStates;
 
 class CookieView {
 public:
@@ -446,6 +450,74 @@ void DispatchMouseWheel(uint32_t aBrowserId, int32_t aX, int32_t aY,
   }
   event.mInputSource = mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_MOUSE;
   widget->DispatchInputEvent(&event);
+}
+
+void DispatchTouch(uint32_t aBrowserId, int32_t aId, float aX, float aY,
+                   float aRadiusX, float aRadiusY, float aRotationAngle,
+                   float aPressure, uint32_t aEventType,
+                   uint32_t aModifiers, uint32_t aPointerType) {
+  nsCOMPtr<nsIWidget> widget = BrowserWidget(aBrowserId);
+  if (!widget) {
+    return;
+  }
+
+  const uint16_t inputSource =
+      aPointerType == 0
+          ? mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_TOUCH
+          : mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_PEN;
+  const uint64_t stateKey =
+      (static_cast<uint64_t>(aBrowserId) << 8) | inputSource;
+  auto [stateEntry, inserted] = sTouchStates.try_emplace(stateKey);
+  mozilla::MultiTouchInput &state = stateEntry->second;
+  state.modifiers = GeckoModifiers(aModifiers);
+  state.mInputSource = inputSource;
+
+  TouchPointerState pointerState;
+  switch (aEventType) {
+  case 0:
+    pointerState = TOUCH_REMOVE;
+    break;
+  case 1:
+  case 2:
+    pointerState = TOUCH_CONTACT;
+    break;
+  case 3:
+    pointerState = TOUCH_CANCEL;
+    break;
+  default:
+    return;
+  }
+
+  mozilla::MultiTouchInput input = mozilla::UpdateSynthesizedTouchState(
+      &state, mozilla::TimeStamp::Now(), static_cast<uint32_t>(aId),
+      pointerState,
+      mozilla::LayoutDeviceIntPoint::Round(aX, aY), aPressure,
+      static_cast<uint32_t>(
+          std::round(aRotationAngle * 180.0 / 3.14159265358979323846)));
+  input.modifiers = GeckoModifiers(aModifiers);
+  input.mInputSource = inputSource;
+
+  auto updateGeometry = [=](mozilla::SingleTouchData &aTouch) {
+    if (aTouch.mIdentifier != aId) {
+      return;
+    }
+    aTouch.mRadius = mozilla::ScreenSize(aRadiusX, aRadiusY);
+    aTouch.mRotationAngle =
+        aRotationAngle * 180.0f / 3.14159265358979323846f;
+    aTouch.mForce = aPressure;
+  };
+  for (auto &touch : state.mTouches) {
+    updateGeometry(touch);
+  }
+  for (auto &touch : input.mTouches) {
+    updateGeometry(touch);
+  }
+
+  mozilla::WidgetTouchEvent event = input.ToWidgetEvent(widget);
+  widget->DispatchInputEvent(&event);
+  if (state.mTouches.IsEmpty()) {
+    sTouchStates.erase(stateEntry);
+  }
 }
 
 mozilla::KeyNameIndex GeckoKeyName(int32_t aWindowsKeyCode,
@@ -848,6 +920,13 @@ NS_IMETHODIMP FirefoxCefBridge::BeforeClose(uint32_t aBrowserId) {
       sWidgetBrowsers.erase(widget->second.get());
     }
     sWidgets.erase(aBrowserId);
+    for (auto touch = sTouchStates.begin(); touch != sTouchStates.end();) {
+      if ((touch->first >> 8) == aBrowserId) {
+        touch = sTouchStates.erase(touch);
+      } else {
+        ++touch;
+      }
+    }
     callbacks = sCallbacks;
   }
   if (callbacks.onBeforeClose) {
@@ -1089,6 +1168,25 @@ firefox_cef_gecko_send_mouse_wheel(uint32_t aBrowserId, int32_t aX, int32_t aY,
                                    int32_t aDeltaY) {
   return DispatchBrowserInput(aBrowserId, "FirefoxCefBridge::MouseWheel", [=] {
     DispatchMouseWheel(aBrowserId, aX, aY, aModifiers, aDeltaX, aDeltaY);
+  });
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_send_touch(
+    uint32_t aBrowserId, int32_t aId, float aX, float aY, float aRadiusX,
+    float aRadiusY, float aRotationAngle, float aPressure,
+    uint32_t aEventType, uint32_t aModifiers, uint32_t aPointerType) {
+  if (aId == -1 || !std::isfinite(aX) || !std::isfinite(aY) ||
+      !std::isfinite(aRadiusX) || !std::isfinite(aRadiusY) ||
+      !std::isfinite(aRotationAngle) || !std::isfinite(aPressure) ||
+      aRadiusX < 0.0f || aRadiusY < 0.0f || aPressure < 0.0f ||
+      aPressure > 1.0f || aEventType > 3 ||
+      (aPointerType != 0 && aPointerType != 2 && aPointerType != 3)) {
+    return 0;
+  }
+  return DispatchBrowserInput(aBrowserId, "FirefoxCefBridge::Touch", [=] {
+    DispatchTouch(aBrowserId, aId, aX, aY, aRadiusX, aRadiusY,
+                  aRotationAngle, aPressure, aEventType, aModifiers,
+                  aPointerType);
   });
 }
 

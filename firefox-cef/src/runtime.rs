@@ -3,7 +3,7 @@ use cef_dll_sys::{
     cef_accelerated_paint_info_common_t, cef_accelerated_paint_info_t,
     cef_accelerated_paint_native_pixmap_plane_t, cef_color_type_t, cef_cursor_type_t,
     cef_errorcode_t, cef_main_args_t, cef_paint_element_type_t, cef_rect_t, cef_size_t,
-    cef_string_t, cef_termination_status_t, cef_transition_type_t,
+    cef_string_t, cef_termination_status_t, cef_touch_event_t, cef_transition_type_t,
 };
 use libc::{c_char, c_int, c_void};
 use std::{
@@ -94,6 +94,8 @@ type BrowserStringCommand = unsafe extern "C" fn(u32, *const c_char) -> c_int;
 type MouseMoveCommand = unsafe extern "C" fn(u32, c_int, c_int, u32, u8) -> c_int;
 type MouseClickCommand = unsafe extern "C" fn(u32, c_int, c_int, u32, u32, u8, c_int) -> c_int;
 type MouseWheelCommand = unsafe extern "C" fn(u32, c_int, c_int, u32, c_int, c_int) -> c_int;
+type TouchCommand =
+    unsafe extern "C" fn(u32, c_int, f32, f32, f32, f32, f32, f32, u32, u32, u32) -> c_int;
 type KeyCommand = unsafe extern "C" fn(u32, u32, u32, c_int, c_int, u8, u16, u16) -> c_int;
 type PostTask =
     unsafe extern "C" fn(Option<unsafe extern "C" fn(*mut c_void)>, *mut c_void) -> c_int;
@@ -117,6 +119,7 @@ struct GeckoApi {
     send_mouse_move: MouseMoveCommand,
     send_mouse_click: MouseClickCommand,
     send_mouse_wheel: MouseWheelCommand,
+    send_touch: TouchCommand,
     send_key: KeyCommand,
     close: BrowserBoolCommand,
     shutdown: Command,
@@ -149,6 +152,7 @@ impl GeckoApi {
             send_mouse_move: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_move\0")? },
             send_mouse_click: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_click\0")? },
             send_mouse_wheel: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_wheel\0")? },
+            send_touch: unsafe { symbol(libxul, b"firefox_cef_gecko_send_touch\0")? },
             send_key: unsafe { symbol(libxul, b"firefox_cef_gecko_send_key\0")? },
             close: unsafe { symbol(libxul, b"firefox_cef_gecko_close\0")? },
             shutdown: unsafe { symbol(libxul, b"firefox_cef_gecko_shutdown\0")? },
@@ -620,6 +624,28 @@ impl BrowserState {
             == 0
         {
             return Err(format!("Gecko rejected mouse wheel for browser {}", self.id).into());
+        }
+        Ok(())
+    }
+
+    pub fn send_touch(&self, event: &cef_touch_event_t) -> RuntimeResult<()> {
+        if unsafe {
+            (gecko()?.send_touch)(
+                self.id as u32,
+                event.id,
+                event.x,
+                event.y,
+                event.radius_x,
+                event.radius_y,
+                event.rotation_angle,
+                event.pressure,
+                event.type_ as u32,
+                event.modifiers,
+                event.pointer_type as u32,
+            )
+        } == 0
+        {
+            return Err(format!("Gecko rejected touch event for browser {}", self.id).into());
         }
         Ok(())
     }

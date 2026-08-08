@@ -491,6 +491,61 @@ impl Backend {
 
     #[qslot]
     #[allow(clippy::too_many_arguments)]
+    fn touch_event(
+        &mut self,
+        window_id: String,
+        id: i32,
+        x: f64,
+        y: f64,
+        radius_x: f64,
+        radius_y: f64,
+        rotation_angle: f64,
+        pressure: f64,
+        event_type: i32,
+        modifiers: i32,
+        pointer_type: i32,
+    ) {
+        let values = [x, y, radius_x, radius_y, rotation_angle, pressure];
+        if id == -1
+            || values.iter().any(|value| !value.is_finite())
+            || radius_x < 0.0
+            || radius_y < 0.0
+            || !(0.0..=1.0).contains(&pressure)
+            || shell_protocol::wire::TouchEventType::try_from(event_type).is_err()
+            || shell_protocol::wire::PointerDeviceType::try_from(pointer_type).is_err()
+        {
+            return;
+        }
+        if let (Some(controller), Ok(window_id), Ok(modifiers)) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            u32::try_from(modifiers),
+        ) {
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "touch-event",
+                TabCommand::TouchEvent {
+                    window_id,
+                    event: shell_protocol::wire::TouchEvent {
+                        id,
+                        x: x as f32,
+                        y: y as f32,
+                        radius_x: radius_x as f32,
+                        radius_y: radius_y as f32,
+                        rotation_angle: rotation_angle as f32,
+                        pressure: pressure as f32,
+                        event_type,
+                        modifiers,
+                        pointer_type,
+                    },
+                },
+            );
+        }
+    }
+
+    #[qslot]
+    #[allow(clippy::too_many_arguments)]
     fn key_event(
         &mut self,
         window_id: String,

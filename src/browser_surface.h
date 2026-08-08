@@ -13,6 +13,7 @@ class QHoverEvent;
 class QInputMethodEvent;
 class QKeyEvent;
 class QMouseEvent;
+class QTouchEvent;
 class QWheelEvent;
 
 class BrowserSurface : public QQuickItem {
@@ -41,6 +42,9 @@ signals:
     void pointerButton(int x, int y, int modifiers, int button, bool mouseUp,
                        int clickCount);
     void pointerWheel(int x, int y, int modifiers, int deltaX, int deltaY);
+    void touchContact(int id, double x, double y, double radiusX,
+                      double radiusY, double rotationAngle, double pressure,
+                      int eventType, int modifiers, int pointerType);
     void browserKey(int eventType, int modifiers, int windowsKeyCode,
                     int nativeKeyCode, bool systemKey, int character,
                     int unmodifiedCharacter);
@@ -56,6 +60,7 @@ protected:
     void mousePressEvent(QMouseEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
+    void touchEvent(QTouchEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;

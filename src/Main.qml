@@ -1084,6 +1084,33 @@ ApplicationWindow {
                         )
                     }
 
+                    onTouchContact: function(
+                        contactId,
+                        x,
+                        y,
+                        radiusX,
+                        radiusY,
+                        rotationAngle,
+                        pressure,
+                        eventType,
+                        modifiers,
+                        pointerType
+                    ) {
+                        browserView.backendObject.touch_event(
+                            browserView.viewId,
+                            contactId,
+                            x,
+                            y,
+                            radiusX,
+                            radiusY,
+                            rotationAngle,
+                            pressure,
+                            eventType,
+                            modifiers,
+                            pointerType
+                        )
+                    }
+
                     onBrowserKey: function(
                         eventType,
                         modifiers,

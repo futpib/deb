@@ -119,6 +119,7 @@ enum ControlCommand {
     },
     MouseWheel(wire::MouseWheel),
     KeyEvent(KeyEvent),
+    TouchEvent(TouchEvent),
 }
 
 fn mouse_button(value: i32) -> Result<MouseButtonType, Box<dyn Error>> {
@@ -148,6 +149,50 @@ fn key_event(command: wire::KeyEvent) -> Result<KeyEvent, Box<dyn Error>> {
         unmodified_character: u16::try_from(command.unmodified_character)
             .map_err(|_| "unmodified key character is not UTF-16")?,
         focus_on_editable_field: 0,
+    })
+}
+
+fn touch_event(command: wire::TouchEvent) -> Result<TouchEvent, Box<dyn Error>> {
+    let type_ = match wire::TouchEventType::try_from(command.event_type) {
+        Ok(wire::TouchEventType::Released) => TouchEventType::RELEASED,
+        Ok(wire::TouchEventType::Pressed) => TouchEventType::PRESSED,
+        Ok(wire::TouchEventType::Moved) => TouchEventType::MOVED,
+        Ok(wire::TouchEventType::Cancelled) => TouchEventType::CANCELLED,
+        _ => return Err("touch event has an invalid type".into()),
+    };
+    let pointer_type = match wire::PointerDeviceType::try_from(command.pointer_type) {
+        Ok(wire::PointerDeviceType::Touch) => PointerType::TOUCH,
+        Ok(wire::PointerDeviceType::Pen) => PointerType::PEN,
+        Ok(wire::PointerDeviceType::Eraser) => PointerType::ERASER,
+        _ => return Err("touch event has an invalid pointer type".into()),
+    };
+    let values = [
+        command.x,
+        command.y,
+        command.radius_x,
+        command.radius_y,
+        command.rotation_angle,
+        command.pressure,
+    ];
+    if command.id == -1
+        || values.iter().any(|value| !value.is_finite())
+        || command.radius_x < 0.0
+        || command.radius_y < 0.0
+        || !(0.0..=1.0).contains(&command.pressure)
+    {
+        return Err("touch event has invalid contact geometry".into());
+    }
+    Ok(TouchEvent {
+        id: command.id,
+        x: command.x,
+        y: command.y,
+        radius_x: command.radius_x,
+        radius_y: command.radius_y,
+        rotation_angle: command.rotation_angle,
+        pressure: command.pressure,
+        type_,
+        modifiers: command.modifiers,
+        pointer_type,
     })
 }
 
@@ -188,10 +233,26 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         wire::request::Operation::KeyEvent(command) => {
             Ok(ControlCommand::KeyEvent(key_event(command)?))
         }
+        wire::request::Operation::TouchEvent(command) => {
+            Ok(ControlCommand::TouchEvent(touch_event(command)?))
+        }
         wire::request::Operation::CreateBrowser(_) | wire::request::Operation::Shutdown(_) => {
             Err("a browser already exists in this helper".into())
         }
     }
+}
+
+fn is_input_operation(operation: Option<&wire::request::Operation>) -> bool {
+    matches!(
+        operation,
+        Some(
+            wire::request::Operation::MouseMove(_)
+                | wire::request::Operation::MouseClick(_)
+                | wire::request::Operation::MouseWheel(_)
+                | wire::request::Operation::KeyEvent(_)
+                | wire::request::Operation::TouchEvent(_)
+        )
+    )
 }
 
 struct BrowserConfig {
@@ -288,6 +349,9 @@ impl ProtocolEmitter {
     }
 
     fn success(&self, request_id: u64) {
+        if request_id == 0 {
+            return;
+        }
         if let Err(error) = self.send(response_packet(
             request_id,
             wire::response::Result::Success(wire::Success {}),
@@ -297,11 +361,16 @@ impl ProtocolEmitter {
     }
 
     fn error(&self, request_id: u64, code: &str, message: impl Into<String>) {
+        let message = message.into();
+        if request_id == 0 {
+            eprintln!("cef-renderer: one-way command failed: {code}: {message}");
+            return;
+        }
         if let Err(error) = self.send(response_packet(
             request_id,
             wire::response::Result::Error(wire::Error {
                 code: code.to_owned(),
-                message: message.into(),
+                message,
                 retryable: false,
                 backend_code: String::new(),
             }),
@@ -1177,6 +1246,14 @@ wrap_task! {
                         Err("CEF browser has no host".into())
                     }
                 }
+                ControlCommand::TouchEvent(event) => {
+                    if let Some(host) = self.browser.host() {
+                        host.send_touch_event(Some(event));
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
+                }
             };
             match result {
                 Ok(()) => self.emitter.success(self.request_id),
@@ -1297,6 +1374,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::PointerInput,
         Capability::KeyboardInput,
         Capability::CursorEvents,
+        Capability::TouchInput,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -1578,8 +1656,12 @@ fn run() -> Result<i32, Box<dyn Error>> {
                     continue;
                 }
             };
-            if request_id == 0 {
-                command_emitter.error(0, "INVALID_REQUEST_ID", "request ID must be nonzero");
+            if request_id == 0 && !is_input_operation(request.operation.as_ref()) {
+                command_emitter.error(
+                    0,
+                    "INVALID_REQUEST_ID",
+                    "request ID zero is reserved for one-way input",
+                );
                 continue;
             }
             if matches!(
@@ -1717,9 +1799,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlCommand, CursorInfo, CursorType, KeyEventType, Point, Size, absolute_profile_path,
-        bounds_from_viewport, control_command, cursor_changed, is_deb_internal_url,
-        validate_cef_api_hash,
+        ControlCommand, CursorInfo, CursorType, KeyEventType, Point, PointerType, Size,
+        TouchEventType, absolute_profile_path, bounds_from_viewport, control_command,
+        cursor_changed, is_deb_internal_url, is_input_operation, validate_cef_api_hash,
     };
     use shell_protocol::wire;
     #[test]
@@ -1854,6 +1936,56 @@ mod tests {
             }) if (command.x, command.y, command.modifiers, command.mouse_up)
                 == (90, 12, 64, true)
         ));
+    }
+
+    #[test]
+    fn parses_and_validates_raw_touch_contacts() {
+        let request = |pressure, event_type| wire::Request {
+            browser_id: 1,
+            operation: Some(wire::request::Operation::TouchEvent(wire::TouchEvent {
+                id: 9,
+                x: 12.5,
+                y: 34.25,
+                radius_x: 3.0,
+                radius_y: 4.0,
+                rotation_angle: 0.5,
+                pressure,
+                event_type,
+                modifiers: 2,
+                pointer_type: wire::PointerDeviceType::Touch as i32,
+            })),
+        };
+        assert!(matches!(
+            control_command(request(
+                0.75,
+                wire::TouchEventType::Moved as i32,
+            )),
+            Ok(ControlCommand::TouchEvent(event))
+                if event.id == 9
+                    && event.x == 12.5
+                    && event.y == 34.25
+                    && event.radius_x == 3.0
+                    && event.radius_y == 4.0
+                    && event.pressure == 0.75
+                    && event.type_ == TouchEventType::MOVED
+                    && event.pointer_type == PointerType::TOUCH
+        ));
+        assert!(control_command(request(1.5, wire::TouchEventType::Moved as i32,)).is_err());
+        assert!(control_command(request(0.5, wire::TouchEventType::Unspecified as i32,)).is_err());
+    }
+
+    #[test]
+    fn reserves_one_way_packets_for_input_operations() {
+        assert!(is_input_operation(Some(
+            &wire::request::Operation::TouchEvent(wire::TouchEvent::default())
+        )));
+        assert!(is_input_operation(Some(
+            &wire::request::Operation::MouseMove(wire::MouseMove::default())
+        )));
+        assert!(!is_input_operation(Some(
+            &wire::request::Operation::Navigate(wire::Navigate::default())
+        )));
+        assert!(!is_input_operation(None));
     }
 
     #[test]

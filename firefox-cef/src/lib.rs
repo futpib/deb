@@ -7,7 +7,8 @@ use cef_dll_sys::{
     _cef_app_t, _cef_browser_host_t, _cef_browser_settings_t, _cef_browser_t, _cef_client_t,
     _cef_dictionary_value_t, _cef_frame_t, _cef_request_context_t, _cef_scheme_handler_factory_t,
     _cef_settings_t, _cef_task_t, cef_key_event_t, cef_main_args_t, cef_mouse_button_type_t,
-    cef_mouse_event_t, cef_string_t, cef_thread_id_t, cef_window_handle_t, cef_window_info_t,
+    cef_mouse_event_t, cef_string_t, cef_thread_id_t, cef_touch_event_t, cef_window_handle_t,
+    cef_window_info_t,
 };
 use libc::{c_char, c_int, c_void};
 use refcount::{CefRefCounted, RefObject, add_ref_raw, release_raw};
@@ -212,6 +213,18 @@ unsafe extern "C" fn host_send_mouse_wheel(
     }
 }
 
+unsafe extern "C" fn host_send_touch(
+    host: *mut _cef_browser_host_t,
+    event: *const cef_touch_event_t,
+) {
+    let Some(event) = (unsafe { event.as_ref() }) else {
+        return;
+    };
+    if let Err(error) = state_from(host).send_touch(event) {
+        eprintln!("firefox-cef: touch event failed: {error}");
+    }
+}
+
 unsafe extern "C" fn frame_is_valid(frame: *mut _cef_frame_t) -> c_int {
     i32::from(state_from(frame).is_valid())
 }
@@ -255,6 +268,7 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     host.send_mouse_move_event = Some(host_send_mouse_move);
     host.send_mouse_click_event = Some(host_send_mouse_click);
     host.send_mouse_wheel_event = Some(host_send_mouse_wheel);
+    host.send_touch_event = Some(host_send_touch);
     let host = RefObject::allocate(host, state.clone());
     state.host.store(host, Ordering::Release);
 
