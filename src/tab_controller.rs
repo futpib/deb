@@ -816,9 +816,7 @@ impl Runtime {
         let (backend, browser_id) = {
             let tab = self.tab_mut(tab_id)?;
             tab.url = url.to_owned();
-            tab.loading = true;
             tab.crashed = false;
-            tab.status = "Navigating…".to_owned();
             (tab.engine.backend(), tab.browser_id)
         };
         if let Some(browser_id) = browser_id {
@@ -1111,11 +1109,15 @@ impl Runtime {
             ProtocolNotice::FrameReady => return Ok(()),
             ProtocolNotice::LoadingChanged(loading) => {
                 tab.loading = loading;
-                if !loading {
+                if loading {
+                    tab.status = "Navigating…".to_owned();
+                } else {
                     tab.status = format!("Live · {}", backend.label());
                 }
             }
-            ProtocolNotice::NavigationCommitted(url) => tab.url = url,
+            ProtocolNotice::NavigationCommitted(url) => {
+                tab.url = url;
+            }
             ProtocolNotice::TitleChanged(title) => tab.title = title,
             ProtocolNotice::LoadFailed(error) => {
                 let failure = format!("Load failed: {error}");

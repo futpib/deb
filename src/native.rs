@@ -4,7 +4,7 @@ use shell_protocol::{
     wire::{self, Capability, Engine},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     ffi::CString,
     os::fd::{IntoRawFd, OwnedFd},
@@ -254,6 +254,8 @@ pub(crate) struct CefInstance {
     browser_id: u64,
     next_request_id: u64,
     pending_requests: HashMap<u64, (u64, &'static str)>,
+    ready_browsers: HashSet<u64>,
+    deferred_browser_requests: HashMap<u64, VecDeque<(wire::request::Operation, &'static str)>>,
     last_event_sequence: u64,
     protocol_closed: bool,
 }
@@ -261,7 +263,7 @@ pub(crate) struct CefInstance {
 impl CefInstance {
     const MAX_PACKETS_PER_POLL: usize = 64;
 
-    fn send_browser_request(
+    fn send_browser_request_now(
         &mut self,
         browser_id: u64,
         operation: wire::request::Operation,
@@ -276,6 +278,34 @@ impl CefInstance {
             .send(&request_packet(request_id, browser_id, operation))?;
         self.pending_requests
             .insert(request_id, (browser_id, description));
+        Ok(())
+    }
+
+    fn send_browser_request(
+        &mut self,
+        browser_id: u64,
+        operation: wire::request::Operation,
+        description: &'static str,
+    ) -> NativeResult<()> {
+        if self.ready_browsers.contains(&browser_id) {
+            self.send_browser_request_now(browser_id, operation, description)
+        } else {
+            self.deferred_browser_requests
+                .entry(browser_id)
+                .or_default()
+                .push_back((operation, description));
+            Ok(())
+        }
+    }
+
+    fn mark_browser_ready(&mut self, browser_id: u64) -> NativeResult<()> {
+        self.ready_browsers.insert(browser_id);
+        let Some(mut requests) = self.deferred_browser_requests.remove(&browser_id) else {
+            return Ok(());
+        };
+        while let Some((operation, description)) = requests.pop_front() {
+            self.send_browser_request_now(browser_id, operation, description)?;
+        }
         Ok(())
     }
 
@@ -306,11 +336,13 @@ impl CefInstance {
         directories: &EngineDirectories,
         surface_id: String,
     ) -> NativeResult<()> {
+        self.ready_browsers.remove(&browser_id);
+        self.deferred_browser_requests.remove(&browser_id);
         self.surfaces.insert(browser_id, surface_id.clone());
         let generation = self.surface_generations.entry(browser_id).or_default();
         *generation += 1;
         bind_qt_surface(&surface_id, browser_id, *generation);
-        if let Err(error) = self.send_browser_request(
+        if let Err(error) = self.send_browser_request_now(
             browser_id,
             wire::request::Operation::CreateBrowser(wire::CreateBrowser {
                 initial_url: url.to_owned(),
@@ -326,6 +358,7 @@ impl CefInstance {
         ) {
             self.surfaces.remove(&browser_id);
             self.surface_generations.remove(&browser_id);
+            self.deferred_browser_requests.remove(&browser_id);
             forget_qt_browser(browser_id);
             return Err(error);
         }
@@ -628,7 +661,14 @@ impl CefInstance {
                 self.last_event_sequence = event.sequence;
                 let browser_id = event.browser_id;
                 let value = match event.value {
-                    Some(wire::event::Value::SurfaceReady(_)) => Some(ProtocolNotice::SurfaceReady),
+                    Some(wire::event::Value::SurfaceReady(_)) => {
+                        match self.mark_browser_ready(browser_id) {
+                            Ok(()) => Some(ProtocolNotice::SurfaceReady),
+                            Err(error) => Some(ProtocolNotice::ProtocolFailed(format!(
+                                "deferred browser command dispatch failed: {error}"
+                            ))),
+                        }
+                    }
                     Some(wire::event::Value::LoadingChanged(loading)) => {
                         Some(ProtocolNotice::LoadingChanged(loading.loading))
                     }
@@ -638,7 +678,11 @@ impl CefInstance {
                             failure.error_text, failure.error_code
                         )))
                     }
-                    Some(wire::event::Value::BrowserClosed(_)) => Some(ProtocolNotice::Closed),
+                    Some(wire::event::Value::BrowserClosed(_)) => {
+                        self.ready_browsers.remove(&browser_id);
+                        self.deferred_browser_requests.remove(&browser_id);
+                        Some(ProtocolNotice::Closed)
+                    }
                     Some(wire::event::Value::BrowserCrashed(crash)) => {
                         Some(ProtocolNotice::Crashed(crash.reason))
                     }
@@ -955,6 +999,8 @@ pub(crate) fn spawn_cef_browser(
         browser_id,
         next_request_id: 3,
         pending_requests: HashMap::new(),
+        ready_browsers: HashSet::from([browser_id]),
+        deferred_browser_requests: HashMap::new(),
         last_event_sequence,
         protocol_closed: false,
     })

@@ -499,8 +499,11 @@ class Driver:
         target_y = target_rectangle.y + target_rectangle.height // 2
         self.move_pointer_to(source_x, source_y)
         self.xdotool("mousedown", "1")
+        time.sleep(0.1)
         self.move_pointer_to((source_x + target_x) // 2, (source_y + target_y) // 2)
+        time.sleep(0.1)
         self.move_pointer_to(target_x, target_y)
+        time.sleep(0.1)
         self.xdotool("mouseup", "1")
 
     def arrange_windows_side_by_side(self, left_control_id, right_control_id):
@@ -678,15 +681,38 @@ class Driver:
         overlap = self.intersection(tooltip_rectangle, surface_rectangle)
         if overlap is None:
             raise SmokeFailure("the tab tooltip does not overlap the browser surface")
-        after = self.capture()
-        changed = ImageChops.difference(before.crop(overlap), after.crop(overlap))
-        changed_pixels = sum(
-            any(channel != 0 for channel in pixel)
-            for pixel in changed.get_flattened_data()
-        )
-        if changed_pixels < 32:
-            raise SmokeFailure("the Qt tooltip did not change composed browser pixels")
-        return changed_pixels
+        last_capture = {}
+
+        def probe_composition():
+            after = self.capture()
+            changed = ImageChops.difference(
+                before.crop(overlap), after.crop(overlap)
+            )
+            changed_pixels = sum(
+                any(channel != 0 for channel in pixel)
+                for pixel in changed.get_flattened_data()
+            )
+            last_capture["after"] = after
+            last_capture["difference"] = changed
+            return changed_pixels if changed_pixels >= 32 else None
+
+        try:
+            return self.wait_until(
+                "the Qt tooltip to change composed browser pixels",
+                probe_composition,
+                timeout=5.0,
+            )
+        except SmokeFailure as error:
+            self.artifact_directory.mkdir(parents=True, exist_ok=True)
+            before.save(self.artifact_directory / "tooltip-before.png")
+            if after := last_capture.get("after"):
+                after.save(self.artifact_directory / "tooltip-after.png")
+            if changed := last_capture.get("difference"):
+                changed.save(self.artifact_directory / "tooltip-difference.png")
+            raise SmokeFailure(
+                "the Qt tooltip did not change composed browser pixels "
+                f"within {overlap}"
+            ) from error
 
     def dump_accessibility_tree(self):
         if self.application is None:

@@ -278,6 +278,8 @@ ApplicationWindow {
         required property var host
         required property var tabsModel
         required property var moveTargetsModel
+        property string draggedTabId: ""
+        property point dragTranslation: Qt.point(0, 0)
         padding: 0
         implicitHeight: 38
 
@@ -392,7 +394,6 @@ ApplicationWindow {
                     required property string tabStatus
                     required property bool loading
                     required property bool crashed
-                    property bool dragStarted: false
                     objectName: `browser.tab.${tabStripControl.host.profileId}.${tabId}`
                     Accessible.id: objectName
                     Accessible.name: tabTitle || tabUrl
@@ -404,7 +405,7 @@ ApplicationWindow {
                         Math.min(260, tabList.width / Math.max(1, tabStripControl.tabsModel.count))
                     )
                     height: tabList.height
-                    z: tabDrag.active ? 2 : 0
+                    z: tabDragArea.dragging ? 2 : 0
                     onClicked: tabStripControl.host.requestTabSelection(tabId)
 
                     contentItem: RowLayout {
@@ -447,41 +448,73 @@ ApplicationWindow {
                     }
 
                     transform: Translate {
-                        x: tabDrag.active ? tabDrag.translation.x : 0
-                        y: tabDrag.active ? tabDrag.translation.y : 0
+                        x: tabDragArea.dragging
+                            ? tabStripControl.dragTranslation.x : 0
+                        y: tabDragArea.dragging
+                            ? tabStripControl.dragTranslation.y : 0
                     }
 
-                    DragHandler {
-                        id: tabDrag
-                        target: null
-                        acceptedButtons: Qt.LeftButton
+                    MouseArea {
+                        id: tabDragArea
+                        anchors.fill: parent
+                        anchors.rightMargin: 30
+                        acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
+                        hoverEnabled: true
+                        property bool dragging: false
+                        property point pressGlobal: Qt.point(0, 0)
 
-                        onActiveChanged: {
-                            if (active) {
-                                tabDelegate.dragStarted = true
-                            } else if (tabDelegate.dragStarted) {
-                                tabDelegate.dragStarted = false
-                                const sourceWindow = tabDelegate.Window.window
-                                const globalPoint = sourceWindow.contentItem.mapToGlobal(
-                                    centroid.scenePosition.x,
-                                    centroid.scenePosition.y
-                                )
-                                tabStripControl.host.finishTabDrag(tabDelegate.tabId, globalPoint)
+                        onPressed: function(mouse) {
+                            if (mouse.button === Qt.LeftButton) {
+                                pressGlobal = mapToGlobal(mouse.x, mouse.y)
+                                tabStripControl.draggedTabId = tabDelegate.tabId
+                                tabStripControl.dragTranslation = Qt.point(0, 0)
                             }
+                        }
+
+                        onPositionChanged: function(mouse) {
+                            if (!(mouse.buttons & Qt.LeftButton)) {
+                                return
+                            }
+                            const globalPoint = mapToGlobal(mouse.x, mouse.y)
+                            const delta = Qt.point(globalPoint.x - pressGlobal.x,
+                                                   globalPoint.y - pressGlobal.y)
+                            if (!dragging && Math.hypot(delta.x, delta.y)
+                                    >= Application.styleHints.startDragDistance) {
+                                dragging = true
+                            }
+                            if (dragging) {
+                                tabStripControl.dragTranslation = delta
+                            }
+                        }
+
+                        onReleased: function(mouse) {
+                            if (mouse.button === Qt.LeftButton) {
+                                if (dragging) {
+                                    tabStripControl.host.finishTabDrag(
+                                        tabDelegate.tabId,
+                                        mapToGlobal(mouse.x, mouse.y)
+                                    )
+                                } else {
+                                    tabStripControl.host.requestTabSelection(tabDelegate.tabId)
+                                }
+                            } else if (mouse.button === Qt.MiddleButton) {
+                                tabStripControl.host.backendObject.close_tab(tabDelegate.tabId)
+                            } else if (mouse.button === Qt.RightButton) {
+                                tabMenu.popup()
+                            }
+                            dragging = false
+                            tabStripControl.draggedTabId = ""
+                            tabStripControl.dragTranslation = Qt.point(0, 0)
+                        }
+
+                        onCanceled: {
+                            dragging = false
+                            tabStripControl.draggedTabId = ""
+                            tabStripControl.dragTranslation = Qt.point(0, 0)
                         }
                     }
 
-                    TapHandler {
-                        acceptedButtons: Qt.MiddleButton
-                        onTapped: tabStripControl.host.backendObject.close_tab(tabDelegate.tabId)
-                    }
-
-                    TapHandler {
-                        acceptedButtons: Qt.RightButton
-                        onTapped: tabMenu.popup()
-                    }
-
-                    ToolTip.visible: tabDelegate.hovered && !tabDrag.active
+                    ToolTip.visible: tabDelegate.hovered && !tabDragArea.dragging
                     ToolTip.text: `${tabDelegate.tabUrl}\n${tabDelegate.tabStatus}`
 
                     Menu {

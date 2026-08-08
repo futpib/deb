@@ -533,6 +533,13 @@ impl BrowserState {
         self.client.store(client, Ordering::Release);
     }
 
+    pub fn current_url(&self) -> String {
+        self.current_url
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     pub fn navigate(&self, url: &str) -> RuntimeResult<()> {
         if !self.is_valid() {
             return Err("browser is closed".into());
@@ -666,7 +673,10 @@ impl BrowserState {
             unsafe { release_raw(handler) };
             return Err("browser render handler has no view rectangle callback".into());
         };
-        unsafe { get_view_rect(handler, browser, &mut rect) };
+        unsafe {
+            add_ref_raw(browser);
+            get_view_rect(handler, browser, &mut rect);
+        }
         unsafe { release_raw(handler) };
         let width = u32::try_from(rect.width.max(2))?;
         let height = u32::try_from(rect.height.max(2))?;

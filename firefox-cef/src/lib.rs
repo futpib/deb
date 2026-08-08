@@ -21,7 +21,7 @@ use std::{
         atomic::{AtomicI32, Ordering},
     },
 };
-use strings::cef_string_to_string;
+use strings::{cef_string_to_string, cef_string_userfree_from_string};
 
 const API_HASH_15000_LINUX: &[u8] = b"210767725a6feb2e4becd3956b648cab6a006712\0";
 const CEF_COMMIT_HASH: &[u8] = b"7c1aa68455db1f1fad159c2b83070ad318212b3d\0";
@@ -235,6 +235,10 @@ unsafe extern "C" fn frame_get_browser(frame: *mut _cef_frame_t) -> *mut _cef_br
     browser
 }
 
+unsafe extern "C" fn frame_get_url(frame: *mut _cef_frame_t) -> cef_dll_sys::cef_string_userfree_t {
+    cef_string_userfree_from_string(&state_from(frame).current_url())
+}
+
 fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     let mut host = unsafe { std::mem::zeroed::<_cef_browser_host_t>() };
     host.get_browser = Some(host_get_browser);
@@ -259,6 +263,7 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     frame.load_url = Some(frame_load_url);
     frame.is_main = Some(frame_true);
     frame.is_focused = Some(frame_true);
+    frame.get_url = Some(frame_get_url);
     frame.get_browser = Some(frame_get_browser);
     let frame = RefObject::allocate(frame, state.clone());
     state.frame.store(frame, Ordering::Release);

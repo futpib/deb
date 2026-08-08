@@ -94,7 +94,10 @@ function registerBrowser(browserId, browser, initialUrl) {
     },
 
     onStateChange(webProgress, request, stateFlags, status) {
-      if (!(stateFlags & Ci.nsIWebProgressListener.STATE_IS_NETWORK)) {
+      if (
+        !webProgress.isTopLevel ||
+        !(stateFlags & Ci.nsIWebProgressListener.STATE_IS_NETWORK)
+      ) {
         return;
       }
       if (stateFlags & Ci.nsIWebProgressListener.STATE_START) {
@@ -102,6 +105,7 @@ function registerBrowser(browserId, browser, initialUrl) {
       }
       if (stateFlags & Ci.nsIWebProgressListener.STATE_STOP) {
         bridge.loadingStateChanged(browserId, false);
+        titleListener();
         if (!Components.isSuccessCode(status) && status != Cr.NS_BINDING_ABORTED) {
           const failedUrl = request?.URI?.spec ?? "";
           bridge.loadError(
@@ -134,7 +138,7 @@ function registerBrowser(browserId, browser, initialUrl) {
     Ci.nsIWebProgress.NOTIFY_LOCATION |
       Ci.nsIWebProgress.NOTIFY_STATE_NETWORK
   );
-  browser.addEventListener("DOMTitleChanged", titleListener, true);
+  browser.addEventListener("pagetitlechanged", titleListener);
   browser.addEventListener("oop-browser-crashed", crashListener);
   const entry = {
     active: false,
@@ -172,7 +176,7 @@ function removeBrowser(browserId, notifyClose) {
     return;
   }
   entry.browser.webProgress.removeProgressListener(entry.progressListener);
-  entry.browser.removeEventListener("DOMTitleChanged", entry.titleListener, true);
+  entry.browser.removeEventListener("pagetitlechanged", entry.titleListener);
   entry.browser.removeEventListener("oop-browser-crashed", entry.crashListener);
   entry.browser.remove();
   browsers.delete(browserId);

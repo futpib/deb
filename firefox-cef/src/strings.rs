@@ -13,6 +13,24 @@ unsafe extern "C" fn free_utf16(value: *mut char16_t) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn cef_string_userfree_utf16_alloc() -> *mut cef_string_utf16_t {
+    unsafe { libc::calloc(1, size_of::<cef_string_utf16_t>()) }.cast()
+}
+
+pub fn cef_string_userfree_from_string(value: &str) -> *mut cef_string_utf16_t {
+    let output = cef_string_userfree_utf16_alloc();
+    if output.is_null() {
+        return ptr::null_mut();
+    }
+    let encoded = value.encode_utf16().collect::<Vec<_>>();
+    if unsafe { cef_string_utf16_set(encoded.as_ptr(), encoded.len(), output, 1) } == 0 {
+        unsafe { cef_string_userfree_utf16_free(output) };
+        return ptr::null_mut();
+    }
+    output
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn cef_string_utf16_set(
     source: *const char16_t,
     source_len: usize,
@@ -276,6 +294,19 @@ mod tests {
             assert!(borrowed.dtor.is_none());
             cef_string_utf16_clear(&mut copied);
             cef_string_utf16_clear(&mut borrowed);
+        }
+    }
+
+    #[test]
+    fn allocates_userfree_utf16_strings() {
+        let output = cef_string_userfree_from_string("deb://new-tab/#firefox");
+        assert!(!output.is_null());
+        unsafe {
+            assert_eq!(
+                cef_string_to_string(output).as_deref(),
+                Some("deb://new-tab/#firefox")
+            );
+            cef_string_userfree_utf16_free(output);
         }
     }
 
