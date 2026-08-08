@@ -42,6 +42,17 @@ unsafe extern "C" {
     fn deb_browser_surface_clear(surface_id: *const libc::c_char, layer: i32);
     fn deb_browser_surface_bind(surface_id: *const libc::c_char, browser_id: u64, generation: u64);
     fn deb_browser_surface_forget(browser_id: u64);
+    fn deb_browser_surface_set_cursor(
+        browser_id: u64,
+        cef_type: i32,
+        custom_bgra: *const u8,
+        custom_bgra_length: usize,
+        width: u32,
+        height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        image_scale_factor: f32,
+    );
 }
 
 struct FrameReleaseTarget {
@@ -154,6 +165,50 @@ fn forget_qt_browser(browser_id: u64) {
     unsafe {
         deb_browser_surface_forget(browser_id);
     }
+}
+
+fn deliver_cursor(browser_id: u64, cursor: &wire::CursorChanged) -> NativeResult<()> {
+    if cursor.cef_type > 49 {
+        return Err(format!("cursor has invalid CEF type {}", cursor.cef_type).into());
+    }
+    if cursor.cef_type == 45 {
+        let expected_length = usize::try_from(cursor.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(cursor.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("custom cursor dimensions overflow")?;
+        if (!cursor.custom_bgra.is_empty() && cursor.custom_bgra.len() != expected_length)
+            || !cursor.image_scale_factor.is_finite()
+            || cursor.image_scale_factor <= 0.0
+        {
+            return Err("custom cursor metadata is invalid".into());
+        }
+    } else if !cursor.custom_bgra.is_empty() {
+        return Err("standard cursor unexpectedly contains custom pixels".into());
+    }
+    let pixels = if cursor.custom_bgra.is_empty() {
+        std::ptr::null()
+    } else {
+        cursor.custom_bgra.as_ptr()
+    };
+    unsafe {
+        deb_browser_surface_set_cursor(
+            browser_id,
+            cursor.cef_type as i32,
+            pixels,
+            cursor.custom_bgra.len(),
+            cursor.width,
+            cursor.height,
+            cursor.hotspot_x,
+            cursor.hotspot_y,
+            cursor.image_scale_factor,
+        );
+    }
+    Ok(())
 }
 
 pub(crate) type NativeResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -740,6 +795,12 @@ impl CefInstance {
                         }
                         None
                     }
+                    Some(wire::event::Value::CursorChanged(cursor)) => {
+                        match deliver_cursor(browser_id, &cursor) {
+                            Ok(()) => None,
+                            Err(error) => Some(ProtocolNotice::ProtocolFailed(error.to_string())),
+                        }
+                    }
                     None => None,
                 };
                 (browser_id, value)
@@ -1214,6 +1275,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::RendererCrashEvents,
         Capability::PointerInput,
         Capability::KeyboardInput,
+        Capability::CursorEvents,
     ]
     .into_iter()
     .map(|capability| capability as i32)

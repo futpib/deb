@@ -78,6 +78,8 @@ if ((needs_firefox_build)); then
         browser/moz.configure \
         gfx/webrender_bindings/RenderCompositor.cpp \
         toolkit/library/libxul.symbols \
+        widget/headless/HeadlessWidget.cpp \
+        widget/headless/HeadlessWidget.h \
         xpfe/appshell/AppWindow.cpp
     fi
     git apply "$patch_file"

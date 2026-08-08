@@ -3,10 +3,12 @@
 #include <QQuickItem>
 #include <QString>
 
+#include <cstddef>
 #include <memory>
 
 class DmabufFrame;
 class BrowserSurfacePrivate;
+class QCursor;
 class QHoverEvent;
 class QInputMethodEvent;
 class QKeyEvent;
@@ -30,6 +32,7 @@ public:
                      const std::shared_ptr<DmabufFrame> &frame);
     void submitFrame(const std::shared_ptr<DmabufFrame> &frame);
     void clearLayer(int layer);
+    void setBrowserCursor(unsigned long long browserId, const QCursor &cursor);
 
 signals:
     void surfaceIdChanged();
@@ -83,3 +86,7 @@ extern "C" void deb_browser_surface_bind(
     const char *surfaceId, unsigned long long browserId,
     unsigned long long surfaceGeneration);
 extern "C" void deb_browser_surface_forget(unsigned long long browserId);
+extern "C" void deb_browser_surface_set_cursor(
+    unsigned long long browserId, int cefType, const unsigned char *customBgra,
+    std::size_t customBgraLength, unsigned int width, unsigned int height,
+    int hotspotX, int hotspotY, float imageScaleFactor);

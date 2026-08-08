@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+import ctypes
+import ctypes.util
+import hashlib
 import http.server
 import os
 import secrets
@@ -20,6 +23,61 @@ from gi.repository import Atspi
 
 class SmokeFailure(RuntimeError):
     pass
+
+
+class XFixesCursorImage(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_short),
+        ("y", ctypes.c_short),
+        ("width", ctypes.c_ushort),
+        ("height", ctypes.c_ushort),
+        ("xhot", ctypes.c_ushort),
+        ("yhot", ctypes.c_ushort),
+        ("cursor_serial", ctypes.c_ulong),
+        ("pixels", ctypes.POINTER(ctypes.c_ulong)),
+        ("atom", ctypes.c_ulong),
+        ("name", ctypes.c_char_p),
+    ]
+
+
+class XCursorProbe:
+    def __init__(self):
+        x11_name = ctypes.util.find_library("X11")
+        xfixes_name = ctypes.util.find_library("Xfixes")
+        if not x11_name or not xfixes_name:
+            raise SmokeFailure("X11 cursor inspection libraries are unavailable")
+        self.x11 = ctypes.CDLL(x11_name)
+        self.xfixes = ctypes.CDLL(xfixes_name)
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XOpenDisplay.restype = ctypes.c_void_p
+        self.x11.XFree.argtypes = [ctypes.c_void_p]
+        self.x11.XFree.restype = ctypes.c_int
+        self.xfixes.XFixesGetCursorImage.argtypes = [ctypes.c_void_p]
+        self.xfixes.XFixesGetCursorImage.restype = ctypes.POINTER(XFixesCursorImage)
+        self.display = self.x11.XOpenDisplay(None)
+        if not self.display:
+            raise SmokeFailure("XOpenDisplay failed while preparing cursor inspection")
+
+    def snapshot(self):
+        pointer = self.xfixes.XFixesGetCursorImage(self.display)
+        if not pointer:
+            raise SmokeFailure("XFixesGetCursorImage returned no cursor")
+        try:
+            image = pointer.contents
+            byte_length = (
+                image.width * image.height * ctypes.sizeof(ctypes.c_ulong)
+            )
+            pixels = ctypes.string_at(image.pixels, byte_length)
+            return (
+                image.width,
+                image.height,
+                image.xhot,
+                image.yhot,
+                hashlib.sha256(pixels).hexdigest(),
+                image.name.decode("utf-8", errors="replace") if image.name else "",
+            )
+        finally:
+            self.x11.XFree(pointer)
 
 
 class E2ESite:
@@ -108,6 +166,18 @@ body.complete {{ background: linear-gradient(135deg, #123020, #176b3a, #49a078);
   color: white;
   background: #2457c5;
   font: 700 24px sans-serif;
+  cursor: pointer;
+}}
+#text-target {{
+  position: fixed;
+  z-index: 2;
+  left: 30%;
+  top: 18%;
+  width: 40%;
+  height: 10%;
+  box-sizing: border-box;
+  padding: 12px;
+  font: 24px sans-serif;
 }}
 body.chromium.clicked #click-target {{ color: #101522; background: #ff00ff; }}
 body.firefox.clicked #click-target {{ color: #101522; background: #00ffff; }}
@@ -116,6 +186,7 @@ body.firefox.clicked #click-target {{ color: #101522; background: #00ffff; }}
 <body class="{engine}">
 <div id="marker"></div>
 <div id="status">Waiting for the cross-engine cookie</div>
+<input id="text-target" type="text" value="Hover this text input">
 <button id="click-target" type="button">Click this page target</button>
 <script>
 const cookieName = {self.cookie_name!r};
@@ -176,6 +247,7 @@ class Driver:
         self.artifact_directory = artifact_directory
         self.log_path = log_path
         self.application = None
+        self.cursor_probe = XCursorProbe()
 
     def assert_no_process_failures(self, context):
         try:
@@ -568,6 +640,49 @@ class Driver:
         self.move_pointer_to(x, y)
         self.xdotool("click", "1")
 
+    def move_over_surface(self, accessible_id, x_fraction, y_fraction):
+        if not 0.0 < x_fraction < 1.0 or not 0.0 < y_fraction < 1.0:
+            raise SmokeFailure("surface hover fractions must be inside the viewport")
+        surface = self.wait_for_id(accessible_id)
+        rectangle = self.rectangle(surface)
+        self.focus_accessible_window(surface)
+        return self.move_pointer_to(
+            rectangle.x + round(rectangle.width * x_fraction),
+            rectangle.y + round(rectangle.height * y_fraction),
+        )
+
+    def verify_page_cursors(self, accessible_id, engine):
+        self.move_over_surface(accessible_id, 0.1, 0.5)
+        time.sleep(0.2)
+        default_cursor = self.cursor_probe.snapshot()
+
+        self.move_over_surface(accessible_id, 0.5, 0.23)
+        text_cursor = self.wait_until(
+            f"the {engine} text-input cursor",
+            lambda: (
+                cursor
+                if (cursor := self.cursor_probe.snapshot())[:5]
+                != default_cursor[:5]
+                else None
+            ),
+        )
+
+        self.move_over_surface(accessible_id, 0.5, 0.8)
+        pointer_cursor = self.wait_until(
+            f"the {engine} CSS pointer cursor",
+            lambda: (
+                cursor
+                if (cursor := self.cursor_probe.snapshot())[:5]
+                not in (default_cursor[:5], text_cursor[:5])
+                else None
+            ),
+        )
+        return tuple(cursor[5] or cursor[4][:12] for cursor in (
+            default_cursor,
+            text_cursor,
+            pointer_cursor,
+        ))
+
     def send_shortcut(self, accessible_id, sequence):
         accessible = self.wait_for_id(accessible_id)
         self.focus_accessible_window(accessible)
@@ -825,6 +940,10 @@ def main():
             chromium_marker, chromium_variants = driver.wait_for_surface(
                 "browser.surface.1", "Chromium"
             )
+            print("deb-e2e: checking Chromium page hover cursors", flush=True)
+            chromium_cursors = driver.verify_page_cursors(
+                "browser.surface.1", "Chromium"
+            )
             print("deb-e2e: clicking the Chromium page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
@@ -854,6 +973,10 @@ def main():
             )
             firefox_marker, firefox_variants = driver.wait_for_surface(
                 "browser.surface.1", "Firefox after cookie synchronization"
+            )
+            print("deb-e2e: checking Firefox page hover cursors", flush=True)
+            firefox_cursors = driver.verify_page_cursors(
+                "browser.surface.1", "Firefox"
             )
             print("deb-e2e: clicking the Firefox page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
@@ -1038,6 +1161,7 @@ def main():
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
                 f"Firefox internal page {firefox_internal_variants}/{firefox_internal_marker}, "
+                f"Chromium cursors {chromium_cursors}, Firefox cursors {firefox_cursors}, "
                 f"retained Chromium {retained_chromium_variants}/{retained_chromium_marker}, "
                 f"retained Firefox {retained_firefox_variants}/{retained_firefox_marker}, "
                 f"second window {second_window_variants}/{second_window_marker}, "

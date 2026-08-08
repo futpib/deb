@@ -1,9 +1,9 @@
 use cef_dll_sys::{
     _cef_browser_host_t, _cef_browser_t, _cef_client_t, _cef_frame_t, _cef_task_t,
     cef_accelerated_paint_info_common_t, cef_accelerated_paint_info_t,
-    cef_accelerated_paint_native_pixmap_plane_t, cef_color_type_t, cef_errorcode_t,
-    cef_main_args_t, cef_paint_element_type_t, cef_rect_t, cef_size_t, cef_string_t,
-    cef_termination_status_t, cef_transition_type_t,
+    cef_accelerated_paint_native_pixmap_plane_t, cef_color_type_t, cef_cursor_type_t,
+    cef_errorcode_t, cef_main_args_t, cef_paint_element_type_t, cef_rect_t, cef_size_t,
+    cef_string_t, cef_termination_status_t, cef_transition_type_t,
 };
 use libc::{c_char, c_int, c_void};
 use std::{
@@ -53,6 +53,7 @@ struct FirefoxCefCallbacks {
             c_int,
         ),
     >,
+    on_cursor_change: Option<unsafe extern "C" fn(*mut c_void, i32, u32)>,
 }
 
 #[repr(C)]
@@ -382,6 +383,7 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
         on_before_close: Some(on_before_close),
         on_cookie_changed: Some(on_cookie_changed),
         on_accelerated_frame: Some(on_accelerated_frame),
+        on_cursor_change: Some(on_cursor_change),
     };
     unsafe { (gecko()?.set_callbacks)(&callbacks) };
     Ok(())
@@ -805,6 +807,37 @@ impl BrowserState {
         }
     }
 
+    pub fn notify_cursor(&self, cef_type: u32) {
+        if cef_type >= cef_cursor_type_t::CT_NUM_VALUES as u32 {
+            return;
+        }
+        let client = self.client.load(Ordering::Acquire);
+        let browser = self.browser.load(Ordering::Acquire);
+        if client.is_null() || browser.is_null() {
+            return;
+        }
+        unsafe {
+            let Some(get_handler) = (*client).get_display_handler else {
+                return;
+            };
+            let handler = get_handler(client);
+            if handler.is_null() {
+                return;
+            }
+            if let Some(callback) = (*handler).on_cursor_change {
+                add_ref_raw(browser);
+                callback(
+                    handler,
+                    browser,
+                    0,
+                    mem::transmute::<u32, cef_cursor_type_t>(cef_type),
+                    ptr::null(),
+                );
+            }
+            release_raw(handler);
+        }
+    }
+
     pub fn notify_crashed(&self, reason: &str) {
         let client = self.client.load(Ordering::Acquire);
         let browser = self.browser.load(Ordering::Acquire);
@@ -955,6 +988,12 @@ unsafe extern "C" fn on_after_created(_context: *mut c_void, id: i32, window: u6
 unsafe extern "C" fn on_loading_state_change(_context: *mut c_void, id: i32, loading: u8) {
     if let Some(state) = find_state(id) {
         state.notify_loading(loading != 0);
+    }
+}
+
+unsafe extern "C" fn on_cursor_change(_context: *mut c_void, id: i32, cef_type: u32) {
+    if let Some(state) = find_state(id) {
+        state.notify_cursor(cef_type);
     }
 }
 

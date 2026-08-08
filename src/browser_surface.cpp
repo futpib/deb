@@ -1,9 +1,11 @@
 #include "browser_surface.h"
 
 #include <QCoreApplication>
+#include <QCursor>
 #include <QGuiApplication>
 #include <QHash>
 #include <QHoverEvent>
+#include <QImage>
 #include <QInputMethodEvent>
 #include <QKeyEvent>
 #include <QMetaObject>
@@ -13,6 +15,7 @@
 #include <QOpenGLContext>
 #include <QOpenGLExtraFunctions>
 #include <QPointer>
+#include <QPixmap>
 #include <QQmlEngine>
 #include <QQuickWindow>
 #include <QSGSimpleTextureNode>
@@ -87,6 +90,97 @@ QHash<QString, QPointer<BrowserSurface>> &surfaceRegistry() {
 QHash<unsigned long long, std::shared_ptr<DmabufFrame>> &frameCache() {
     static QHash<unsigned long long, std::shared_ptr<DmabufFrame>> cache;
     return cache;
+}
+
+QHash<unsigned long long, QCursor> &cursorCache() {
+    static QHash<unsigned long long, QCursor> cache;
+    return cache;
+}
+
+QCursor cursorForCefType(int type, const QByteArray &customBgra,
+                         unsigned int width, unsigned int height,
+                         int hotspotX, int hotspotY, float imageScaleFactor) {
+    switch (type) {
+    case 1:
+    case 31:
+    case 39:
+    case 40:
+        return QCursor(Qt::CrossCursor);
+    case 2:
+        return QCursor(Qt::PointingHandCursor);
+    case 3:
+    case 30:
+        return QCursor(Qt::IBeamCursor);
+    case 4:
+        return QCursor(Qt::WaitCursor);
+    case 5:
+        return QCursor(Qt::WhatsThisCursor);
+    case 6:
+    case 13:
+    case 15:
+    case 18:
+    case 21:
+    case 28:
+    case 44:
+        return QCursor(Qt::SizeHorCursor);
+    case 7:
+    case 10:
+    case 14:
+    case 19:
+    case 22:
+    case 25:
+    case 43:
+        return QCursor(Qt::SizeVerCursor);
+    case 8:
+    case 12:
+    case 16:
+    case 23:
+    case 27:
+        return QCursor(Qt::SizeBDiagCursor);
+    case 9:
+    case 11:
+    case 17:
+    case 24:
+    case 26:
+        return QCursor(Qt::SizeFDiagCursor);
+    case 20:
+    case 29:
+        return QCursor(Qt::SizeAllCursor);
+    case 33:
+    case 49:
+        return QCursor(Qt::DragLinkCursor);
+    case 34:
+        return QCursor(Qt::BusyCursor);
+    case 35:
+    case 38:
+    case 46:
+        return QCursor(Qt::ForbiddenCursor);
+    case 36:
+    case 48:
+        return QCursor(Qt::DragCopyCursor);
+    case 37:
+        return QCursor(Qt::BlankCursor);
+    case 41:
+        return QCursor(Qt::OpenHandCursor);
+    case 42:
+        return QCursor(Qt::ClosedHandCursor);
+    case 45: {
+        if (width == 0 || height == 0 || customBgra.isEmpty()) {
+            return QCursor(Qt::ArrowCursor);
+        }
+        const QImage borrowed(
+            reinterpret_cast<const unsigned char *>(customBgra.constData()),
+            static_cast<int>(width), static_cast<int>(height),
+            QImage::Format_ARGB32);
+        QPixmap pixmap = QPixmap::fromImage(borrowed.copy());
+        pixmap.setDevicePixelRatio(imageScaleFactor);
+        return QCursor(pixmap, hotspotX, hotspotY);
+    }
+    case 47:
+        return QCursor(Qt::DragMoveCursor);
+    default:
+        return QCursor(Qt::ArrowCursor);
+    }
 }
 
 int cefModifiers(Qt::KeyboardModifiers modifiers, Qt::MouseButtons buttons) {
@@ -580,7 +674,20 @@ void BrowserSurface::bindBrowser(
     if (frame != nullptr) {
         deb_rebind_dmabuf_lease(frame->leaseId, surfaceGeneration);
     }
+    const auto cursor = cursorCache().constFind(browserId);
+    if (cursor == cursorCache().constEnd()) {
+        unsetCursor();
+    } else {
+        setCursor(*cursor);
+    }
     update();
+}
+
+void BrowserSurface::setBrowserCursor(unsigned long long browserId,
+                                      const QCursor &cursor) {
+    if (d_->browserId == browserId) {
+        setCursor(cursor);
+    }
 }
 
 void BrowserSurface::submitFrame(const std::shared_ptr<DmabufFrame> &frame) {
@@ -836,7 +943,35 @@ extern "C" void deb_browser_surface_bind(
 
 extern "C" void deb_browser_surface_forget(unsigned long long browserId) {
     QMetaObject::invokeMethod(
-        qApp, [browserId] { frameCache().remove(browserId); },
+        qApp,
+        [browserId] {
+            frameCache().remove(browserId);
+            cursorCache().remove(browserId);
+        },
+        Qt::QueuedConnection);
+}
+
+extern "C" void deb_browser_surface_set_cursor(
+    unsigned long long browserId, int cefType, const unsigned char *customBgra,
+    std::size_t customBgraLength, unsigned int width, unsigned int height,
+    int hotspotX, int hotspotY, float imageScaleFactor) {
+    const QByteArray pixels(
+        reinterpret_cast<const char *>(customBgra),
+        customBgra == nullptr ? 0 : static_cast<qsizetype>(customBgraLength));
+    QMetaObject::invokeMethod(
+        qApp,
+        [browserId, cefType, pixels, width, height, hotspotX, hotspotY,
+         imageScaleFactor] {
+            const QCursor cursor = cursorForCefType(
+                cefType, pixels, width, height, hotspotX, hotspotY,
+                imageScaleFactor);
+            cursorCache().insert(browserId, cursor);
+            for (BrowserSurface *surface : surfaceRegistry()) {
+                if (surface != nullptr) {
+                    surface->setBrowserCursor(browserId, cursor);
+                }
+            }
+        },
         Qt::QueuedConnection);
 }
 

@@ -95,3 +95,39 @@ diff --git a/xpfe/appshell/AppWindow.cpp b/xpfe/appshell/AppWindow.cpp
      mWindow = nsIWidget::CreateHeadlessWidget();
    } else {
      mWindow = nsIWidget::CreateTopLevelWindow();
+diff --git a/widget/headless/HeadlessWidget.cpp b/widget/headless/HeadlessWidget.cpp
+--- a/widget/headless/HeadlessWidget.cpp
++++ b/widget/headless/HeadlessWidget.cpp
+@@ -22,6 +22,9 @@
+ #include "nsIScreen.h"
+ #include "HeadlessKeyBindings.h"
+ 
++extern "C" void firefox_cef_gecko_cursor_changed(nsIWidget *aWidget,
++                                                   uint32_t aCursor);
++
+ using namespace mozilla;
+ using namespace mozilla::gfx;
+ using namespace mozilla::layers;
+@@ -130,6 +133,11 @@ void HeadlessWidget::GetCompositorWidgetInitData(
+       mozilla::widget::HeadlessCompositorWidgetInitData(GetClientSize());
+ }
+ 
++void HeadlessWidget::SetCursor(const Cursor& aCursor) {
++  nsIWidget::SetCursor(aCursor);
++  firefox_cef_gecko_cursor_changed(this, aCursor.mDefaultCursor);
++}
++
+ void HeadlessWidget::RaiseWindow() {
+   MOZ_ASSERT(
+       mWindowType == WindowType::TopLevel || mWindowType == WindowType::Dialog,
+diff --git a/widget/headless/HeadlessWidget.h b/widget/headless/HeadlessWidget.h
+--- a/widget/headless/HeadlessWidget.h
++++ b/widget/headless/HeadlessWidget.h
+@@ -57,6 +57,7 @@ class HeadlessWidget final : public nsIWidget {
+       mozilla::widget::CompositorWidgetInitData* aInitData) override;
+ 
+   void Destroy() override;
++  void SetCursor(const Cursor& aCursor) override;
+   void Show(bool aState) override;
+   bool IsVisible() const override;
+   void Move(const DesktopPoint&) override;

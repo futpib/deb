@@ -92,6 +92,8 @@ struct FirefoxCefCallbacks {
                              uint32_t width, uint32_t height, uint64_t modifier,
                              const FirefoxCefPlane *planes, size_t planeCount,
                              int fenceFd);
+  void (*onCursorChange)(void *context, int32_t browserId,
+                         uint32_t cefCursorType);
 };
 
 mozilla::StaticMutex sMutex;
@@ -294,6 +296,82 @@ mozilla::MouseButton GeckoButton(uint32_t aButton) {
   default:
     return mozilla::MouseButton::eNotPressed;
   }
+}
+
+uint32_t ToCefCursorType(nsCursor aCursor) {
+  switch (aCursor) {
+  case eCursor_wait:
+    return 4;
+  case eCursor_select:
+    return 3;
+  case eCursor_hyperlink:
+    return 2;
+  case eCursor_n_resize:
+    return 7;
+  case eCursor_s_resize:
+    return 10;
+  case eCursor_w_resize:
+    return 13;
+  case eCursor_e_resize:
+    return 6;
+  case eCursor_nw_resize:
+    return 9;
+  case eCursor_se_resize:
+    return 11;
+  case eCursor_ne_resize:
+    return 8;
+  case eCursor_sw_resize:
+    return 12;
+  case eCursor_crosshair:
+    return 1;
+  case eCursor_move:
+  case eCursor_all_scroll:
+    return 29;
+  case eCursor_help:
+    return 5;
+  case eCursor_copy:
+    return 36;
+  case eCursor_alias:
+    return 33;
+  case eCursor_context_menu:
+    return 32;
+  case eCursor_cell:
+    return 31;
+  case eCursor_grab:
+    return 41;
+  case eCursor_grabbing:
+    return 42;
+  case eCursor_spinning:
+    return 34;
+  case eCursor_zoom_in:
+    return 39;
+  case eCursor_zoom_out:
+    return 40;
+  case eCursor_not_allowed:
+    return 38;
+  case eCursor_col_resize:
+    return 18;
+  case eCursor_row_resize:
+    return 19;
+  case eCursor_no_drop:
+    return 35;
+  case eCursor_vertical_text:
+    return 30;
+  case eCursor_nesw_resize:
+    return 16;
+  case eCursor_nwse_resize:
+    return 17;
+  case eCursor_ns_resize:
+    return 14;
+  case eCursor_ew_resize:
+    return 15;
+  case eCursor_none:
+    return 37;
+  case eCursor_standard:
+  case eCursorCount:
+    return 0;
+  }
+  return 0;
 }
 
 void DispatchMouseMove(uint32_t aBrowserId, int32_t aX, int32_t aY,
@@ -855,6 +933,16 @@ firefox_cef_gecko_browser_for_widget(nsIWidget *aWidget) {
   mozilla::StaticMutexAutoLock lock(sMutex);
   auto browser = sWidgetBrowsers.find(aWidget);
   return browser == sWidgetBrowsers.end() ? 0 : browser->second;
+}
+
+extern "C" NS_EXPORT void
+firefox_cef_gecko_cursor_changed(nsIWidget *aWidget, uint32_t aCursor) {
+  const uint32_t browserId = firefox_cef_gecko_browser_for_widget(aWidget);
+  FirefoxCefCallbacks callbacks = Callbacks();
+  if (browserId && aCursor < eCursorCount && callbacks.onCursorChange) {
+    callbacks.onCursorChange(callbacks.context, browserId,
+                             ToCefCursorType(static_cast<nsCursor>(aCursor)));
+  }
 }
 
 extern "C" NS_EXPORT void firefox_cef_gecko_emit_accelerated_frame(

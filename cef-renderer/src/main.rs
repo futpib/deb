@@ -574,6 +574,55 @@ wrap_load_handler! {
     }
 }
 
+fn cursor_changed(
+    type_: CursorType,
+    custom_cursor_info: Option<&CursorInfo>,
+) -> wire::CursorChanged {
+    let mut changed = wire::CursorChanged {
+        cef_type: type_.get_raw(),
+        custom_bgra: Vec::new(),
+        width: 0,
+        height: 0,
+        hotspot_x: 0,
+        hotspot_y: 0,
+        image_scale_factor: 1.0,
+    };
+    if type_ != CursorType::CUSTOM {
+        return changed;
+    }
+    let Some(info) = custom_cursor_info else {
+        return changed;
+    };
+    let (Ok(width), Ok(height)) = (
+        u32::try_from(info.size.width),
+        u32::try_from(info.size.height),
+    ) else {
+        return changed;
+    };
+    let Some(byte_length) = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return changed;
+    };
+    if info.buffer.is_null() || byte_length == 0 || byte_length > MAX_PACKET_BYTES / 2 {
+        return changed;
+    }
+    changed.custom_bgra =
+        unsafe { std::slice::from_raw_parts(info.buffer.cast::<u8>(), byte_length).to_vec() };
+    changed.width = width;
+    changed.height = height;
+    changed.hotspot_x = info.hotspot.x;
+    changed.hotspot_y = info.hotspot.y;
+    changed.image_scale_factor = info.image_scale_factor;
+    changed
+}
+
 wrap_display_handler! {
     struct BrowserDisplayHandler {
         emitter: ProtocolEmitter,
@@ -586,6 +635,19 @@ wrap_display_handler! {
                     title: title.map(CefString::to_string).unwrap_or_default(),
                 },
             ));
+        }
+
+        fn on_cursor_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            _cursor: std::os::raw::c_ulong,
+            type_: CursorType,
+            custom_cursor_info: Option<&CursorInfo>,
+        ) -> i32 {
+            self.emitter.event(wire::event::Value::CursorChanged(
+                cursor_changed(type_, custom_cursor_info),
+            ));
+            1
         }
     }
 }
@@ -1234,6 +1296,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::RendererCrashEvents,
         Capability::PointerInput,
         Capability::KeyboardInput,
+        Capability::CursorEvents,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -1654,8 +1717,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        ControlCommand, KeyEventType, absolute_profile_path, bounds_from_viewport, control_command,
-        is_deb_internal_url, validate_cef_api_hash,
+        ControlCommand, CursorInfo, CursorType, KeyEventType, Point, Size, absolute_profile_path,
+        bounds_from_viewport, control_command, cursor_changed, is_deb_internal_url,
+        validate_cef_api_hash,
     };
     use shell_protocol::wire;
     #[test]
@@ -1807,6 +1871,32 @@ mod tests {
         };
         assert!(control_command(request(wire::MouseButton::Unspecified as i32, 1)).is_err());
         assert!(control_command(request(wire::MouseButton::Left as i32, 0)).is_err());
+    }
+
+    #[test]
+    fn serializes_standard_and_custom_page_cursors() {
+        let standard = cursor_changed(CursorType::IBEAM, None);
+        assert_eq!(standard.cef_type, CursorType::IBEAM.get_raw());
+        assert!(standard.custom_bgra.is_empty());
+
+        let mut pixels = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let custom = cursor_changed(
+            CursorType::CUSTOM,
+            Some(&CursorInfo {
+                hotspot: Point { x: 1, y: 0 },
+                image_scale_factor: 2.0,
+                buffer: pixels.as_mut_ptr().cast(),
+                size: Size {
+                    width: 2,
+                    height: 1,
+                },
+            }),
+        );
+        assert_eq!(custom.cef_type, CursorType::CUSTOM.get_raw());
+        assert_eq!(custom.custom_bgra, pixels);
+        assert_eq!((custom.width, custom.height), (2, 1));
+        assert_eq!((custom.hotspot_x, custom.hotspot_y), (1, 0));
+        assert_eq!(custom.image_scale_factor, 2.0);
     }
 
     #[test]
