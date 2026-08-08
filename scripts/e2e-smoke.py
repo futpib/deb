@@ -156,7 +156,6 @@ class VirtualTouchscreen:
         self.width = width
         self.height = height
         try:
-            self.set_bit(self.UI_SET_EVBIT, self.EV_SYN)
             self.set_bit(self.UI_SET_EVBIT, self.EV_KEY)
             self.set_bit(self.UI_SET_EVBIT, self.EV_ABS)
             self.set_bit(self.UI_SET_KEYBIT, self.BTN_TOUCH)
@@ -182,7 +181,7 @@ class VirtualTouchscreen:
         time.sleep(1.0)
 
     def set_bit(self, operation, value):
-        fcntl.ioctl(self.fd, operation, struct.pack("i", value))
+        fcntl.ioctl(self.fd, operation, value)
 
     def set_axis(self, code, maximum):
         setup = UInputAbsSetup(
@@ -230,7 +229,7 @@ class VirtualTouchscreen:
     def pinch(self, x, y):
         self.begin(0, 100, x - 24, y, primary=True)
         self.begin(1, 101, x + 24, y)
-        for distance in (40, 60, 80, 100):
+        for distance in (40, 60, 80, 100, 80, 60, 40, 24):
             self.move_pair((x - distance, y), (x + distance, y))
             time.sleep(0.04)
         self.emit(self.EV_ABS, self.ABS_MT_SLOT, 1)
@@ -952,7 +951,12 @@ class Driver:
     def surface_statistics(self, accessible_id):
         pixels = list(self.surface_image(accessible_id).get_flattened_data())
         marker_pixels = sum(
-            red < 16 and green > 239 and blue < 16 for red, green, blue in pixels
+            blue < 16
+            and (
+                (red < 16 and green > 239)
+                or (red > 239 and 120 < green < 160)
+            )
+            for red, green, blue in pixels
         )
         variants = len(set(pixels[::97]))
         return marker_pixels, variants
@@ -1187,6 +1191,7 @@ def main():
                     "browser.tab.default.1",
                     f"deb-e2e chromium raw gesture received {site.token}",
                 )
+                time.sleep(0.1)
             print("deb-e2e: clicking the Chromium page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
@@ -1231,6 +1236,7 @@ def main():
                     "browser.tab.default.2",
                     f"deb-e2e firefox raw gesture received {site.token}",
                 )
+                time.sleep(0.1)
             print("deb-e2e: clicking the Firefox page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
