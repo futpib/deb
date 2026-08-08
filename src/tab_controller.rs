@@ -116,7 +116,31 @@ pub enum TabCommand {
     Stop,
 }
 
+impl TabCommand {
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::AddWindow { .. } => "add-window",
+            Self::RemoveWindow(_) => "remove-window",
+            Self::Layout(_, _) => "layout",
+            Self::SetWindowState { .. } => "set-window-state",
+            Self::Navigate(_, _) => "navigate",
+            Self::Reload(_) => "reload",
+            Self::NewTab(_, _) => "new-tab",
+            Self::Select(_, _) => "select-tab",
+            Self::Close(_) => "close-tab",
+            Self::SwitchEngine(_, _) => "switch-engine",
+            Self::Move { .. } => "move-tab",
+            Self::MouseMove { .. } => "mouse-move",
+            Self::MouseClick { .. } => "mouse-click",
+            Self::MouseWheel { .. } => "mouse-wheel",
+            Self::KeyEvent { .. } => "key-event",
+            Self::Stop => "stop",
+        }
+    }
+}
+
 pub struct TabController {
+    profile_id: String,
     sender: Sender<TabCommand>,
     thread: JoinHandle<()>,
 }
@@ -127,8 +151,18 @@ impl TabController {
     }
 
     pub fn stop(self) {
-        let _ = self.sender.send(TabCommand::Stop);
-        let _ = self.thread.join();
+        if let Err(error) = self.sender.send(TabCommand::Stop) {
+            eprintln!(
+                "deb: failure: tab controller stop: profile={}: {error}",
+                self.profile_id
+            );
+        }
+        if self.thread.join().is_err() {
+            eprintln!(
+                "deb: failure: tab controller stop: profile={}: controller thread panicked",
+                self.profile_id
+            );
+        }
     }
 }
 
@@ -139,17 +173,23 @@ pub fn spawn(
 ) -> TabController {
     let (sender, receiver) = mpsc::channel();
     let invoker = Arc::new(Mutex::new(invoker));
+    let controller_profile_id = profile_id.clone();
     let thread = std::thread::spawn({
         let invoker = Arc::clone(&invoker);
+        let failure_profile_id = profile_id.clone();
         move || {
             let result = Runtime::new(profile_id, directories, Arc::clone(&invoker), receiver)
                 .and_then(Runtime::run);
             if let Err(error) = result {
-                eprintln!("deb: tab controller failed: {error}");
+                eprintln!("deb: failure: tab controller: profile={failure_profile_id}: {error}");
             }
         }
     });
-    TabController { sender, thread }
+    TabController {
+        profile_id: controller_profile_id,
+        sender,
+        thread,
+    }
 }
 
 #[derive(Serialize)]
@@ -202,6 +242,25 @@ impl Tab {
             crashed: self.crashed,
         }
     }
+}
+
+fn tab_failure_message(
+    profile_id: &str,
+    tab: &Tab,
+    browser_id: Option<u64>,
+    failure: &str,
+) -> String {
+    let browser_id = browser_id
+        .or(tab.browser_id)
+        .map_or_else(|| "none".to_owned(), |browser_id| browser_id.to_string());
+    let engine = match tab.engine {
+        TabEngine::Chromium => "chromium",
+        TabEngine::Firefox => "firefox",
+    };
+    format!(
+        "deb: failure: tab: profile={profile_id} window={} tab={} engine={engine} browser={browser_id}: {failure}",
+        tab.window_id, tab.id
+    )
 }
 
 fn relocate_tab(
@@ -472,7 +531,13 @@ impl Runtime {
                     if matches!(command, TabCommand::Stop) {
                         break;
                     }
-                    self.command(command)?;
+                    let operation = command.operation();
+                    if let Err(error) = self.command(command) {
+                        eprintln!(
+                            "deb: failure: tab command: profile={} operation={operation}: {error}",
+                            self.profile_id
+                        );
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
                 Err(RecvTimeoutError::Timeout) => {}
@@ -636,7 +701,12 @@ impl Runtime {
     fn attach_tab(&mut self, tab_id: u64) -> TabResult<()> {
         let browser_id = NEXT_BROWSER_ID.fetch_add(1, Ordering::Relaxed);
         if browser_id == 0 {
-            return Err("application browser ID space is exhausted".into());
+            self.mark_tab_failed(
+                tab_id,
+                None,
+                "Application browser ID space is exhausted".to_owned(),
+            )?;
+            return Ok(());
         }
         let (backend, url, window_id) = {
             let tab = self.tab_mut(tab_id)?;
@@ -668,30 +738,76 @@ impl Runtime {
                 Ok(process) => {
                     let mut runtime = EngineRuntime::initial(process);
                     self.cookie_sync.begin(backend);
-                    runtime.process.read_browser_cookies(browser_id)?;
-                    *self.engine_mut(backend) = Some(runtime);
+                    match runtime.process.read_browser_cookies(browser_id) {
+                        Ok(()) => *self.engine_mut(backend) = Some(runtime),
+                        Err(error) => {
+                            runtime.process.shutdown();
+                            self.mark_tab_failed(
+                                tab_id,
+                                Some(browser_id),
+                                format!("{} failed: {error}", backend.label()),
+                            )?;
+                        }
+                    }
                 }
                 Err(error) => {
-                    let tab = self.tab_mut(tab_id)?;
-                    tab.browser_id = None;
-                    tab.loading = false;
-                    tab.status = format!("{} failed: {error}", backend.label());
+                    self.mark_tab_failed(
+                        tab_id,
+                        Some(browser_id),
+                        format!("{} failed: {error}", backend.label()),
+                    )?;
                 }
             }
         } else {
-            let runtime = self.engine_mut(backend).as_mut().expect("engine exists");
-            runtime.process.create_browser(
-                browser_id,
-                parent,
-                bounds,
-                &url,
-                &profile_id,
-                &directories,
-                surface_id,
-            )?;
-            runtime.browsers.insert(browser_id);
+            let result = {
+                let runtime = self.engine_mut(backend).as_mut().expect("engine exists");
+                runtime.process.create_browser(
+                    browser_id,
+                    parent,
+                    bounds,
+                    &url,
+                    &profile_id,
+                    &directories,
+                    surface_id,
+                )
+            };
+            match result {
+                Ok(()) => {
+                    self.engine_mut(backend)
+                        .as_mut()
+                        .expect("engine exists")
+                        .browsers
+                        .insert(browser_id);
+                }
+                Err(error) => {
+                    self.mark_tab_failed(
+                        tab_id,
+                        Some(browser_id),
+                        format!("{} failed: {error}", backend.label()),
+                    )?;
+                }
+            }
         }
         self.dirty = true;
+        Ok(())
+    }
+
+    fn mark_tab_failed(
+        &mut self,
+        tab_id: u64,
+        browser_id: Option<u64>,
+        failure: String,
+    ) -> TabResult<()> {
+        let profile_id = self.profile_id.clone();
+        let tab = self.tab_mut(tab_id)?;
+        eprintln!(
+            "{}",
+            tab_failure_message(&profile_id, tab, browser_id, &failure)
+        );
+        tab.browser_id = None;
+        tab.loading = false;
+        tab.crashed = true;
+        tab.status = failure;
         Ok(())
     }
 
@@ -957,11 +1073,36 @@ impl Runtime {
     }
 
     fn handle_notice(&mut self, backend: CefBackend, notice: RoutedNotice) -> TabResult<()> {
-        let Some(tab) = self.tab_for_browser_mut(backend, notice.browser_id) else {
+        let Some(tab_index) = self.tabs.iter().position(|tab| {
+            tab.engine.backend() == backend && tab.browser_id == Some(notice.browser_id)
+        }) else {
+            let failure = match &notice.value {
+                ProtocolNotice::CommandFailed(error) | ProtocolNotice::ProtocolFailed(error) => {
+                    Some(error.as_str())
+                }
+                ProtocolNotice::LoadFailed(error) | ProtocolNotice::Crashed(error) => {
+                    Some(error.as_str())
+                }
+                _ => None,
+            };
+            if let Some(failure) = failure {
+                eprintln!(
+                    "deb: failure: engine event: profile={} engine={} browser={}: {failure}",
+                    self.profile_id,
+                    backend.label(),
+                    notice.browser_id
+                );
+            }
             return Ok(());
         };
+        let profile_id = self.profile_id.clone();
+        let tab = &mut self.tabs[tab_index];
         match notice.value {
             ProtocolNotice::CommandFailed(error) | ProtocolNotice::ProtocolFailed(error) => {
+                eprintln!(
+                    "{}",
+                    tab_failure_message(&profile_id, tab, Some(notice.browser_id), &error)
+                );
                 tab.status = error;
             }
             ProtocolNotice::SurfaceReady => {
@@ -977,18 +1118,34 @@ impl Runtime {
             ProtocolNotice::NavigationCommitted(url) => tab.url = url,
             ProtocolNotice::TitleChanged(title) => tab.title = title,
             ProtocolNotice::LoadFailed(error) => {
+                let failure = format!("Load failed: {error}");
+                eprintln!(
+                    "{}",
+                    tab_failure_message(&profile_id, tab, Some(notice.browser_id), &failure)
+                );
                 tab.loading = false;
-                tab.status = format!("Load failed: {error}");
+                tab.status = failure;
             }
             ProtocolNotice::Closed => {
+                let failure = "Browser closed";
+                eprintln!(
+                    "{}",
+                    tab_failure_message(&profile_id, tab, Some(notice.browser_id), failure)
+                );
                 tab.browser_id = None;
                 tab.loading = false;
-                tab.status = "Browser closed".to_owned();
+                tab.crashed = true;
+                tab.status = failure.to_owned();
             }
             ProtocolNotice::Crashed(reason) => {
+                let failure = format!("Renderer crashed: {reason}");
+                eprintln!(
+                    "{}",
+                    tab_failure_message(&profile_id, tab, Some(notice.browser_id), &failure)
+                );
                 tab.crashed = true;
                 tab.loading = false;
-                tab.status = format!("Renderer crashed: {reason}");
+                tab.status = failure;
             }
             ProtocolNotice::CookieSnapshotEntry(_)
             | ProtocolNotice::CookieSnapshotComplete
@@ -1003,11 +1160,16 @@ impl Runtime {
         if let Some(runtime) = runtime {
             runtime.process.shutdown();
         }
+        let profile_id = self.profile_id.clone();
         for tab in self
             .tabs
             .iter_mut()
             .filter(|tab| tab.engine.backend() == backend)
         {
+            eprintln!(
+                "{}",
+                tab_failure_message(&profile_id, tab, tab.browser_id, &reason)
+            );
             tab.browser_id = None;
             tab.loading = false;
             tab.crashed = true;
@@ -1059,12 +1221,26 @@ impl Runtime {
                 })
                 .collect(),
         };
-        let json =
-            serde_json::to_string(&snapshot).unwrap_or_else(|_| "{\"windows\":[]}".to_owned());
-        let invoker = self
-            .invoker
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let json = match serde_json::to_string(&snapshot) {
+            Ok(json) => json,
+            Err(error) => {
+                eprintln!(
+                    "deb: failure: tab snapshot: profile={}: {error}",
+                    self.profile_id
+                );
+                "{\"windows\":[]}".to_owned()
+            }
+        };
+        let invoker = match self.invoker.lock() {
+            Ok(invoker) => invoker,
+            Err(error) => {
+                eprintln!(
+                    "deb: failure: Qt invocation: profile={}: invoker lock was poisoned",
+                    self.profile_id
+                );
+                error.into_inner()
+            }
+        };
         invoke_method!(&*invoker, "update_window_state", json);
         self.dirty = false;
     }
@@ -1117,17 +1293,13 @@ impl Runtime {
             .find(|tab| tab.id == id)
             .ok_or_else(|| format!("tab {id} does not exist").into())
     }
-
-    fn tab_for_browser_mut(&mut self, backend: CefBackend, browser: u64) -> Option<&mut Tab> {
-        self.tabs
-            .iter_mut()
-            .find(|tab| tab.engine.backend() == backend && tab.browser_id == Some(browser))
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CookieMutation, Tab, TabEngine, reconcile_mutation, relocate_tab};
+    use super::{
+        CookieMutation, Tab, TabEngine, reconcile_mutation, relocate_tab, tab_failure_message,
+    };
     use crate::cookie_store::{CanonicalCookie, CookieIdentity};
     use shell_protocol::wire;
     use std::collections::HashMap;
@@ -1203,6 +1375,18 @@ mod tests {
         assert_eq!(TabEngine::parse("chromium"), Some(TabEngine::Chromium));
         assert_eq!(TabEngine::parse("firefox"), Some(TabEngine::Firefox));
         assert_eq!(TabEngine::parse("webkit"), None);
+    }
+
+    #[test]
+    fn tab_failures_identify_the_exact_runtime_context() {
+        let mut tab = tab(7, 3);
+        tab.engine = TabEngine::Firefox;
+        tab.browser_id = Some(42);
+
+        assert_eq!(
+            tab_failure_message("work", &tab, None, "helper exited: exit status: 11"),
+            "deb: failure: tab: profile=work window=3 tab=7 engine=firefox browser=42: helper exited: exit status: 11"
+        );
     }
 
     #[test]

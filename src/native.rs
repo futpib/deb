@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command},
     sync::{
-        Mutex, OnceLock,
+        Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, TryRecvError},
     },
@@ -62,6 +62,18 @@ fn frame_leases() -> &'static Mutex<HashMap<u64, FrameReleaseTarget>> {
     LEASES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn lock_frame_leases(operation: &str) -> MutexGuard<'static, HashMap<u64, FrameReleaseTarget>> {
+    match frame_leases().lock() {
+        Ok(leases) => leases,
+        Err(error) => {
+            eprintln!(
+                "deb: failure: frame lease {operation}: frame lease registry lock was poisoned"
+            );
+            error.into_inner()
+        }
+    }
+}
+
 fn register_frame_lease(
     sender: &mpsc::Sender<FrameLeaseEvent>,
     browser_id: u64,
@@ -71,61 +83,61 @@ fn register_frame_lease(
 ) -> u64 {
     static NEXT_LEASE: AtomicU64 = AtomicU64::new(1);
     let lease_id = NEXT_LEASE.fetch_add(1, Ordering::Relaxed);
-    frame_leases()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .insert(
-            lease_id,
-            FrameReleaseTarget {
-                sender: sender.clone(),
-                browser_id,
-                frame_id,
-                layer,
-                surface_generation,
-            },
-        );
+    lock_frame_leases("registration").insert(
+        lease_id,
+        FrameReleaseTarget {
+            sender: sender.clone(),
+            browser_id,
+            frame_id,
+            layer,
+            surface_generation,
+        },
+    );
     lease_id
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn deb_release_dmabuf_lease(lease_id: u64) {
-    let target = frame_leases()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .remove(&lease_id);
-    if let Some(target) = target {
-        let _ = target.sender.send(FrameLeaseEvent::Released(
+    let target = lock_frame_leases("release").remove(&lease_id);
+    if let Some(target) = target
+        && let Err(error) = target.sender.send(FrameLeaseEvent::Released(
             target.browser_id,
             target.frame_id,
-        ));
+        ))
+    {
+        eprintln!(
+            "deb: failure: frame lease release: browser={} frame={}: {error}",
+            target.browser_id, target.frame_id
+        );
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn deb_present_dmabuf_lease(lease_id: u64) {
-    let target = frame_leases()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
+    let target = lock_frame_leases("presentation")
         .get(&lease_id)
         .and_then(|target| {
             (target.layer == wire::SurfaceLayer::View).then(|| {
                 (
                     target.sender.clone(),
                     target.browser_id,
+                    target.frame_id,
                     target.surface_generation,
                 )
             })
         });
-    if let Some((sender, browser_id, surface_generation)) = target {
-        let _ = sender.send(FrameLeaseEvent::Presented(browser_id, surface_generation));
+    if let Some((sender, browser_id, frame_id, surface_generation)) = target
+        && let Err(error) = sender.send(FrameLeaseEvent::Presented(browser_id, surface_generation))
+    {
+        eprintln!(
+            "deb: failure: frame lease presentation: browser={browser_id} frame={frame_id}: {error}"
+        );
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn deb_rebind_dmabuf_lease(lease_id: u64, surface_generation: u64) {
-    let mut leases = frame_leases()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut leases = lock_frame_leases("rebind");
     if let Some(target) = leases.get_mut(&lease_id) {
         target.surface_generation = surface_generation;
     }
@@ -665,8 +677,13 @@ impl CefInstance {
                         match self.deliver_frame(browser_id, frame, file_descriptors) {
                             Ok(()) => None,
                             Err(error) => {
-                                let _ = self.send_frame_release(browser_id, frame_id);
-                                Some(ProtocolNotice::ProtocolFailed(error.to_string()))
+                                let failure = match self.send_frame_release(browser_id, frame_id) {
+                                    Ok(()) => error.to_string(),
+                                    Err(release_error) => format!(
+                                        "{error}; failed to release rejected frame {frame_id}: {release_error}"
+                                    ),
+                                };
+                                Some(ProtocolNotice::ProtocolFailed(failure))
                             }
                         }
                     }
@@ -803,10 +820,16 @@ impl CefInstance {
         for browser_id in self.surface_generations.keys().copied() {
             forget_qt_browser(browser_id);
         }
-        let _ = self.send_process_request(
+        if let Err(error) = self.send_process_request(
             wire::request::Operation::Shutdown(wire::Shutdown {}),
             "shutdown",
-        );
+        ) {
+            eprintln!(
+                "deb: failure: helper shutdown: browser={} process={}: {error}",
+                self.browser_id,
+                self.child.id()
+            );
+        }
         stop_child(&mut self.child);
     }
 
@@ -904,8 +927,18 @@ pub(crate) fn spawn_cef_browser(
     ) {
         Ok(ready) => ready,
         Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(kill_error) = child.kill() {
+                eprintln!(
+                    "deb: failure: helper startup cleanup: process={}: kill failed: {kill_error}",
+                    child.id()
+                );
+            }
+            if let Err(wait_error) = child.wait() {
+                eprintln!(
+                    "deb: failure: helper startup cleanup: process={}: wait failed: {wait_error}",
+                    child.id()
+                );
+            }
             return Err(format!("{} did not become ready: {error}", backend.name()).into());
         }
     };
@@ -1173,11 +1206,27 @@ fn stop_child(child: &mut Child) {
         match child.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) => sleep(Duration::from_millis(50)),
-            Err(_) => break,
+            Err(error) => {
+                eprintln!(
+                    "deb: failure: helper shutdown: process={}: status check failed: {error}",
+                    child.id()
+                );
+                break;
+            }
         }
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    if let Err(error) = child.kill() {
+        eprintln!(
+            "deb: failure: helper shutdown: process={}: kill failed: {error}",
+            child.id()
+        );
+    }
+    if let Err(error) = child.wait() {
+        eprintln!(
+            "deb: failure: helper shutdown: process={}: wait failed: {error}",
+            child.id()
+        );
+    }
 }
 
 #[cfg(test)]

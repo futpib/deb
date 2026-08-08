@@ -12,6 +12,23 @@ use tab_controller::{TabCommand, TabController, TabEngine};
 
 const DEFAULT_URL: &str = "deb://new-tab/";
 
+fn send_controller_command(
+    controller: &TabController,
+    profile_id: &str,
+    operation: &str,
+    command: TabCommand,
+) -> bool {
+    match controller.send(command) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "deb: failure: shell command: profile={profile_id} operation={operation}: {error}"
+            );
+            false
+        }
+    }
+}
+
 unsafe extern "C" {
     fn register_browser_surface();
 }
@@ -79,6 +96,10 @@ impl Backend {
         }
         if !is_valid_profile_id(&profile_id) {
             self.status = format!("Invalid profile ID {profile_id:?}");
+            eprintln!(
+                "deb: failure: profile selection: profile={}: {}",
+                self.profile_id, self.status
+            );
             self.status_changed();
             return;
         }
@@ -121,20 +142,31 @@ impl Backend {
     #[qslot]
     fn navigate(&mut self, window_id: String, input: String) {
         let Ok(window_id) = window_id.parse::<u64>() else {
+            eprintln!(
+                "deb: failure: shell command: profile={} operation=navigate: invalid window ID {window_id:?}",
+                self.profile_id
+            );
             return;
         };
         let url = normalize_url(&input);
         if self.controller.is_none() {
+            self.status = "Native controller is not running".to_owned();
+            eprintln!(
+                "deb: failure: shell command: profile={} operation=navigate: {}",
+                self.profile_id, self.status
+            );
+            self.status_changed();
             return;
         }
         self.status = "Navigating…".to_owned();
         self.status_changed();
-        let send_failed = self.controller.as_ref().is_none_or(|controller| {
-            controller
-                .send(TabCommand::Navigate(window_id, url))
-                .is_err()
-        });
-        if send_failed {
+        let controller = self.controller.as_ref().expect("controller exists");
+        if !send_controller_command(
+            controller,
+            &self.profile_id,
+            "navigate",
+            TabCommand::Navigate(window_id, url),
+        ) {
             self.status = "Native controller stopped".to_owned();
             self.status_changed();
         }
@@ -174,6 +206,10 @@ impl Backend {
                 Ok(directories) => directories,
                 Err(error) => {
                     self.status = format!("Profile storage failed: {error}");
+                    eprintln!(
+                        "deb: failure: profile storage: profile={}: {}",
+                        self.profile_id, self.status
+                    );
                     self.status_changed();
                     return;
                 }
@@ -186,23 +222,38 @@ impl Backend {
         }
         if let Some(controller) = &self.controller {
             if self.registered_windows.insert(window_id) {
-                let _ = controller.send(TabCommand::AddWindow {
-                    id: window_id,
-                    parent: host_id,
-                    bounds,
-                    label,
-                    initial_url: self.url.clone(),
-                    create_initial_tab,
-                });
+                send_controller_command(
+                    controller,
+                    &self.profile_id,
+                    "add-window",
+                    TabCommand::AddWindow {
+                        id: window_id,
+                        parent: host_id,
+                        bounds,
+                        label,
+                        initial_url: self.url.clone(),
+                        create_initial_tab,
+                    },
+                );
             } else if self.window_bounds.get(&window_id) != Some(&bounds) {
-                let _ = controller.send(TabCommand::Layout(window_id, bounds));
+                send_controller_command(
+                    controller,
+                    &self.profile_id,
+                    "layout",
+                    TabCommand::Layout(window_id, bounds),
+                );
             }
             if self.window_states.get(&window_id) != Some(&(visible, focused)) {
-                let _ = controller.send(TabCommand::SetWindowState {
-                    id: window_id,
-                    visible,
-                    focused,
-                });
+                send_controller_command(
+                    controller,
+                    &self.profile_id,
+                    "set-window-state",
+                    TabCommand::SetWindowState {
+                        id: window_id,
+                        visible,
+                        focused,
+                    },
+                );
             }
         }
         self.window_bounds.insert(window_id, bounds);
@@ -218,14 +269,24 @@ impl Backend {
         self.window_bounds.remove(&window_id);
         self.window_states.remove(&window_id);
         if let Some(controller) = &self.controller {
-            let _ = controller.send(TabCommand::RemoveWindow(window_id));
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "remove-window",
+                TabCommand::RemoveWindow(window_id),
+            );
         }
     }
 
     #[qslot]
     fn reload(&mut self, window_id: String) {
         if let (Some(controller), Ok(window_id)) = (&self.controller, window_id.parse::<u64>()) {
-            let _ = controller.send(TabCommand::Reload(window_id));
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "reload",
+                TabCommand::Reload(window_id),
+            );
         }
     }
 
@@ -236,7 +297,12 @@ impl Backend {
             window_id.parse::<u64>(),
             TabEngine::parse(&engine),
         ) {
-            let _ = controller.send(TabCommand::NewTab(window_id, engine));
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "new-tab",
+                TabCommand::NewTab(window_id, engine),
+            );
         }
     }
 
@@ -247,14 +313,24 @@ impl Backend {
             window_id.parse::<u64>(),
             tab_id.parse::<u64>(),
         ) {
-            let _ = controller.send(TabCommand::Select(window_id, tab_id));
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "select-tab",
+                TabCommand::Select(window_id, tab_id),
+            );
         }
     }
 
     #[qslot]
     fn close_tab(&mut self, tab_id: String) {
         if let (Some(controller), Ok(tab_id)) = (&self.controller, tab_id.parse::<u64>()) {
-            let _ = controller.send(TabCommand::Close(tab_id));
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "close-tab",
+                TabCommand::Close(tab_id),
+            );
         }
     }
 
@@ -265,7 +341,12 @@ impl Backend {
             tab_id.parse::<u64>(),
             TabEngine::parse(&engine),
         ) {
-            let _ = controller.send(TabCommand::SwitchEngine(tab_id, engine));
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "switch-engine",
+                TabCommand::SwitchEngine(tab_id, engine),
+            );
         }
     }
 
@@ -276,11 +357,16 @@ impl Backend {
             tab_id.parse::<u64>(),
             target_window_id.parse::<u64>(),
         ) {
-            let _ = controller.send(TabCommand::Move {
-                tab: tab_id,
-                window: target_window_id,
-                target_index: None,
-            });
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "move-tab",
+                TabCommand::Move {
+                    tab: tab_id,
+                    window: target_window_id,
+                    target_index: None,
+                },
+            );
         }
     }
 
@@ -295,11 +381,16 @@ impl Backend {
             tab_id.parse::<u64>(),
             usize::try_from(target_index),
         ) {
-            let _ = controller.send(TabCommand::Move {
-                tab: tab_id,
-                window: window_id,
-                target_index: Some(target_index),
-            });
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "reorder-tab",
+                TabCommand::Move {
+                    tab: tab_id,
+                    window: window_id,
+                    target_index: Some(target_index),
+                },
+            );
         }
     }
 
@@ -310,13 +401,18 @@ impl Backend {
             window_id.parse::<u64>(),
             u32::try_from(modifiers),
         ) {
-            let _ = controller.send(TabCommand::MouseMove {
-                window_id,
-                x,
-                y,
-                modifiers,
-                leaving,
-            });
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "mouse-move",
+                TabCommand::MouseMove {
+                    window_id,
+                    x,
+                    y,
+                    modifiers,
+                    leaving,
+                },
+            );
         }
     }
 
@@ -344,15 +440,20 @@ impl Backend {
             u32::try_from(modifiers),
             u32::try_from(click_count),
         ) {
-            let _ = controller.send(TabCommand::MouseClick {
-                window_id,
-                x,
-                y,
-                modifiers,
-                button,
-                mouse_up,
-                click_count,
-            });
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "mouse-click",
+                TabCommand::MouseClick {
+                    window_id,
+                    x,
+                    y,
+                    modifiers,
+                    button,
+                    mouse_up,
+                    click_count,
+                },
+            );
         }
     }
 
@@ -372,14 +473,19 @@ impl Backend {
             window_id.parse::<u64>(),
             u32::try_from(modifiers),
         ) {
-            let _ = controller.send(TabCommand::MouseWheel {
-                window_id,
-                x,
-                y,
-                modifiers,
-                delta_x,
-                delta_y,
-            });
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "mouse-wheel",
+                TabCommand::MouseWheel {
+                    window_id,
+                    x,
+                    y,
+                    modifiers,
+                    delta_x,
+                    delta_y,
+                },
+            );
         }
     }
 
@@ -412,18 +518,23 @@ impl Backend {
             u32::try_from(character),
             u32::try_from(unmodified_character),
         ) {
-            let _ = controller.send(TabCommand::KeyEvent {
-                window_id,
-                event: shell_protocol::wire::KeyEvent {
-                    event_type,
-                    modifiers,
-                    windows_key_code,
-                    native_key_code,
-                    is_system_key,
-                    character,
-                    unmodified_character,
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "key-event",
+                TabCommand::KeyEvent {
+                    window_id,
+                    event: shell_protocol::wire::KeyEvent {
+                        event_type,
+                        modifiers,
+                        windows_key_code,
+                        native_key_code,
+                        is_system_key,
+                        character,
+                        unmodified_character,
+                    },
                 },
-            });
+            );
         }
     }
 
@@ -431,8 +542,15 @@ impl Backend {
     fn update_window_state(&mut self, state_json: String) {
         self.window_state_json = state_json;
         self.window_state_json_changed();
-        let Ok(state) = serde_json::from_str::<serde_json::Value>(&self.window_state_json) else {
-            return;
+        let state = match serde_json::from_str::<serde_json::Value>(&self.window_state_json) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!(
+                    "deb: failure: shell state: profile={}: invalid controller snapshot: {error}",
+                    self.profile_id
+                );
+                return;
+            }
         };
         let Some(window) = state
             .get("windows")
@@ -441,7 +559,16 @@ impl Backend {
         else {
             return;
         };
-        self.tabs_json = serde_json::to_string(&window["tabs"]).unwrap_or_else(|_| "[]".to_owned());
+        self.tabs_json = match serde_json::to_string(&window["tabs"]) {
+            Ok(tabs_json) => tabs_json,
+            Err(error) => {
+                eprintln!(
+                    "deb: failure: shell state: profile={}: tab snapshot serialization failed: {error}",
+                    self.profile_id
+                );
+                "[]".to_owned()
+            }
+        };
         self.active_tab_id = window["activeTabId"]
             .as_str()
             .unwrap_or_default()
@@ -496,21 +623,31 @@ impl Default for ProfileManager {
     fn default() -> Self {
         match ProfileStore::load() {
             Ok(store) => {
-                let profiles_json =
-                    serde_json::to_string(store.profiles()).unwrap_or_else(|_| "[]".to_owned());
+                let (profiles_json, error) = match serde_json::to_string(store.profiles()) {
+                    Ok(profiles_json) => (profiles_json, String::new()),
+                    Err(error) => {
+                        let failure = format!("Profile registry serialization failed: {error}");
+                        eprintln!("deb: failure: profile registry: {failure}");
+                        ("[]".to_owned(), failure)
+                    }
+                };
                 Self {
                     profiles_json,
                     last_created_profile_json: String::new(),
-                    error: String::new(),
+                    error,
                     store: Some(store),
                 }
             }
-            Err(error) => Self {
-                profiles_json: r#"[{"id":"default","name":"Default"}]"#.to_owned(),
-                last_created_profile_json: String::new(),
-                error: format!("Profile registry failed: {error}"),
-                store: None,
-            },
+            Err(error) => {
+                let failure = format!("Profile registry failed: {error}");
+                eprintln!("deb: failure: profile registry: {failure}");
+                Self {
+                    profiles_json: r#"[{"id":"default","name":"Default"}]"#.to_owned(),
+                    last_created_profile_json: String::new(),
+                    error: failure,
+                    store: None,
+                }
+            }
         }
     }
 }
@@ -542,15 +679,28 @@ impl ProfileManager {
     fn create_profile(&mut self, name: String) {
         let Some(store) = &mut self.store else {
             self.error = "Profile registry is unavailable".to_owned();
+            eprintln!("deb: failure: profile registry: {}", self.error);
             self.error_changed();
             return;
         };
         match store.create(&name) {
             Ok(profile) => {
-                self.profiles_json =
-                    serde_json::to_string(store.profiles()).unwrap_or_else(|_| "[]".to_owned());
-                self.last_created_profile_json =
-                    serde_json::to_string(&profile).unwrap_or_default();
+                let serialized =
+                    serde_json::to_string(store.profiles()).and_then(|profiles_json| {
+                        serde_json::to_string(&profile)
+                            .map(|created_profile_json| (profiles_json, created_profile_json))
+                    });
+                let (profiles_json, created_profile_json) = match serialized {
+                    Ok(serialized) => serialized,
+                    Err(error) => {
+                        self.error = format!("Profile registry serialization failed: {error}");
+                        eprintln!("deb: failure: profile registry: {}", self.error);
+                        self.error_changed();
+                        return;
+                    }
+                };
+                self.profiles_json = profiles_json;
+                self.last_created_profile_json = created_profile_json;
                 self.error.clear();
                 self.profiles_json_changed();
                 self.last_created_profile_json_changed();
@@ -558,6 +708,7 @@ impl ProfileManager {
             }
             Err(error) => {
                 self.error = error.to_string();
+                eprintln!("deb: failure: profile registry: {}", self.error);
                 self.error_changed();
             }
         }

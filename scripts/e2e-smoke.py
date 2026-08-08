@@ -171,15 +171,31 @@ def descendants(accessible):
 
 
 class Driver:
-    def __init__(self, process, artifact_directory):
+    def __init__(self, process, artifact_directory, log_path):
         self.process = process
         self.artifact_directory = artifact_directory
+        self.log_path = log_path
         self.application = None
+
+    def assert_no_process_failures(self, context):
+        try:
+            output = self.log_path.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            return
+        failures = [
+            line
+            for line in output.splitlines()
+            if "deb: failure:" in line or "deb: tab controller failed:" in line
+        ]
+        if failures:
+            details = "\n".join(failures[-8:])
+            raise SmokeFailure(f"process failure during {context}:\n{details}")
 
     def wait_until(self, description, probe, timeout=20.0):
         deadline = time.monotonic() + timeout
         last_error = None
         while time.monotonic() < deadline:
+            self.assert_no_process_failures(f"waiting for {description}")
             if self.process.poll() is not None:
                 raise SmokeFailure(
                     f"deb exited with status {self.process.returncode} while waiting for {description}"
@@ -248,6 +264,37 @@ class Driver:
 
         return self.wait_until(
             f"{accessible_id} text to equal {expected!r}", probe, timeout
+        )
+
+    def wait_for_selected(self, accessible_id, timeout=20.0):
+        def probe():
+            accessible = self.find_id(accessible_id)
+            if accessible is None:
+                return None
+            states = accessible.get_state_set()
+            return accessible if states.contains(Atspi.StateType.SELECTED) else None
+
+        return self.wait_until(f"{accessible_id} to become selected", probe, timeout)
+
+    def wait_for_one_selected(self, accessible_ids, timeout=20.0):
+        def probe():
+            selected = []
+            for accessible_id in accessible_ids:
+                accessible = self.find_id(accessible_id)
+                if accessible is None:
+                    return None
+                if accessible.get_state_set().contains(Atspi.StateType.SELECTED):
+                    selected.append(accessible_id)
+            return selected[0] if len(selected) == 1 else None
+
+        return self.wait_until("exactly one stress tab to be selected", probe, timeout)
+
+    def wait_for_process_quiet(self, description, duration):
+        deadline = time.monotonic() + duration
+        return self.wait_until(
+            description,
+            lambda: time.monotonic() >= deadline,
+            timeout=duration + 5.0,
         )
 
     def find_tooltip(self):
@@ -523,6 +570,19 @@ class Driver:
         self.focus_accessible_window(accessible)
         self.xdotool("key", "--clearmodifiers", sequence)
 
+    def send_repeated_shortcut(self, accessible_id, sequence, repeat, repeat_delay):
+        accessible = self.wait_for_id(accessible_id)
+        self.focus_accessible_window(accessible)
+        self.xdotool(
+            "key",
+            "--clearmodifiers",
+            "--repeat",
+            str(repeat),
+            "--repeat-delay",
+            str(repeat_delay),
+            sequence,
+        )
+
     def type_address(self, accessible_id, address):
         self.click(accessible_id)
         self.xdotool("key", "--clearmodifiers", "ctrl+a")
@@ -698,7 +758,7 @@ def main():
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        driver = Driver(process, arguments.artifacts)
+        driver = Driver(process, arguments.artifacts, arguments.log)
 
         def terminate(_signal_number, _frame):
             raise SmokeFailure("the external E2E timeout expired")
@@ -900,8 +960,54 @@ def main():
             )
 
             print(
+                "deb-e2e: stress-switching two live tabs from each engine",
+                flush=True,
+            )
+            driver.click("browser.new.default.3")
+            driver.wait_for_id("browser.tab.default.5")
+            driver.wait_for_selected("browser.tab.default.5")
+            driver.wait_for_name("browser.status.3", "Gecko")
+            driver.click("browser.new-menu.3")
+            driver.click("browser.new.chromium.3", focus_window=False)
+            driver.wait_for_id("browser.tab.default.6")
+            driver.wait_for_selected("browser.tab.default.6")
+            driver.wait_for_name("browser.status.3", "Chromium")
+            driver.click("browser.new.default.3")
+            driver.wait_for_id("browser.tab.default.7")
+            driver.wait_for_selected("browser.tab.default.7")
+            driver.wait_for_name("browser.status.3", "Chromium")
+
+            stress_tabs = (
+                ("browser.tab.default.2", "Gecko"),
+                ("browser.tab.default.6", "Chromium"),
+                ("browser.tab.default.5", "Gecko"),
+                ("browser.tab.default.7", "Chromium"),
+            )
+            for cycle in range(10):
+                for tab_id, engine in stress_tabs:
+                    driver.click(tab_id)
+                    driver.wait_for_selected(tab_id)
+                    driver.wait_for_name("browser.status.3", engine)
+                    driver.assert_no_process_failures(
+                        f"tab-switch stress cycle {cycle + 1} selecting {tab_id}"
+                    )
+
+            driver.send_shortcut("browser.surface.3", "ctrl+Tab")
+            driver.wait_for_selected("browser.tab.default.2")
+            driver.send_repeated_shortcut(
+                "browser.surface.3", "ctrl+Tab", repeat=47, repeat_delay=20
+            )
+            driver.wait_for_process_quiet("rapid Ctrl+Tab processing", 2.0)
+            selected_stress_tab = driver.wait_for_one_selected(
+                tuple(tab_id for tab_id, _engine in stress_tabs)
+            )
+            selected_engine = dict(stress_tabs)[selected_stress_tab]
+            driver.wait_for_name("browser.status.3", selected_engine)
+            driver.assert_no_process_failures("rapid Ctrl+Tab stress")
+
+            print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                "both engines, trusted page clicks, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, and three windows "
+                "both engines, trusted page clicks, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
