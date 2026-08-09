@@ -5,9 +5,11 @@ mod tab_controller;
 
 use native::NativeRect;
 use profile::ProfileStore;
-use qtbridge::{QApp, QObjectHolder, qobject};
+use qtbridge::{QObjectHolder, QmlRegister, qobject};
 use shell_protocol::is_valid_profile_id;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use tab_controller::{TabCommand, TabController, TabEngine};
 
 const DEFAULT_URL: &str = "deb://new-tab/";
@@ -30,7 +32,18 @@ fn send_controller_command(
 }
 
 unsafe extern "C" {
-    fn register_browser_surface();
+    fn deb_run_kde_shell(
+        argc: libc::c_int,
+        argv: *mut *mut libc::c_char,
+        qml: *const u8,
+        qml_size: usize,
+        register_rust_types: extern "C" fn(),
+    ) -> libc::c_int;
+}
+
+extern "C" fn register_rust_types() {
+    ProfileManager::register();
+    Backend::register();
 }
 
 struct Backend {
@@ -800,15 +813,31 @@ fn main() {
             std::env::set_var("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop");
         }
     }
-    unsafe {
-        register_browser_surface();
+    let mut arguments = std::env::args_os()
+        .map(|argument| {
+            CString::new(argument.as_os_str().as_bytes())
+                .expect("process argument contains an interior NUL byte")
+        })
+        .collect::<Vec<_>>();
+    let mut argument_pointers = arguments
+        .iter_mut()
+        .map(|argument| argument.as_ptr().cast_mut())
+        .collect::<Vec<_>>();
+    argument_pointers.push(std::ptr::null_mut());
+    let qml = include_bytes!("Main.qml");
+    let exit_code = unsafe {
+        deb_run_kde_shell(
+            libc::c_int::try_from(arguments.len())
+                .expect("too many process arguments for QApplication"),
+            argument_pointers.as_mut_ptr(),
+            qml.as_ptr(),
+            qml.len(),
+            register_rust_types,
+        )
+    };
+    if exit_code != 0 {
+        std::process::exit(exit_code);
     }
-
-    QApp::new()
-        .register::<ProfileManager>()
-        .register::<Backend>()
-        .load_qml(include_bytes!("Main.qml"))
-        .run();
 }
 
 #[cfg(test)]

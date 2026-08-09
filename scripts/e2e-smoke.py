@@ -568,6 +568,38 @@ class Driver:
                 continue
         return None
 
+    @staticmethod
+    def normalized_name(value):
+        return (value or "").replace("&", "").replace("…", "...").strip()
+
+    def find_named(self, expected, role_names=()):
+        if self.application is None:
+            return None
+        expected = self.normalized_name(expected)
+        for accessible in descendants(self.application):
+            try:
+                if role_names and accessible.get_role_name() not in role_names:
+                    continue
+                if self.normalized_name(accessible.get_name()) == expected:
+                    return accessible
+            except Exception:
+                continue
+        return None
+
+    def wait_for_named(self, expected, role_names=(), timeout=20.0):
+        return self.wait_until(
+            f"accessible object named {expected!r}",
+            lambda: self.find_named(expected, role_names),
+            timeout,
+        )
+
+    def wait_for_missing_named(self, expected, role_names=(), timeout=20.0):
+        return self.wait_until(
+            f"accessible object named {expected!r} to disappear",
+            lambda: self.find_named(expected, role_names) is None,
+            timeout,
+        )
+
     def wait_for_id(self, accessible_id, timeout=20.0):
         return self.wait_until(
             f"accessible object {accessible_id}",
@@ -768,10 +800,17 @@ class Driver:
                     ),
                 )
             )
-            candidates.append((window_name != top_name, score, window))
+            candidates.append(
+                (
+                    not self.window_is_managed(window),
+                    window_name != top_name,
+                    score,
+                    window,
+                )
+            )
         if not candidates:
             raise SmokeFailure("deb has no visible X11 window for an accessible control")
-        _, _, window = min(candidates)
+        _, _, _, window = min(candidates)
         self.xdotool("windowraise", window)
         subprocess.run(
             ["xdotool", "windowfocus", window],
@@ -818,6 +857,18 @@ class Driver:
         self.move_pointer(accessible, focus_window)
         self.xdotool("click", "1")
 
+    def click_named(self, expected, role_names=(), focus_window=True):
+        def probe():
+            accessible = self.find_named(expected, role_names)
+            if accessible is None:
+                return None
+            self.rectangle(accessible)
+            return accessible
+
+        accessible = self.wait_until(f"actionable control named {expected!r}", probe)
+        self.move_pointer(accessible, focus_window)
+        self.xdotool("click", "1")
+
     def click_button(self, accessible_id, button, focus_window=True):
         accessible = self.wait_for_actionable(accessible_id)
         self.move_pointer(accessible, focus_window)
@@ -847,6 +898,14 @@ class Driver:
         right = self.wait_for_actionable(right_control_id)
         left_window = self.focus_accessible_window(left)
         right_window = self.focus_accessible_window(right)
+        print(
+            "deb-e2e: arranging windows "
+            f"left={left_window}/{self.xdotool('getwindowname', left_window, capture=True)!r}/"
+            f"{self.window_geometry(left_window)} "
+            f"right={right_window}/{self.xdotool('getwindowname', right_window, capture=True)!r}/"
+            f"{self.window_geometry(right_window)}",
+            flush=True,
+        )
         display_width, display_height = (
             int(value)
             for value in self.xdotool("getdisplaygeometry", capture=True).split()
@@ -929,6 +988,17 @@ class Driver:
             stderr=subprocess.PIPE,
         )
         return result.returncode == 0 and "_NET_WM_STATE_FULLSCREEN" in result.stdout
+
+    @staticmethod
+    def window_is_managed(window):
+        result = subprocess.run(
+            ["xprop", "-id", window, "WM_STATE"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.returncode == 0 and "window state:" in result.stdout
 
     def raw_pinch_surface(self, accessible_id, touchscreen):
         surface = self.wait_for_id(accessible_id)
@@ -1045,6 +1115,8 @@ class Driver:
         return marker_pixels, variants
 
     def wait_for_surface(self, accessible_id, engine):
+        self.xdotool("mousemove", "1", "1")
+
         def probe():
             marker_pixels, variants = self.surface_statistics(accessible_id)
             if marker_pixels >= 128 and variants >= 8:
@@ -1086,7 +1158,8 @@ class Driver:
 
     def verify_page_fullscreen(self, surface_id, address_id, engine):
         surface = self.wait_for_id(surface_id)
-        initial_window = self.focus_accessible_window(surface)
+        initial_address = self.wait_for_actionable(address_id)
+        initial_window = self.focus_accessible_window(initial_address)
         initial_geometry = self.window_geometry(initial_window)
         display_geometry = tuple(
             int(value)
@@ -1131,8 +1204,15 @@ class Driver:
             timeout=30.0,
         )
         self.xdotool("key", "--clearmodifiers", "Escape")
-        address = self.wait_for_actionable(address_id)
-        restored_window = self.focus_accessible_window(address)
+        self.wait_for_actionable(address_id)
+        restored_window = initial_window
+        restored_after_escape = self.window_geometry(restored_window)
+        print(
+            f"deb-e2e: {engine} fullscreen geometry "
+            f"initial={initial_geometry} fullscreen={geometry} "
+            f"after-escape={restored_after_escape}",
+            flush=True,
+        )
         self.wait_until(
             f"the {engine} window to leave EWMH fullscreen",
             lambda: not self.window_is_fullscreen(restored_window),
@@ -1358,6 +1438,23 @@ def main():
             driver.application = driver.wait_until(
                 "deb to appear on AT-SPI", driver.find_application
             )
+            print(
+                "deb-e2e: verifying the native KXMLGUI toolbar and toolbar editor",
+                flush=True,
+            )
+            driver.wait_for_id("mainToolBar")
+            driver.wait_for_descendant("browser.address.1", "mainToolBar")
+            driver.wait_for_descendant("browser.engine.1", "mainToolBar")
+            driver.wait_for_descendant("browser.new-window.1", "mainToolBar")
+            driver.click_named("Settings", role_names=("menu", "menu item"))
+            driver.click_named("Configure Toolbars...", focus_window=False)
+            driver.wait_for_named("Configure Toolbars — deb", role_names=("dialog",))
+            driver.wait_for_named("Main Toolbar <deb>", role_names=("combo box",))
+            driver.click_named("Cancel", role_names=("button",), focus_window=False)
+            driver.wait_for_missing_named(
+                "Configure Toolbars — deb", role_names=("dialog",)
+            )
+            driver.wait_for_actionable("browser.address.1")
             driver.wait_for_name("browser.status.1", "Chromium")
             print("deb-e2e: clicking New Firefox tab through XTEST", flush=True)
             driver.click("browser.new-menu.1")
@@ -1657,7 +1754,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"both engines, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
+                f"native KXMLGUI toolbar configuration, both engines, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "

@@ -7,23 +7,27 @@ import QtQuick.Window
 import deb
 import deb_native
 
-ApplicationWindow {
+Item {
     id: root
     objectName: "window.main"
-    width: 1440
-    height: 860
-    minimumWidth: 900
-    minimumHeight: 560
-    visible: true
-    title: "deb · Chromium + Gecko"
     property int nextViewId: 1
     property var detachedWindows: []
-    readonly property bool contentFullscreen: {
+    property bool shuttingDown: false
+    readonly property int detachedWindowCount: detachedWindows.length
+    readonly property var activeWorkspace: {
         if (profileTabs.currentIndex < 0) {
-            return false
+            return null
         }
-        const workspace = profileRepeater.itemAt(profileTabs.currentIndex)
-        return workspace !== null && workspace.contentFullscreen
+        return profileRepeater.itemAt(profileTabs.currentIndex)
+    }
+    readonly property string activeUrl: activeWorkspace === null
+        ? "" : activeWorkspace.activeUrl
+    readonly property string activeStatus: activeWorkspace === null
+        ? "Waiting for native host…" : activeWorkspace.activeStatus
+    readonly property string activeEngine: activeWorkspace === null
+        ? "chromium" : activeWorkspace.activeEngine()
+    readonly property bool contentFullscreen: {
+        return activeWorkspace !== null && activeWorkspace.contentFullscreen
     }
 
     ProfileManager {
@@ -52,6 +56,12 @@ ApplicationWindow {
     }
 
     function containsGlobalPoint(windowObject, globalPoint) {
+        if (windowObject === root) {
+            const local = root.mapFromGlobal(globalPoint.x, globalPoint.y)
+            return root.Window.visibility !== Window.Hidden
+                && local.x >= 0 && local.y >= 0
+                && local.x < root.width && local.y < root.height
+        }
         return windowObject.visible
             && globalPoint.x >= windowObject.x
             && globalPoint.y >= windowObject.y
@@ -79,8 +89,74 @@ ApplicationWindow {
 
     function releaseDetachedWindow(browserWindow) {
         detachedWindows = detachedWindows.filter(candidate => candidate !== browserWindow)
-        if (detachedWindows.length === 0 && !root.visible) {
-            Qt.callLater(root.close)
+        if (detachedWindows.length === 0
+                && root.Window.visibility === Window.Hidden) {
+            shutdown()
+            Qt.callLater(Qt.quit)
+        }
+    }
+
+    function newTab() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.newTab(activeWorkspace.activeEngine())
+        }
+    }
+
+    function newChromiumTab() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.newTab("chromium")
+        }
+    }
+
+    function newFirefoxTab() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.newTab("firefox")
+        }
+    }
+
+    function reloadActiveTab() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.reload()
+        }
+    }
+
+    function switchActiveEngine(engine) {
+        if (activeWorkspace !== null) {
+            activeWorkspace.switchActiveEngine(engine)
+        }
+    }
+
+    function closeActiveTab() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.closeActiveTab()
+        }
+    }
+
+    function navigateActive(address) {
+        if (activeWorkspace !== null) {
+            activeWorkspace.navigate(address)
+        }
+    }
+
+    function newWindow() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.newWindow()
+        }
+    }
+
+    function exitContentFullscreen() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.exitContentFullscreen()
+        }
+    }
+
+    function shutdown() {
+        if (shuttingDown) {
+            return
+        }
+        shuttingDown = true
+        for (let index = 0; index < profileRepeater.count; ++index) {
+            profileRepeater.itemAt(index).stop()
         }
     }
 
@@ -123,80 +199,87 @@ ApplicationWindow {
         }
     }
 
-    header: ToolBar {
-        visible: !root.contentFullscreen
+    ColumnLayout {
+        anchors.fill: parent
+        spacing: 0
 
-        RowLayout {
-            anchors.fill: parent
-            anchors.leftMargin: 10
-            anchors.rightMargin: 10
-            spacing: 8
+        ToolBar {
+            visible: !root.contentFullscreen
+            Layout.fillWidth: true
 
-            TabBar {
-                id: profileTabs
-                objectName: "profiles.tabs"
-                Accessible.id: objectName
-                Layout.fillWidth: true
+            RowLayout {
+                anchors.fill: parent
+                anchors.leftMargin: 10
+                anchors.rightMargin: 10
+                spacing: 8
 
-                Repeater {
-                    model: profilesModel
+                TabBar {
+                    id: profileTabs
+                    objectName: "profiles.tabs"
+                    Accessible.id: objectName
+                    Layout.fillWidth: true
 
-                    TabButton {
-                        required property string profileId
-                        required property string profileName
-                        objectName: `profile.tab.${profileId}`
-                        Accessible.id: objectName
-                        Accessible.name: profileName
-                        Accessible.description: `Browser profile ${profileName}`
-                        text: profileName
-                        ToolTip.visible: hovered
-                        ToolTip.text: `Profile ${profileId}`
+                    Repeater {
+                        model: profilesModel
+
+                        TabButton {
+                            required property string profileId
+                            required property string profileName
+                            objectName: `profile.tab.${profileId}`
+                            Accessible.id: objectName
+                            Accessible.name: profileName
+                            Accessible.description: `Browser profile ${profileName}`
+                            text: profileName
+                            ToolTip.visible: hovered
+                            ToolTip.text: `Profile ${profileId}`
+                        }
                     }
                 }
-            }
 
-            Label {
-                objectName: "profile.error"
-                Accessible.id: objectName
-                Accessible.role: Accessible.AlertMessage
-                Accessible.name: text
-                visible: profileManager.error.length > 0
-                text: profileManager.error
-                color: palette.brightText
-                elide: Text.ElideRight
-                Layout.maximumWidth: 260
-            }
+                Label {
+                    objectName: "profile.error"
+                    Accessible.id: objectName
+                    Accessible.role: Accessible.AlertMessage
+                    Accessible.name: text
+                    visible: profileManager.error.length > 0
+                    text: profileManager.error
+                    color: palette.brightText
+                    elide: Text.ElideRight
+                    Layout.maximumWidth: 260
+                }
 
-            TextField {
-                id: newProfileName
-                objectName: "profile.name-input"
-                Accessible.id: objectName
-                Accessible.name: "New profile name"
-                placeholderText: "New profile name"
-                Layout.preferredWidth: 170
-                onAccepted: profileManager.create_profile(text)
-            }
+                TextField {
+                    id: newProfileName
+                    objectName: "profile.name-input"
+                    Accessible.id: objectName
+                    Accessible.name: "New profile name"
+                    placeholderText: "New profile name"
+                    Layout.preferredWidth: 170
+                    onAccepted: profileManager.create_profile(text)
+                }
 
-            Button {
-                objectName: "profile.add"
-                Accessible.id: objectName
-                Accessible.name: text
-                text: "Add profile"
-                enabled: newProfileName.text.trim().length > 0
-                onClicked: profileManager.create_profile(newProfileName.text)
+                Button {
+                    objectName: "profile.add"
+                    Accessible.id: objectName
+                    Accessible.name: text
+                    text: "Add profile"
+                    enabled: newProfileName.text.trim().length > 0
+                    onClicked: profileManager.create_profile(newProfileName.text)
+                }
             }
         }
-    }
 
-    StackLayout {
-        anchors.fill: parent
-        currentIndex: profileTabs.currentIndex
+        StackLayout {
+            currentIndex: profileTabs.currentIndex
+            Layout.fillWidth: true
+            Layout.fillHeight: true
 
-        Repeater {
-            id: profileRepeater
-            model: profilesModel
+            Repeater {
+                id: profileRepeater
+                model: profilesModel
 
-            ProfileWorkspace {
+                ProfileWorkspace {
+                }
             }
         }
     }
@@ -259,6 +342,8 @@ ApplicationWindow {
         readonly property string viewId: profilesModel.get(index).profileViewId
         readonly property var backendObject: backend
         readonly property bool contentFullscreen: mainBrowserView.activeFullscreen
+        readonly property string activeUrl: mainBrowserView.currentUrl
+        readonly property string activeStatus: mainBrowserView.currentStatus
         Backend {
             id: backend
             profileId: workspace.profileId
@@ -272,9 +357,45 @@ ApplicationWindow {
             profileName: workspace.profileName
             viewId: workspace.viewId
             windowLabel: `${workspace.profileName} · main window`
-            viewVisible: workspace.visible && root.visible
-            viewFocused: root.active && workspace.visible
+            viewVisible: workspace.visible
+                && root.Window.visibility !== Window.Hidden
+            viewFocused: root.Window.active && workspace.visible
             adoptTabId: ""
+            nativeToolbar: true
+        }
+
+        function activeEngine() {
+            return mainBrowserView.activeEngine()
+        }
+
+        function newTab(engine) {
+            backend.new_tab(viewId, engine)
+        }
+
+        function reload() {
+            backend.reload(viewId)
+        }
+
+        function switchActiveEngine(engine) {
+            mainBrowserView.switchActiveEngine(engine)
+        }
+
+        function closeActiveTab() {
+            if (mainBrowserView.activeTabId.length > 0) {
+                backend.close_tab(mainBrowserView.activeTabId)
+            }
+        }
+
+        function navigate(address) {
+            backend.navigate(viewId, address)
+        }
+
+        function newWindow() {
+            root.openDetachedWindow(backend, profileId, profileName)
+        }
+
+        function exitContentFullscreen() {
+            mainBrowserView.exitContentFullscreen()
         }
 
         function stop() {
@@ -671,6 +792,7 @@ ApplicationWindow {
         required property bool viewVisible
         required property bool viewFocused
         required property string adoptTabId
+        property bool nativeToolbar: false
         property bool rebuildingTabs: false
         property bool registered: false
         property string activeTabId: ""
@@ -725,6 +847,12 @@ ApplicationWindow {
                 }
             }
             return "chromium"
+        }
+
+        function switchActiveEngine(engine) {
+            if (activeTabId.length > 0 && activeEngine() !== engine) {
+                backendObject.switch_engine(activeTabId, engine)
+            }
         }
 
         function findTabIndex(tabId) {
@@ -877,7 +1005,7 @@ ApplicationWindow {
         Shortcut {
             sequence: "Ctrl+Shift+T"
             context: Qt.WindowShortcut
-            enabled: browserView.viewVisible
+            enabled: browserView.viewVisible && !browserView.nativeToolbar
             onActivated: browserView.backendObject.new_tab(
                 browserView.viewId, browserView.activeEngine()
             )
@@ -886,7 +1014,8 @@ ApplicationWindow {
         Shortcut {
             sequence: "Ctrl+W"
             context: Qt.WindowShortcut
-            enabled: browserView.viewVisible && browserView.activeTabId.length > 0
+            enabled: browserView.viewVisible && !browserView.nativeToolbar
+                && browserView.activeTabId.length > 0
             onActivated: browserView.backendObject.close_tab(browserView.activeTabId)
         }
 
@@ -957,6 +1086,9 @@ ApplicationWindow {
         }
 
         function applyWindowFullscreen() {
+            if (nativeToolbar) {
+                return
+            }
             const hostWindow = browserView.Window.window
             if (hostWindow === null) {
                 return
@@ -977,6 +1109,14 @@ ApplicationWindow {
                     hostWindow.showNormal()
                 }
             }
+        }
+
+        function exitContentFullscreen() {
+            if (!activeFullscreen) {
+                return
+            }
+            backendObject.key_event(viewId, 1, 0, 0x1b, 0, false, 0, 0)
+            backendObject.key_event(viewId, 3, 0, 0x1b, 0, false, 0, 0)
         }
 
         onActiveFullscreenChanged: {
@@ -1006,10 +1146,12 @@ ApplicationWindow {
                     }
 
                     RowLayout {
+                        visible: !browserView.nativeToolbar
                         Layout.fillWidth: true
 
                         Button {
-                            objectName: `browser.reload.${browserView.viewId}`
+                            objectName: browserView.nativeToolbar
+                                ? "" : `browser.reload.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.name: "Reload this tab"
                             text: "↻"
@@ -1020,7 +1162,8 @@ ApplicationWindow {
 
                         ComboBox {
                             id: enginePicker
-                            objectName: `browser.engine.${browserView.viewId}`
+                            objectName: browserView.nativeToolbar
+                                ? "" : `browser.engine.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.name: "Tab engine"
                             model: ["Chromium", "Firefox"]
@@ -1037,7 +1180,8 @@ ApplicationWindow {
 
                         TextField {
                             id: address
-                            objectName: `browser.address.${browserView.viewId}`
+                            objectName: browserView.nativeToolbar
+                                ? "" : `browser.address.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.name: "Address"
                             Layout.fillWidth: true
@@ -1047,7 +1191,8 @@ ApplicationWindow {
                         }
 
                         Button {
-                            objectName: `browser.go.${browserView.viewId}`
+                            objectName: browserView.nativeToolbar
+                                ? "" : `browser.go.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.name: text
                             text: "Go"
@@ -1055,7 +1200,8 @@ ApplicationWindow {
                         }
 
                         Button {
-                            objectName: `browser.new-window.${browserView.viewId}`
+                            objectName: browserView.nativeToolbar
+                                ? "" : `browser.new-window.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.name: text
                             text: "New window"
@@ -1067,7 +1213,8 @@ ApplicationWindow {
                         }
 
                         Label {
-                            objectName: `browser.status.${browserView.viewId}`
+                            objectName: browserView.nativeToolbar
+                                ? "" : `browser.status.${browserView.viewId}`
                             Accessible.id: objectName
                             Accessible.role: Accessible.StaticText
                             Accessible.name: text
@@ -1203,15 +1350,5 @@ ApplicationWindow {
         })
     }
 
-    onClosing: function(close) {
-        if (detachedWindows.length > 0) {
-            close.accepted = false
-            root.hide()
-            return
-        }
-        for (let index = 0; index < profileRepeater.count; ++index) {
-            profileRepeater.itemAt(index).stop()
-        }
-        Qt.quit()
-    }
+    Component.onDestruction: shutdown()
 }

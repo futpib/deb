@@ -81,12 +81,16 @@ if ((require_touch)); then
   touch_arguments+=(--require-touch)
 fi
 SECONDS=0
+echo "Running native KXMLGUI toolbar persistence self-test"
+timeout 30s env QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 \
+  "$project_root/target/debug/deb" --self-test-kxmlgui
 set +e
 timeout --signal=TERM --kill-after=20s 180s \
   env \
   XDG_CONFIG_HOME="$test_root/config" \
   XDG_DATA_HOME="$test_root/data" \
   XDG_CACHE_HOME="$test_root/cache" \
+  XDG_STATE_HOME="$test_root/state" \
   QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 \
   DEB_URL=deb://new-tab/#deb-smoke \
   python3 "$script_directory/e2e-smoke.py" \
