@@ -1692,6 +1692,26 @@ def main():
             driver.wait_for_id("browser.tab.default.4")
             driver.wait_for_descendant("browser.tab.default.4", "browser.view.2")
             driver.wait_for_name("browser.status.2", "Chromium")
+            print(
+                "deb-e2e: navigating and reloading through the detached QML toolbar",
+                flush=True,
+            )
+            detached_toolbar_url = f"{chromium_url}?detached-toolbar=1"
+            driver.type_address("browser.address.2", detached_toolbar_url)
+            driver.wait_for_text("browser.address.2", detached_toolbar_url)
+            driver.wait_for_name(
+                "browser.tab.default.4", f"deb-e2e chromium set {site.token}"
+            )
+            detached_toolbar_marker, detached_toolbar_variants = (
+                driver.wait_for_surface(
+                    "browser.surface.2", "detached-toolbar Chromium"
+                )
+            )
+            driver.click("browser.reload.2")
+            driver.wait_for_name(
+                "browser.tab.default.4", f"deb-e2e chromium set {site.token}"
+            )
+            driver.wait_for_surface("browser.surface.2", "reloaded detached Chromium")
             driver.wait_for_name("browser.status.1", "Chromium")
             driver.wait_for_text("browser.address.1", chromium_url)
             main_after_move_marker, main_after_move_variants = driver.wait_for_surface(
@@ -1747,6 +1767,20 @@ def main():
             driver.wait_for_name("browser.status.3", selected_engine)
             driver.assert_no_process_failures("rapid Ctrl+Tab stress")
 
+            print(
+                "deb-e2e: opening a fourth window through the detached QML toolbar",
+                flush=True,
+            )
+            driver.click("browser.new-window.3")
+            driver.wait_for_id("browser.view.4")
+            driver.wait_for_id("browser.tab.default.8")
+            driver.wait_for_descendant("browser.tab.default.8", "browser.view.4")
+            driver.wait_for_name("browser.status.4", "Chromium")
+            qml_window_marker, qml_window_variants = driver.wait_for_surface(
+                "browser.surface.4", "QML-toolbar-created Chromium window"
+            )
+            driver.assert_no_process_failures("detached QML toolbar window creation")
+
             touch_summary = (
                 " and trusted raw two-contact gestures"
                 if touchscreen is not None
@@ -1754,7 +1788,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"native KXMLGUI toolbar configuration, both engines, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
+                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -1765,6 +1799,8 @@ def main():
                 f"second window {second_window_variants}/{second_window_marker}, "
                 f"detached Firefox {detached_firefox_variants}/{detached_firefox_marker}, "
                 f"moved Firefox {moved_firefox_variants}/{moved_firefox_marker}, "
+                f"detached toolbar {detached_toolbar_variants}/{detached_toolbar_marker}, "
+                f"QML-created window {qml_window_variants}/{qml_window_marker}, "
                 f"main after move {main_after_move_variants}/{main_after_move_marker}, "
                 f"page clicks {chromium_click_pixels}/{firefox_click_pixels} pixels, "
                 f"retained clicks {retained_chromium_click_pixels}/{retained_firefox_click_pixels}, "
