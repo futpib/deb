@@ -7,6 +7,8 @@ const bridge = Cc[
 ].getService(Ci.nsIFirefoxCefBridge);
 
 const browsers = new Map();
+const devtoolsCommands = new Map();
+const devtoolsOpenings = new Map();
 const windowParameters = new URLSearchParams(window.location.search);
 const childBrowserId = Number(windowParameters.get("browserId"));
 const startsRuntime = !Number.isInteger(childBrowserId) || childBrowserId <= 0;
@@ -66,6 +68,59 @@ function loadUrl(browser, url) {
   browser.loadURI(Services.io.newURI(url), {
     triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
   });
+}
+
+async function openDeveloperTools(entry) {
+  const { require } = ChromeUtils.importESModule(
+    "resource://devtools/shared/loader/Loader.sys.mjs"
+  );
+  const { CommandsFactory } = require(
+    "resource://devtools/shared/commands/commands-factory.js"
+  );
+  const { gDevTools } = require(
+    "resource://devtools/client/framework/devtools.js"
+  );
+  const { Toolbox } = require(
+    "resource://devtools/client/framework/toolbox.js"
+  );
+  let commands = devtoolsCommands.get(entry.browserId);
+  if (!commands) {
+    commands = await CommandsFactory.forRemoteTab(entry.browser.browserId);
+    devtoolsCommands.set(entry.browserId, commands);
+    commands.client.once("closed").then(() => {
+      devtoolsCommands.delete(entry.browserId);
+    });
+  }
+  const createsWindow = !gDevTools.getToolboxForCommands(commands);
+  if (createsWindow) {
+    bridge.prepareDevToolsWindow();
+  }
+  try {
+    return await gDevTools.showToolbox(commands, {
+      toolId: "inspector",
+      hostType: Toolbox.HostType.WINDOW,
+      raise: true,
+    });
+  } catch (error) {
+    if (createsWindow) {
+      bridge.cancelDevToolsWindow();
+    }
+    throw error;
+  }
+}
+
+function showDeveloperTools(entry) {
+  const opening = devtoolsOpenings.get(entry.browserId);
+  if (opening) {
+    return opening.then(toolbox => toolbox.raise());
+  }
+  const pending = openDeveloperTools(entry).finally(() => {
+    if (devtoolsOpenings.get(entry.browserId) === pending) {
+      devtoolsOpenings.delete(entry.browserId);
+    }
+  });
+  devtoolsOpenings.set(entry.browserId, pending);
+  return pending;
 }
 
 function createBrowserElement(browserId) {
@@ -301,6 +356,13 @@ const commandObserver = (subject, topic, command) => {
         replaceCrashedBrowser(browserId, entry.currentUrl);
       } else {
         entry?.browser.reload();
+      }
+      break;
+    case "show-devtools":
+      if (entry) {
+        showDeveloperTools(entry).catch(error => {
+          console.error("firefox-cef: opening developer tools failed", error);
+        });
       }
       break;
     case "focus":

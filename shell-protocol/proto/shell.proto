@@ -25,6 +25,7 @@ enum Capability {
   CAPABILITY_CURSOR_EVENTS = 13;
   CAPABILITY_TOUCH_INPUT = 14;
   CAPABILITY_FULLSCREEN = 15;
+  CAPABILITY_DEVTOOLS = 16;
 }
 
 enum MouseButton {
@@ -102,6 +103,7 @@ message Request {
     MouseWheel mouse_wheel = 23;
     KeyEvent key_event = 24;
     TouchEvent touch_event = 25;
+    OpenDevTools open_dev_tools = 26;
   }
 }
 
@@ -144,6 +146,8 @@ message SetFocus {
 }
 
 message Reload {}
+
+message OpenDevTools {}
 
 message Close {
   bool force = 1;

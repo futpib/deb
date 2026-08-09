@@ -1057,6 +1057,82 @@ class Driver:
         self.focus_accessible_window(accessible)
         self.xdotool("key", "--clearmodifiers", sequence)
 
+    def managed_named_windows(self):
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--name", ".*"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        windows = {}
+        for window in result.stdout.split():
+            if not self.window_is_managed(window):
+                continue
+            try:
+                windows[window] = self.xdotool(
+                    "getwindowname", window, capture=True
+                )
+            except subprocess.CalledProcessError:
+                continue
+        return windows
+
+    def verify_developer_tools(self, accessible_id, engine, title_marker):
+        before = set(self.managed_named_windows())
+        self.send_shortcut(accessible_id, "ctrl+shift+i")
+
+        def opened_toolbox():
+            for window, title in self.managed_named_windows().items():
+                normalized = title.lower()
+                if window not in before and (
+                    "devtools" in normalized or "developer tools" in normalized
+                ):
+                    if title_marker not in title:
+                        continue
+                    width, height = self.window_geometry(window)[2:]
+                    if width >= 500 and height >= 300:
+                        return window, title
+            return None
+
+        try:
+            window, title = self.wait_until(
+                f"the {engine} developer-tools window for the active page",
+                opened_toolbox,
+                timeout=45.0,
+            )
+        except SmokeFailure as error:
+            raise SmokeFailure(
+                f"{error}; managed windows were {self.managed_named_windows()}"
+            ) from error
+
+        self.send_shortcut(accessible_id, "ctrl+shift+i")
+        self.wait_until(
+            f"the existing {engine} developer-tools window to be focused",
+            lambda: window
+            if self.xdotool("getactivewindow", capture=True) == window
+            else None,
+        )
+        matching = {
+            candidate
+            for candidate, candidate_title in self.managed_named_windows().items()
+            if candidate not in before
+            and (
+                "devtools" in candidate_title.lower()
+                or "developer tools" in candidate_title.lower()
+            )
+        }
+        if matching != {window}:
+            raise SmokeFailure(
+                f"{engine} opened duplicate developer-tools windows: {matching}"
+            )
+
+        self.xdotool("key", "--clearmodifiers", "alt+F4")
+        self.wait_until(
+            f"the {engine} developer-tools window to close",
+            lambda: True if window not in self.managed_named_windows() else None,
+        )
+        return title
+
     def send_repeated_shortcut(self, accessible_id, sequence, repeat, repeat_delay):
         accessible = self.wait_for_id(accessible_id)
         self.focus_accessible_window(accessible)
@@ -1526,6 +1602,13 @@ def main():
                 "browser.tab.default.1",
                 f"deb-e2e chromium click received {site.token}",
             )
+            print(
+                "deb-e2e: opening and reusing Chromium DevTools through KDE's shortcut",
+                flush=True,
+            )
+            chromium_devtools_title = driver.verify_developer_tools(
+                "browser.surface.1", "Chromium", site.token
+            )
 
             print("deb-e2e: observing Chromium's cookie from Firefox", flush=True)
             driver.click("browser.tab.default.2")
@@ -1583,6 +1666,13 @@ def main():
             driver.wait_for_name(
                 "browser.tab.default.2",
                 f"deb-e2e firefox click received {site.token}",
+            )
+            print(
+                "deb-e2e: opening and reusing Firefox Developer Tools through KDE's shortcut",
+                flush=True,
+            )
+            firefox_devtools_title = driver.verify_developer_tools(
+                "browser.surface.1", "Firefox", site.token
             )
 
             print("deb-e2e: switching retained tabs through their buttons", flush=True)
@@ -1788,7 +1878,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
+                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -1807,6 +1897,7 @@ def main():
                 f"shortcut clicks {shortcut_chromium_click_pixels}/{shortcut_firefox_click_pixels}, "
                 f"moved/main clicks {moved_firefox_click_pixels}/{main_after_move_click_pixels}, "
                 f"fullscreen markers {chromium_fullscreen_pixels}/{firefox_fullscreen_pixels} at {chromium_fullscreen_geometry}/{firefox_fullscreen_geometry}, "
+                f"developer tools {chromium_devtools_title!r}/{firefox_devtools_title!r}, "
                 f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0

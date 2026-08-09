@@ -120,6 +120,12 @@ Item {
         }
     }
 
+    function openDeveloperTools() {
+        if (activeWorkspace !== null) {
+            activeWorkspace.openDeveloperTools()
+        }
+    }
+
     function switchActiveEngine(engine) {
         if (activeWorkspace !== null) {
             activeWorkspace.switchActiveEngine(engine)
@@ -374,6 +380,10 @@ Item {
 
         function reload() {
             backend.reload(viewId)
+        }
+
+        function openDeveloperTools() {
+            backend.open_developer_tools(viewId)
         }
 
         function switchActiveEngine(engine) {

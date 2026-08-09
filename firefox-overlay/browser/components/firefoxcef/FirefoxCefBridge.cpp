@@ -115,6 +115,7 @@ uint32_t sInitialHeight = 2;
 nsCString sInitialUrl;
 bool sRuntimeReady;
 bool sObservingCookies;
+bool sDevToolsWindowPending;
 std::map<uint32_t, BrowserConfig> sConfiguredBrowsers;
 std::map<uint32_t, nsCOMPtr<nsIWidget>> sWidgets;
 std::map<nsIWidget *, uint32_t> sWidgetBrowsers;
@@ -760,6 +761,18 @@ NS_IMETHODIMP FirefoxCefBridge::RuntimeReady() {
   return NS_OK;
 }
 
+NS_IMETHODIMP FirefoxCefBridge::PrepareDevToolsWindow() {
+  StaticMutexAutoLock lock(sMutex);
+  sDevToolsWindowPending = true;
+  return NS_OK;
+}
+
+NS_IMETHODIMP FirefoxCefBridge::CancelDevToolsWindow() {
+  StaticMutexAutoLock lock(sMutex);
+  sDevToolsWindowPending = false;
+  return NS_OK;
+}
+
 NS_IMETHODIMP FirefoxCefBridge::AttachWindow(uint32_t aBrowserId,
                                              nsIBaseWindow *aBaseWindow) {
   if (!aBaseWindow) {
@@ -948,6 +961,15 @@ NS_IMETHODIMP FirefoxCefBridge::BeforeClose(uint32_t aBrowserId) {
 
 } // namespace mozilla
 
+extern "C" NS_EXPORT int firefox_cef_gecko_take_devtools_window() {
+  mozilla::StaticMutexAutoLock lock(sMutex);
+  if (!sDevToolsWindowPending) {
+    return 0;
+  }
+  sDevToolsWindowPending = false;
+  return 1;
+}
+
 extern "C" NS_EXPORT void
 firefox_cef_gecko_set_callbacks(const FirefoxCefCallbacks *aCallbacks) {
   mozilla::StaticMutexAutoLock lock(sMutex);
@@ -1135,6 +1157,11 @@ extern "C" NS_EXPORT int firefox_cef_gecko_navigate(uint32_t aBrowserId,
 
 extern "C" NS_EXPORT int firefox_cef_gecko_reload(uint32_t aBrowserId) {
   NotifyCommand(BrowserCommand("reload", aBrowserId));
+  return 1;
+}
+
+extern "C" NS_EXPORT int firefox_cef_gecko_show_devtools(uint32_t aBrowserId) {
+  NotifyCommand(BrowserCommand("show-devtools", aBrowserId));
   return 1;
 }
 

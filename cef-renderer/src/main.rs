@@ -106,6 +106,7 @@ enum ControlCommand {
     Resize(Bounds),
     Focus(bool),
     Reload,
+    OpenDevTools,
     Close(bool),
     Visibility(bool),
     ReadCookies,
@@ -204,6 +205,7 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         )),
         wire::request::Operation::SetFocus(command) => Ok(ControlCommand::Focus(command.focused)),
         wire::request::Operation::Reload(_) => Ok(ControlCommand::Reload),
+        wire::request::Operation::OpenDevTools(_) => Ok(ControlCommand::OpenDevTools),
         wire::request::Operation::Close(command) => Ok(ControlCommand::Close(command.force)),
         wire::request::Operation::SetVisibility(command) => {
             Ok(ControlCommand::Visibility(command.visible))
@@ -552,6 +554,9 @@ wrap_life_span_handler! {
             let Some(browser) = browser else {
                 return;
             };
+            if browser.is_popup() != 0 {
+                return;
+            }
             let Some(host) = browser.host() else {
                 return;
             };
@@ -565,7 +570,10 @@ wrap_life_span_handler! {
             eprintln!("cef-renderer: windowless browser ready");
         }
 
-        fn on_before_close(&self, _browser: Option<&mut Browser>) {
+        fn on_before_close(&self, browser: Option<&mut Browser>) {
+            if browser.is_some_and(|browser| browser.is_popup() != 0) {
+                return;
+            }
             self.registry.remove(self.browser_id);
             self.emitter
                 .event(wire::event::Value::BrowserClosed(wire::BrowserClosed {}));
@@ -1163,6 +1171,21 @@ wrap_task! {
                     self.browser.reload();
                     Ok(())
                 }
+                ControlCommand::OpenDevTools => {
+                    if let Some(host) = self.browser.host() {
+                        let window_info = WindowInfo::default();
+                        let settings = BrowserSettings::default();
+                        host.show_dev_tools(
+                            Some(&window_info),
+                            None,
+                            Some(&settings),
+                            None,
+                        );
+                        Ok(())
+                    } else {
+                        Err("CEF browser has no host".into())
+                    }
+                }
                 ControlCommand::Close(force) => {
                     if self.request_id != 0 {
                         self.emitter.success(self.request_id);
@@ -1401,6 +1424,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::CursorEvents,
         Capability::TouchInput,
         Capability::Fullscreen,
+        Capability::Devtools,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -1571,6 +1595,7 @@ fn run() -> Result<i32, Box<dyn Error>> {
         root_cache_path: CefString::from(
             browser_config.profile_data_path.to_string_lossy().as_ref(),
         ),
+        persist_session_cookies: 1,
         resources_dir_path: CefString::from(runtime_path.to_string_lossy().as_ref()),
         locales_dir_path: CefString::from(runtime_path.join("locales").to_string_lossy().as_ref()),
         log_file: CefString::from("/dev/stderr"),
@@ -1909,6 +1934,19 @@ mod tests {
                 })),
             }),
             Ok(ControlCommand::Focus(true))
+        ));
+    }
+
+    #[test]
+    fn parses_open_devtools_request() {
+        assert!(matches!(
+            control_command(wire::Request {
+                browser_id: 1,
+                operation: Some(wire::request::Operation::OpenDevTools(
+                    wire::OpenDevTools {}
+                )),
+            }),
+            Ok(ControlCommand::OpenDevTools)
         ));
     }
 

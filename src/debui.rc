@@ -13,6 +13,7 @@
         </Menu>
         <Menu name="view"><text>&amp;View</text>
             <Action name="reload"/>
+            <Action name="developer-tools"/>
             <Action name="focus-location"/>
             <Separator/>
             <Action name="view-full-screen"/>

@@ -111,7 +111,8 @@ int runKxmlGuiSelfTest() {
             "default toolbar actions are not new-tab, reload, engine, location, new-window");
     }
     if (first->actionCollection()->action(QStringLiteral("configure-toolbars")) == nullptr ||
-        first->actionCollection()->action(QStringLiteral("configure-shortcuts")) == nullptr) {
+        first->actionCollection()->action(QStringLiteral("configure-shortcuts")) == nullptr ||
+        first->actionCollection()->action(QStringLiteral("developer-tools")) == nullptr) {
         return selfTestFailure("configuration actions are missing");
     }
     first->show();
@@ -254,6 +255,13 @@ void DebMainWindow::setupActions() {
                        QKeySequence(QStringLiteral("Ctrl+R")));
     connect(action, &QAction::triggered, this,
             [this] { invokeRoot("reloadActiveTab"); });
+
+    action = makeAction(collection, QStringLiteral("developer-tools"),
+                       i18nc("@action", "Developer Tools"),
+                       QStringLiteral("applications-development"),
+                       QKeySequence(QStringLiteral("Ctrl+Shift+I")));
+    connect(action, &QAction::triggered, this,
+            [this] { invokeRoot("openDeveloperTools"); });
 
     action = makeAction(collection, QStringLiteral("focus-location"),
                        i18nc("@action", "Focus Location"),

@@ -117,6 +117,7 @@ struct GeckoApi {
     release_frame: ReleaseFrame,
     navigate: BrowserStringCommand,
     reload: BrowserCommand,
+    show_dev_tools: BrowserCommand,
     send_mouse_move: MouseMoveCommand,
     send_mouse_click: MouseClickCommand,
     send_mouse_wheel: MouseWheelCommand,
@@ -151,6 +152,7 @@ impl GeckoApi {
             release_frame: unsafe { symbol(libxul, b"firefox_cef_gecko_release_frame\0")? },
             navigate: unsafe { symbol(libxul, b"firefox_cef_gecko_navigate\0")? },
             reload: unsafe { symbol(libxul, b"firefox_cef_gecko_reload\0")? },
+            show_dev_tools: unsafe { symbol(libxul, b"firefox_cef_gecko_show_devtools\0")? },
             send_mouse_move: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_move\0")? },
             send_mouse_click: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_click\0")? },
             send_mouse_wheel: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_wheel\0")? },
@@ -574,6 +576,11 @@ impl BrowserState {
     pub fn reload(&self) -> RuntimeResult<()> {
         let api = gecko()?;
         api.browser_command(api.reload, self.id, "reload")
+    }
+
+    pub fn show_dev_tools(&self) -> RuntimeResult<()> {
+        let api = gecko()?;
+        api.browser_command(api.show_dev_tools, self.id, "developer tools")
     }
 
     pub fn invalidate(&self) -> RuntimeResult<()> {

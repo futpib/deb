@@ -7,8 +7,8 @@ use cef_dll_sys::{
     _cef_app_t, _cef_browser_host_t, _cef_browser_settings_t, _cef_browser_t, _cef_client_t,
     _cef_dictionary_value_t, _cef_frame_t, _cef_request_context_t, _cef_scheme_handler_factory_t,
     _cef_settings_t, _cef_task_t, cef_key_event_t, cef_main_args_t, cef_mouse_button_type_t,
-    cef_mouse_event_t, cef_string_t, cef_thread_id_t, cef_touch_event_t, cef_window_handle_t,
-    cef_window_info_t,
+    cef_mouse_event_t, cef_point_t, cef_string_t, cef_thread_id_t, cef_touch_event_t,
+    cef_window_handle_t, cef_window_info_t,
 };
 use libc::{c_char, c_int, c_void};
 use refcount::{CefRefCounted, RefObject, add_ref_raw, release_raw};
@@ -120,6 +120,18 @@ unsafe extern "C" fn host_is_fullscreen(host: *mut _cef_browser_host_t) -> c_int
 unsafe extern "C" fn host_exit_fullscreen(host: *mut _cef_browser_host_t, _will_resize: c_int) {
     if let Err(error) = state_from(host).exit_fullscreen() {
         eprintln!("firefox-cef: fullscreen exit failed: {error}");
+    }
+}
+
+unsafe extern "C" fn host_show_dev_tools(
+    host: *mut _cef_browser_host_t,
+    _window_info: *const cef_window_info_t,
+    _client: *mut _cef_client_t,
+    _settings: *const _cef_browser_settings_t,
+    _inspect_element_at: *const cef_point_t,
+) {
+    if let Err(error) = state_from(host).show_dev_tools() {
+        eprintln!("firefox-cef: developer tools failed: {error}");
     }
 }
 
@@ -271,6 +283,7 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     host.set_focus = Some(host_set_focus);
     host.is_fullscreen = Some(host_is_fullscreen);
     host.exit_fullscreen = Some(host_exit_fullscreen);
+    host.show_dev_tools = Some(host_show_dev_tools);
     host.send_key_event = Some(host_send_key_event);
     host.get_window_handle = Some(host_get_window_handle);
     host.get_client = Some(host_get_client);

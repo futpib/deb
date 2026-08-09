@@ -304,6 +304,18 @@ impl Backend {
     }
 
     #[qslot]
+    fn open_developer_tools(&mut self, window_id: String) {
+        if let (Some(controller), Ok(window_id)) = (&self.controller, window_id.parse::<u64>()) {
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "developer-tools",
+                TabCommand::OpenDevTools(window_id),
+            );
+        }
+    }
+
+    #[qslot]
     fn new_tab(&mut self, window_id: String, engine: String) {
         if let (Some(controller), Ok(window_id), Some(engine)) = (
             &self.controller,

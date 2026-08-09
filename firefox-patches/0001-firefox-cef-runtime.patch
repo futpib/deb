@@ -14,7 +14,7 @@ diff --git a/toolkit/library/libxul.symbols b/toolkit/library/libxul.symbols
 index e63e3e7442..902d5ee39f 100644
 --- a/toolkit/library/libxul.symbols
 +++ b/toolkit/library/libxul.symbols
-@@ -1,4 +1,28 @@
+@@ -1,4 +1,29 @@
  XRE_GetBootstrap
 +firefox_cef_gecko_set_callbacks
 +firefox_cef_gecko_configure
@@ -25,6 +25,7 @@ index e63e3e7442..902d5ee39f 100644
 +firefox_cef_gecko_emit_accelerated_frame
 +firefox_cef_gecko_navigate
 +firefox_cef_gecko_reload
++firefox_cef_gecko_show_devtools
 +firefox_cef_gecko_focus
 +firefox_cef_gecko_set_visibility
 +firefox_cef_gecko_send_mouse_move
@@ -73,11 +74,12 @@ diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_binding
  void wr_compositor_add_surface(void* aCompositor, wr::NativeSurfaceId aId,
                                 const wr::CompositorSurfaceTransform* aTransform,
                                 wr::DeviceIntRect aClipRect,
-@@ -200,6 +204,10 @@
+@@ -200,6 +204,11 @@
  /* static */
  UniquePtr<RenderCompositor> RenderCompositor::Create(
      const RefPtr<widget::CompositorWidget>& aWidget, nsACString& aError) {
-+  if (PR_GetEnv("FIREFOX_CEF_DIRECT")) {
++  if (PR_GetEnv("FIREFOX_CEF_DIRECT") && aWidget->AsDelegate() &&
++      aWidget->AsDelegate()->AsHeadlessCompositorWidget()) {
 +    return CreateFirefoxCefRenderCompositor(aWidget, aError);
 +  }
 +
@@ -87,13 +89,25 @@ diff --git a/gfx/webrender_bindings/RenderCompositor.cpp b/gfx/webrender_binding
 diff --git a/xpfe/appshell/AppWindow.cpp b/xpfe/appshell/AppWindow.cpp
 --- a/xpfe/appshell/AppWindow.cpp
 +++ b/xpfe/appshell/AppWindow.cpp
-@@ -184,7 +184,8 @@
+@@ -95,6 +95,8 @@
+ //*****************************************************************************
+ 
+ namespace mozilla {
++
++extern "C" int firefox_cef_gecko_take_devtools_window();
+ 
+ using dom::AutoNoJSAPI;
+ using dom::BrowserHost;
+@@ -184,7 +186,11 @@
                            DesktopIntSize(aInitialWidth, aInitialHeight));
  
    // Create top level window
 -  if (gfxPlatform::IsHeadless()) {
++  const bool firefoxCefDirect = PR_GetEnv("FIREFOX_CEF_DIRECT");
++  const bool firefoxCefDevTools =
++      firefoxCefDirect && firefox_cef_gecko_take_devtools_window();
 +  if (gfxPlatform::IsHeadless() ||
-+      PR_GetEnv("FIREFOX_CEF_DIRECT")) {
++      (firefoxCefDirect && !firefoxCefDevTools)) {
      mWindow = nsIWidget::CreateHeadlessWidget();
    } else {
      mWindow = nsIWidget::CreateTopLevelWindow();

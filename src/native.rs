@@ -470,6 +470,14 @@ impl CefInstance {
         )
     }
 
+    pub(crate) fn open_dev_tools(&mut self, browser_id: u64) -> NativeResult<()> {
+        self.send_browser_request(
+            browser_id,
+            wire::request::Operation::OpenDevTools(wire::OpenDevTools {}),
+            "developer tools",
+        )
+    }
+
     pub(crate) fn send_mouse_move(
         &mut self,
         browser_id: u64,
@@ -1312,6 +1320,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::CursorEvents,
         Capability::TouchInput,
         Capability::Fullscreen,
+        Capability::Devtools,
     ]
     .into_iter()
     .map(|capability| capability as i32)
