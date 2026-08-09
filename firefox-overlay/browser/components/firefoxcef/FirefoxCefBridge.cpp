@@ -97,6 +97,8 @@ struct FirefoxCefCallbacks {
                              int fenceFd);
   void (*onCursorChange)(void *context, int32_t browserId,
                          uint32_t cefCursorType);
+  void (*onFullscreenChange)(void *context, int32_t browserId,
+                             uint8_t fullscreen);
 };
 
 mozilla::StaticMutex sMutex;
@@ -882,6 +884,15 @@ NS_IMETHODIMP FirefoxCefBridge::LoadingStateChanged(uint32_t aBrowserId,
   return NS_OK;
 }
 
+NS_IMETHODIMP FirefoxCefBridge::FullscreenChanged(uint32_t aBrowserId,
+                                                  bool aFullscreen) {
+  FirefoxCefCallbacks callbacks = Callbacks();
+  if (callbacks.onFullscreenChange) {
+    callbacks.onFullscreenChange(callbacks.context, aBrowserId, aFullscreen);
+  }
+  return NS_OK;
+}
+
 NS_IMETHODIMP FirefoxCefBridge::LoadError(uint32_t aBrowserId,
                                           int32_t aErrorCode,
                                           const nsACString &aErrorText,
@@ -1138,6 +1149,12 @@ extern "C" NS_EXPORT int firefox_cef_gecko_set_visibility(uint32_t aBrowserId,
   command.Append('\t');
   command.Append(aVisible ? '1' : '0');
   NotifyCommand(std::move(command));
+  return 1;
+}
+
+extern "C" NS_EXPORT int
+firefox_cef_gecko_exit_fullscreen(uint32_t aBrowserId) {
+  NotifyCommand(BrowserCommand("exit-fullscreen", aBrowserId));
   return 1;
 }
 

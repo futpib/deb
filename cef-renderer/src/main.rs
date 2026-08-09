@@ -706,6 +706,22 @@ wrap_display_handler! {
             ));
         }
 
+        fn on_fullscreen_mode_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            fullscreen: std::os::raw::c_int,
+        ) {
+            eprintln!(
+                "cef-renderer: HTML fullscreen {}",
+                if fullscreen != 0 { "entered" } else { "exited" }
+            );
+            self.emitter.event(wire::event::Value::FullscreenChanged(
+                wire::FullscreenChanged {
+                    fullscreen: fullscreen != 0,
+                },
+            ));
+        }
+
         fn on_cursor_change(
             &self,
             _browser: Option<&mut Browser>,
@@ -1160,6 +1176,9 @@ wrap_task! {
                 }
                 ControlCommand::Visibility(visible) => {
                     if let Some(host) = self.browser.host() {
+                        if !visible && host.is_fullscreen() != 0 {
+                            host.exit_fullscreen(1);
+                        }
                         host.was_hidden(i32::from(!visible));
                         if *visible {
                             host.set_focus(1);
@@ -1240,6 +1259,12 @@ wrap_task! {
                 }
                 ControlCommand::KeyEvent(event) => {
                     if let Some(host) = self.browser.host() {
+                        if event.type_ == KeyEventType::RAWKEYDOWN
+                            && event.windows_key_code == 0x1b
+                            && host.is_fullscreen() != 0
+                        {
+                            host.exit_fullscreen(1);
+                        }
                         host.send_key_event(Some(event));
                         Ok(())
                     } else {
@@ -1375,6 +1400,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::KeyboardInput,
         Capability::CursorEvents,
         Capability::TouchInput,
+        Capability::Fullscreen,
     ]
     .into_iter()
     .map(|capability| capability as i32)

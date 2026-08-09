@@ -24,6 +24,7 @@ enum Capability {
   CAPABILITY_KEYBOARD_INPUT = 12;
   CAPABILITY_CURSOR_EVENTS = 13;
   CAPABILITY_TOUCH_INPUT = 14;
+  CAPABILITY_FULLSCREEN = 15;
 }
 
 enum MouseButton {
@@ -245,6 +246,7 @@ message Event {
     AcceleratedFrame accelerated_frame = 20;
     SurfaceCleared surface_cleared = 21;
     CursorChanged cursor_changed = 22;
+    FullscreenChanged fullscreen_changed = 23;
   }
 }
 
@@ -258,6 +260,10 @@ message CursorChanged {
   int32 hotspot_x = 5;
   int32 hotspot_y = 6;
   float image_scale_factor = 7;
+}
+
+message FullscreenChanged {
+  bool fullscreen = 1;
 }
 
 enum SurfaceLayer {

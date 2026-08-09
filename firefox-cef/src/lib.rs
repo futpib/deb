@@ -113,6 +113,16 @@ unsafe extern "C" fn host_is_ready_to_close(host: *mut _cef_browser_host_t) -> c
 
 unsafe extern "C" fn host_set_focus(_host: *mut _cef_browser_host_t, _focus: c_int) {}
 
+unsafe extern "C" fn host_is_fullscreen(host: *mut _cef_browser_host_t) -> c_int {
+    i32::from(state_from(host).is_fullscreen())
+}
+
+unsafe extern "C" fn host_exit_fullscreen(host: *mut _cef_browser_host_t, _will_resize: c_int) {
+    if let Err(error) = state_from(host).exit_fullscreen() {
+        eprintln!("firefox-cef: fullscreen exit failed: {error}");
+    }
+}
+
 unsafe extern "C" fn host_send_key_event(
     host: *mut _cef_browser_host_t,
     event: *const cef_key_event_t,
@@ -259,6 +269,8 @@ fn make_browser_objects(state: Arc<BrowserState>) -> *mut _cef_browser_t {
     host.try_close_browser = Some(host_try_close_browser);
     host.is_ready_to_be_closed = Some(host_is_ready_to_close);
     host.set_focus = Some(host_set_focus);
+    host.is_fullscreen = Some(host_is_fullscreen);
+    host.exit_fullscreen = Some(host_exit_fullscreen);
     host.send_key_event = Some(host_send_key_event);
     host.get_window_handle = Some(host_get_window_handle);
     host.get_client = Some(host_get_client);

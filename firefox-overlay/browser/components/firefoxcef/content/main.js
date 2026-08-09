@@ -15,6 +15,53 @@ const ownedBrowserId = coordinator ? bridge.browserId : childBrowserId;
 const ownedInitialUrl = coordinator
   ? bridge.initialUrl
   : windowParameters.get("url") ?? "about:blank";
+if (startsRuntime) {
+  ChromeUtils.registerWindowActor("FirefoxCefDOMFullscreen", {
+    parent: {
+      esModuleURI:
+        "resource:///modules/FirefoxCefFullscreenParent.sys.mjs",
+    },
+    child: {
+      esModuleURI:
+        "resource:///modules/FirefoxCefFullscreenChild.sys.mjs",
+      events: {
+        "MozDOMFullscreen:Request": {},
+        "MozDOMFullscreen:Exit": {},
+        "MozDOMFullscreen:Exited": {},
+      },
+    },
+    allFrames: true,
+  });
+}
+
+window.FullScreen = {
+  firefoxCef: true,
+  actor: null,
+  active: false,
+
+  enterDomFullscreen(actor) {
+    this.actor = actor;
+    if (!this.active) {
+      this.active = true;
+      document.documentElement.setAttribute("inDOMFullscreen", true);
+      bridge.fullscreenChanged(ownedBrowserId, true);
+    }
+  },
+
+  cleanupDomFullscreen() {
+    if (this.active) {
+      this.active = false;
+      document.documentElement.removeAttribute("inDOMFullscreen");
+      bridge.fullscreenChanged(ownedBrowserId, false);
+    }
+    this.actor = null;
+  },
+
+  exitDomFullscreen() {
+    this.actor?.sendAsyncMessage("FirefoxCefFullscreen:Exit", {});
+  },
+};
+
 function loadUrl(browser, url) {
   browser.loadURI(Services.io.newURI(url), {
     triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
@@ -269,6 +316,11 @@ const commandObserver = (subject, topic, command) => {
     case "invalidate":
       if (entry) {
         repaintBrowser(entry);
+      }
+      break;
+    case "exit-fullscreen":
+      if (entry) {
+        window.FullScreen.exitDomFullscreen();
       }
       break;
     case "close":

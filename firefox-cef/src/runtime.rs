@@ -54,6 +54,7 @@ struct FirefoxCefCallbacks {
         ),
     >,
     on_cursor_change: Option<unsafe extern "C" fn(*mut c_void, i32, u32)>,
+    on_fullscreen_change: Option<unsafe extern "C" fn(*mut c_void, i32, u8)>,
 }
 
 #[repr(C)]
@@ -121,6 +122,7 @@ struct GeckoApi {
     send_mouse_wheel: MouseWheelCommand,
     send_touch: TouchCommand,
     send_key: KeyCommand,
+    exit_fullscreen: BrowserCommand,
     close: BrowserBoolCommand,
     shutdown: Command,
     post_task: PostTask,
@@ -154,6 +156,7 @@ impl GeckoApi {
             send_mouse_wheel: unsafe { symbol(libxul, b"firefox_cef_gecko_send_mouse_wheel\0")? },
             send_touch: unsafe { symbol(libxul, b"firefox_cef_gecko_send_touch\0")? },
             send_key: unsafe { symbol(libxul, b"firefox_cef_gecko_send_key\0")? },
+            exit_fullscreen: unsafe { symbol(libxul, b"firefox_cef_gecko_exit_fullscreen\0")? },
             close: unsafe { symbol(libxul, b"firefox_cef_gecko_close\0")? },
             shutdown: unsafe { symbol(libxul, b"firefox_cef_gecko_shutdown\0")? },
             post_task: unsafe { symbol(libxul, b"firefox_cef_gecko_post_task\0")? },
@@ -201,6 +204,7 @@ pub struct BrowserState {
     window: AtomicU32,
     current_url: Mutex<String>,
     loading: AtomicBool,
+    fullscreen: AtomicBool,
     after_created: AtomicBool,
     closed: AtomicBool,
 }
@@ -388,6 +392,7 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
         on_cookie_changed: Some(on_cookie_changed),
         on_accelerated_frame: Some(on_accelerated_frame),
         on_cursor_change: Some(on_cursor_change),
+        on_fullscreen_change: Some(on_fullscreen_change),
     };
     unsafe { (gecko()?.set_callbacks)(&callbacks) };
     Ok(())
@@ -499,6 +504,7 @@ impl BrowserState {
             window: AtomicU32::new(0),
             current_url: Mutex::new(url.to_owned()),
             loading: AtomicBool::new(false),
+            fullscreen: AtomicBool::new(false),
             after_created: AtomicBool::new(false),
             closed: AtomicBool::new(false),
         });
@@ -533,6 +539,10 @@ impl BrowserState {
 
     pub fn is_loading(&self) -> bool {
         self.loading.load(Ordering::Acquire)
+    }
+
+    pub fn is_fullscreen(&self) -> bool {
+        self.fullscreen.load(Ordering::Acquire)
     }
 
     pub fn take_client(&self, client: *mut _cef_client_t) {
@@ -677,6 +687,11 @@ impl BrowserState {
             return Err(format!("Gecko rejected key event for browser {}", self.id).into());
         }
         Ok(())
+    }
+
+    pub fn exit_fullscreen(&self) -> RuntimeResult<()> {
+        let api = gecko()?;
+        api.browser_command(api.exit_fullscreen, self.id, "fullscreen exit")
     }
 
     pub fn sync_from_parent(&self, _focus: bool) -> RuntimeResult<()> {
@@ -864,6 +879,31 @@ impl BrowserState {
         }
     }
 
+    pub fn notify_fullscreen(&self, fullscreen: bool) {
+        if self.fullscreen.swap(fullscreen, Ordering::AcqRel) == fullscreen {
+            return;
+        }
+        let client = self.client.load(Ordering::Acquire);
+        let browser = self.browser.load(Ordering::Acquire);
+        if client.is_null() || browser.is_null() {
+            return;
+        }
+        unsafe {
+            let Some(get_handler) = (*client).get_display_handler else {
+                return;
+            };
+            let handler = get_handler(client);
+            if handler.is_null() {
+                return;
+            }
+            if let Some(callback) = (*handler).on_fullscreen_mode_change {
+                add_ref_raw(browser);
+                callback(handler, browser, i32::from(fullscreen));
+            }
+            release_raw(handler);
+        }
+    }
+
     pub fn notify_crashed(&self, reason: &str) {
         let client = self.client.load(Ordering::Acquire);
         let browser = self.browser.load(Ordering::Acquire);
@@ -1020,6 +1060,12 @@ unsafe extern "C" fn on_loading_state_change(_context: *mut c_void, id: i32, loa
 unsafe extern "C" fn on_cursor_change(_context: *mut c_void, id: i32, cef_type: u32) {
     if let Some(state) = find_state(id) {
         state.notify_cursor(cef_type);
+    }
+}
+
+unsafe extern "C" fn on_fullscreen_change(_context: *mut c_void, id: i32, fullscreen: u8) {
+    if let Some(state) = find_state(id) {
+        state.notify_fullscreen(fullscreen != 0);
     }
 }
 

@@ -20,7 +20,7 @@ for argument in "$@"; do
   esac
 done
 
-for command in glxinfo python3 timeout rg xdotool xdpyinfo; do
+for command in glxinfo openbox python3 timeout rg xdotool xdpyinfo xprop; do
   if ! command -v "$command" >/dev/null; then
     echo "Required smoke-test command is unavailable: $command" >&2
     exit 1

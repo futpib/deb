@@ -18,6 +18,13 @@ ApplicationWindow {
     title: "deb · Chromium + Gecko"
     property int nextViewId: 1
     property var detachedWindows: []
+    readonly property bool contentFullscreen: {
+        if (profileTabs.currentIndex < 0) {
+            return false
+        }
+        const workspace = profileRepeater.itemAt(profileTabs.currentIndex)
+        return workspace !== null && workspace.contentFullscreen
+    }
 
     ProfileManager {
         id: profileManager
@@ -117,6 +124,8 @@ ApplicationWindow {
     }
 
     header: ToolBar {
+        visible: !root.contentFullscreen
+
         RowLayout {
             anchors.fill: parent
             anchors.leftMargin: 10
@@ -249,12 +258,14 @@ ApplicationWindow {
         readonly property string profileName: profilesModel.get(index).profileName
         readonly property string viewId: profilesModel.get(index).profileViewId
         readonly property var backendObject: backend
+        readonly property bool contentFullscreen: mainBrowserView.activeFullscreen
         Backend {
             id: backend
             profileId: workspace.profileId
         }
 
         BrowserView {
+            id: mainBrowserView
             anchors.fill: parent
             backendObject: backend
             profileId: workspace.profileId
@@ -665,6 +676,17 @@ ApplicationWindow {
         property string activeTabId: ""
         property string currentUrl: ""
         property string currentStatus: "Waiting for native host…"
+        readonly property bool activeFullscreen: {
+            const state = JSON.parse(backendObject.windowStateJson)
+            const ownWindow = (state.windows ?? []).find(candidate => candidate.id === viewId)
+            if (ownWindow === undefined) {
+                return false
+            }
+            const activeTab = ownWindow.tabs.find(tab => tab.id === ownWindow.activeTabId)
+            return activeTab !== undefined && activeTab.fullscreen === true
+        }
+        property bool fullscreenApplied: false
+        property int fullscreenRestoreVisibility: Window.Windowed
         objectName: `browser.view.${viewId}`
         Accessible.id: objectName
         Accessible.role: Accessible.Pane
@@ -721,7 +743,8 @@ ApplicationWindow {
                 "tabTitle": tab.title,
                 "tabStatus": tab.status,
                 "loading": tab.loading,
-                "crashed": tab.crashed
+                "crashed": tab.crashed,
+                "fullscreen": tab.fullscreen
             }
             for (const role of Object.keys(roles)) {
                 if (tabsModel.get(index)[role] !== roles[role]) {
@@ -742,7 +765,8 @@ ApplicationWindow {
                         "tabTitle": tab.title,
                         "tabStatus": tab.status,
                         "loading": tab.loading,
-                        "crashed": tab.crashed
+                        "crashed": tab.crashed,
+                        "fullscreen": tab.fullscreen
                     })
                     currentIndex = targetIndex
                 } else if (currentIndex !== targetIndex) {
@@ -932,11 +956,39 @@ ApplicationWindow {
             }
         }
 
+        function applyWindowFullscreen() {
+            const hostWindow = browserView.Window.window
+            if (hostWindow === null) {
+                return
+            }
+            if (activeFullscreen && !fullscreenApplied) {
+                fullscreenRestoreVisibility = hostWindow.visibility
+                fullscreenApplied = true
+                hostWindow.showFullScreen()
+            } else if (!activeFullscreen && fullscreenApplied) {
+                fullscreenApplied = false
+                if (fullscreenRestoreVisibility === Window.Maximized) {
+                    hostWindow.showMaximized()
+                } else if (fullscreenRestoreVisibility === Window.Minimized) {
+                    hostWindow.showMinimized()
+                } else if (fullscreenRestoreVisibility === Window.FullScreen) {
+                    hostWindow.showFullScreen()
+                } else {
+                    hostWindow.showNormal()
+                }
+            }
+        }
+
+        onActiveFullscreenChanged: {
+            Qt.callLater(applyWindowFullscreen)
+        }
+
         ColumnLayout {
             anchors.fill: parent
             spacing: 0
 
             ToolBar {
+                visible: !browserView.activeFullscreen
                 Layout.fillWidth: true
 
                 ColumnLayout {
@@ -1145,7 +1197,10 @@ ApplicationWindow {
 
         onViewVisibleChanged: Qt.callLater(syncNativeGeometry)
         onViewFocusedChanged: Qt.callLater(syncNativeGeometry)
-        Component.onCompleted: Qt.callLater(syncNativeGeometry)
+        Component.onCompleted: Qt.callLater(function() {
+            syncNativeGeometry()
+            applyWindowFullscreen()
+        })
     }
 
     onClosing: function(close) {

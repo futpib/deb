@@ -831,6 +831,9 @@ impl CefInstance {
                             Err(error) => Some(ProtocolNotice::ProtocolFailed(error.to_string())),
                         }
                     }
+                    Some(wire::event::Value::FullscreenChanged(change)) => {
+                        Some(ProtocolNotice::FullscreenChanged(change.fullscreen))
+                    }
                     None => None,
                 };
                 (browser_id, value)
@@ -996,6 +999,7 @@ pub(crate) enum ProtocolNotice {
     CookieSnapshotEntry(wire::Cookie),
     CookieSnapshotComplete,
     CookieChanged(wire::Cookie, wire::CookieChangeCause),
+    FullscreenChanged(bool),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1307,6 +1311,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::KeyboardInput,
         Capability::CursorEvents,
         Capability::TouchInput,
+        Capability::Fullscreen,
     ]
     .into_iter()
     .map(|capability| capability as i32)

@@ -5,7 +5,7 @@
 #include "nsISupports.idl"
 #include "nsIBaseWindow.idl"
 
-[scriptable, uuid(69e18a45-3b22-4505-a57c-f23d5b272fbc)]
+[scriptable, uuid(335ff545-2339-4216-a59e-e1cc1ef9f091)]
 interface nsIFirefoxCefBridge : nsISupports
 {
   readonly attribute unsigned long browserId;
@@ -19,6 +19,7 @@ interface nsIFirefoxCefBridge : nsISupports
   void addressChanged(in unsigned long browserId, in AUTF8String url);
   void titleChanged(in unsigned long browserId, in AUTF8String title);
   void loadingStateChanged(in unsigned long browserId, in boolean loading);
+  void fullscreenChanged(in unsigned long browserId, in boolean fullscreen);
   void loadError(in unsigned long browserId,
                  in long errorCode,
                  in AUTF8String errorText,

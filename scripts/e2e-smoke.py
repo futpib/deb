@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import atexit
 import ctypes
 import ctypes.util
 import fcntl
@@ -338,6 +339,39 @@ body.complete {{ background: linear-gradient(135deg, #123020, #176b3a, #49a078);
   font: 700 24px sans-serif;
   cursor: pointer;
 }}
+#player {{
+  position: fixed;
+  z-index: 2;
+  left: 4%;
+  top: 34%;
+  width: 20%;
+  height: 14%;
+  background: #0b1020;
+}}
+#fullscreen-target {{
+  width: 100%;
+  height: 100%;
+  border: 4px solid #ffd400;
+  color: white;
+  background: #8b1e3f;
+  font: 700 20px sans-serif;
+  cursor: pointer;
+}}
+#fullscreen-marker {{ display: none; }}
+#player:fullscreen {{
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  background: #06162e;
+}}
+#player:fullscreen #fullscreen-target {{ display: none; }}
+#player:fullscreen #fullscreen-marker {{
+  display: block;
+  width: 240px;
+  height: 160px;
+  background: #00ff7f;
+}}
 #text-target {{
   position: fixed;
   z-index: 2;
@@ -358,13 +392,21 @@ body.touched #marker {{ background: #ff8c00; }}
 <div id="marker"></div>
 <div id="status">Waiting for the cross-engine cookie</div>
 <input id="text-target" type="text" value="Hover this text input">
+<div id="player">
+  <button id="fullscreen-target" type="button">Fullscreen player</button>
+  <div id="fullscreen-marker"></div>
+</div>
 <button id="click-target" type="button">Click this page target</button>
 <script>
 const cookieName = {self.cookie_name!r};
 const token = {self.token!r};
 const status = document.getElementById("status");
 const clickTarget = document.getElementById("click-target");
+const player = document.getElementById("player");
+const fullscreenTarget = document.getElementById("fullscreen-target");
 const clickTitle = {f"deb-e2e {engine} click received {self.token}"!r};
+const fullscreenRequestTitle = {f"deb-e2e {engine} fullscreen requested {self.token}"!r};
+const fullscreenTitle = {f"deb-e2e {engine} fullscreen entered {self.token}"!r};
 const touchTitle = {f"deb-e2e {engine} raw gesture received {self.token}"!r};
 let initialTouchDistance = null;
 let rawGestureMoved = false;
@@ -387,6 +429,21 @@ clickTarget.addEventListener("click", event => {{
   document.title = clickTitle;
   status.textContent = "The page received a trusted browser click";
   document.body.classList.add("clicked");
+}});
+fullscreenTarget.addEventListener("click", event => {{
+  if (!event.isTrusted) {{
+    document.title = `deb-e2e {engine} rejected untrusted fullscreen ${{token}}`;
+    return;
+  }}
+  document.title = fullscreenRequestTitle;
+  player.requestFullscreen().catch(error => {{
+    document.title = `deb-e2e {engine} fullscreen failed: ${{error.name}}`;
+  }});
+}});
+document.addEventListener("fullscreenchange", () => {{
+  document.title = document.fullscreenElement === player
+    ? fullscreenTitle
+    : clickTitle;
 }});
 document.addEventListener("touchstart", event => {{
   rawGestureTrusted = rawGestureTrusted && event.isTrusted;
@@ -824,6 +881,13 @@ class Driver:
             timeout,
         )
 
+    def accessible_is_showing(self, accessible_id):
+        accessible = self.find_id(accessible_id)
+        if accessible is None:
+            return False
+        states = accessible.get_state_set()
+        return states.contains(Atspi.StateType.SHOWING)
+
     def wait_for_horizontal_order(self, left_id, right_id, timeout=20.0):
         def probe():
             left = self.find_id(left_id)
@@ -846,6 +910,25 @@ class Driver:
         y = rectangle.y + round(rectangle.height * y_fraction)
         self.move_pointer_to(x, y)
         self.xdotool("click", "1")
+
+    def window_geometry(self, window):
+        values = self.shell_values(
+            self.xdotool("getwindowgeometry", "--shell", window, capture=True)
+        )
+        return tuple(
+            int(values[name]) for name in ("X", "Y", "WIDTH", "HEIGHT")
+        )
+
+    @staticmethod
+    def window_is_fullscreen(window):
+        result = subprocess.run(
+            ["xprop", "-id", window, "_NET_WM_STATE"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        return result.returncode == 0 and "_NET_WM_STATE_FULLSCREEN" in result.stdout
 
     def raw_pinch_surface(self, accessible_id, touchscreen):
         surface = self.wait_for_id(accessible_id)
@@ -994,6 +1077,87 @@ class Driver:
             f"the {engine} page's trusted-click marker", probe, timeout=20.0
         )
 
+    def fullscreen_marker_pixels(self, accessible_id):
+        pixels = self.surface_image(accessible_id).get_flattened_data()
+        return sum(
+            red < 16 and green > 239 and 110 < blue < 145
+            for red, green, blue in pixels
+        )
+
+    def verify_page_fullscreen(self, surface_id, address_id, engine):
+        surface = self.wait_for_id(surface_id)
+        initial_window = self.focus_accessible_window(surface)
+        initial_geometry = self.window_geometry(initial_window)
+        display_geometry = tuple(
+            int(value)
+            for value in self.xdotool("getdisplaygeometry", capture=True).split()
+        )
+        self.click_surface(surface_id, 0.14, 0.41)
+        self.wait_until(
+            f"the {engine} browser chrome to hide",
+            lambda: not self.accessible_is_showing(address_id),
+        )
+        self.wait_until(
+            f"the {engine} profile chrome to hide",
+            lambda: not self.accessible_is_showing("profiles.tabs"),
+        )
+        window = self.focus_accessible_window(self.wait_for_id(surface_id))
+        self.wait_until(
+            f"the {engine} window to enter EWMH fullscreen",
+            lambda: self.window_is_fullscreen(window),
+        )
+
+        def fullscreen_geometry():
+            x, y, width, height = self.window_geometry(window)
+            return (
+                (x, y, width, height)
+                if abs(x) <= 2
+                and abs(y) <= 2
+                and abs(width - display_geometry[0]) <= 2
+                and abs(height - display_geometry[1]) <= 2
+                else None
+            )
+
+        geometry = self.wait_until(
+            f"the {engine} window to cover the display", fullscreen_geometry
+        )
+        marker_pixels = self.wait_until(
+            f"the {engine} fullscreen-only page marker",
+            lambda: (
+                pixels
+                if (pixels := self.fullscreen_marker_pixels(surface_id)) >= 128
+                else None
+            ),
+            timeout=30.0,
+        )
+        self.xdotool("key", "--clearmodifiers", "Escape")
+        address = self.wait_for_actionable(address_id)
+        restored_window = self.focus_accessible_window(address)
+        self.wait_until(
+            f"the {engine} window to leave EWMH fullscreen",
+            lambda: not self.window_is_fullscreen(restored_window),
+        )
+        self.wait_until(
+            f"the {engine} profile chrome to restore",
+            lambda: self.accessible_is_showing("profiles.tabs"),
+        )
+        self.wait_until(
+            f"the {engine} fullscreen marker to disappear",
+            lambda: self.fullscreen_marker_pixels(surface_id) < 128,
+        )
+
+        def restored_geometry():
+            current = self.window_geometry(restored_window)
+            return current if all(
+                abs(first - second) <= 2
+                for first, second in zip(current, initial_geometry)
+            ) else None
+
+        self.wait_until(
+            f"the {engine} window geometry to restore", restored_geometry
+        )
+        return marker_pixels, geometry
+
     @staticmethod
     def intersection(first, second):
         left = max(first.x, second.x)
@@ -1100,6 +1264,50 @@ def stop_process(process):
             process.wait(timeout=5)
 
 
+def has_window_manager():
+    result = subprocess.run(
+        ["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"],
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    marker = "window id #"
+    output = result.stdout.lower()
+    if result.returncode != 0 or marker not in output:
+        return False
+    window = output.split(marker, 1)[1].strip().split()[0]
+    probe = subprocess.run(
+        ["xprop", "-id", window, "_NET_WM_NAME"],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return probe.returncode == 0
+
+
+def ensure_window_manager():
+    if has_window_manager():
+        return None
+    process = subprocess.Popen(
+        ["openbox", "--sm-disable"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise SmokeFailure(
+                f"openbox exited before managing the test display with status {process.returncode}"
+            )
+        if has_window_manager():
+            return process
+        time.sleep(0.1)
+    stop_process(process)
+    raise SmokeFailure("timed out waiting for openbox to manage the test display")
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", required=True, type=Path)
@@ -1112,6 +1320,9 @@ def parse_arguments():
 def main():
     arguments = parse_arguments()
     arguments.artifacts.mkdir(parents=True, exist_ok=True)
+    window_manager = ensure_window_manager()
+    if window_manager is not None:
+        atexit.register(stop_process, window_manager)
     touchscreen = None
     if arguments.require_touch or os.access("/dev/uinput", os.W_OK):
         geometry = subprocess.run(
@@ -1205,6 +1416,19 @@ def main():
             chromium_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.1", "browser.surface.1"
             )
+            print(
+                "deb-e2e: entering Chromium page-player fullscreen and exiting with Escape",
+                flush=True,
+            )
+            chromium_fullscreen_pixels, chromium_fullscreen_geometry = (
+                driver.verify_page_fullscreen(
+                    "browser.surface.1", "browser.address.1", "Chromium"
+                )
+            )
+            driver.wait_for_name(
+                "browser.tab.default.1",
+                f"deb-e2e chromium click received {site.token}",
+            )
 
             print("deb-e2e: observing Chromium's cookie from Firefox", flush=True)
             driver.click("browser.tab.default.2")
@@ -1249,6 +1473,19 @@ def main():
             print("deb-e2e: proving Qt composition over Firefox", flush=True)
             firefox_tooltip_pixels = driver.verify_tooltip_overlay(
                 "browser.tab.default.2", "browser.surface.1"
+            )
+            print(
+                "deb-e2e: entering Firefox page-player fullscreen and exiting with Escape",
+                flush=True,
+            )
+            firefox_fullscreen_pixels, firefox_fullscreen_geometry = (
+                driver.verify_page_fullscreen(
+                    "browser.surface.1", "browser.address.1", "Firefox"
+                )
+            )
+            driver.wait_for_name(
+                "browser.tab.default.2",
+                f"deb-e2e firefox click received {site.token}",
             )
 
             print("deb-e2e: switching retained tabs through their buttons", flush=True)
@@ -1420,7 +1657,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"both engines, trusted page clicks{touch_summary}, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
+                f"both engines, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, three windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -1436,6 +1673,7 @@ def main():
                 f"retained clicks {retained_chromium_click_pixels}/{retained_firefox_click_pixels}, "
                 f"shortcut clicks {shortcut_chromium_click_pixels}/{shortcut_firefox_click_pixels}, "
                 f"moved/main clicks {moved_firefox_click_pixels}/{main_after_move_click_pixels}, "
+                f"fullscreen markers {chromium_fullscreen_pixels}/{firefox_fullscreen_pixels} at {chromium_fullscreen_geometry}/{firefox_fullscreen_geometry}, "
                 f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0
@@ -1448,6 +1686,9 @@ def main():
             site.stop()
             if touchscreen is not None:
                 touchscreen.close()
+            if window_manager is not None:
+                stop_process(window_manager)
+                atexit.unregister(stop_process)
 
 
 if __name__ == "__main__":

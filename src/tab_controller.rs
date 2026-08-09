@@ -412,6 +412,7 @@ struct TabSnapshot<'a> {
     status: &'a str,
     loading: bool,
     crashed: bool,
+    fullscreen: bool,
 }
 
 #[derive(Serialize)]
@@ -438,6 +439,7 @@ struct Tab {
     status: String,
     loading: bool,
     crashed: bool,
+    fullscreen: bool,
 }
 
 impl Tab {
@@ -450,6 +452,7 @@ impl Tab {
             status: &self.status,
             loading: self.loading,
             crashed: self.crashed,
+            fullscreen: self.fullscreen,
         }
     }
 }
@@ -898,6 +901,7 @@ impl Runtime {
             status: "Starting engine…".to_owned(),
             loading: true,
             crashed: false,
+            fullscreen: false,
         });
         id
     }
@@ -928,6 +932,7 @@ impl Runtime {
             tab.status = format!("Starting {}…", tab.engine.backend().label());
             tab.loading = true;
             tab.crashed = false;
+            tab.fullscreen = false;
             (tab.engine.backend(), tab.url.clone(), tab.window_id)
         };
         let (parent, bounds) = {
@@ -1021,6 +1026,7 @@ impl Runtime {
         tab.browser_id = None;
         tab.loading = false;
         tab.crashed = true;
+        tab.fullscreen = false;
         tab.status = failure;
         Ok(())
     }
@@ -1140,6 +1146,7 @@ impl Runtime {
         tab.status = "Switching engine…".to_owned();
         tab.loading = true;
         tab.crashed = false;
+        tab.fullscreen = false;
         self.window_mut(window_id)?.displayed_tab = None;
         self.attach_tab(tab_id)?;
         self.refresh_visibility()?;
@@ -1333,6 +1340,18 @@ impl Runtime {
                 tab.url = url;
             }
             ProtocolNotice::TitleChanged(title) => tab.title = title,
+            ProtocolNotice::FullscreenChanged(fullscreen) => {
+                eprintln!(
+                    "deb: HTML fullscreen {}: profile={} window={} tab={} engine={} browser={}",
+                    if fullscreen { "entered" } else { "exited" },
+                    profile_id,
+                    tab.window_id,
+                    tab.id,
+                    backend.label(),
+                    notice.browser_id
+                );
+                tab.fullscreen = fullscreen;
+            }
             ProtocolNotice::LoadFailed(error) => {
                 let failure = format!("Load failed: {error}");
                 eprintln!(
@@ -1351,6 +1370,7 @@ impl Runtime {
                 tab.browser_id = None;
                 tab.loading = false;
                 tab.crashed = true;
+                tab.fullscreen = false;
                 tab.status = failure.to_owned();
             }
             ProtocolNotice::Crashed(reason) => {
@@ -1361,6 +1381,7 @@ impl Runtime {
                 );
                 tab.crashed = true;
                 tab.loading = false;
+                tab.fullscreen = false;
                 tab.status = failure;
             }
             ProtocolNotice::CookieSnapshotEntry(_)
@@ -1389,6 +1410,7 @@ impl Runtime {
             tab.browser_id = None;
             tab.loading = false;
             tab.crashed = true;
+            tab.fullscreen = false;
             tab.status = reason.clone();
         }
         self.dirty = true;
@@ -1552,6 +1574,7 @@ mod tests {
             status: String::new(),
             loading: false,
             crashed: false,
+            fullscreen: false,
         }
     }
 
