@@ -316,6 +316,33 @@ impl Backend {
     }
 
     #[qslot]
+    fn context_menu_command(
+        &mut self,
+        window_id: String,
+        menu_id: String,
+        command_id: i32,
+        dismissed: bool,
+    ) {
+        if let (Some(controller), Ok(window_id), Ok(menu_id)) = (
+            &self.controller,
+            window_id.parse::<u64>(),
+            menu_id.parse::<u64>(),
+        ) {
+            send_controller_command(
+                controller,
+                &self.profile_id,
+                "context-menu",
+                TabCommand::ContextMenu {
+                    window_id,
+                    menu_id,
+                    command_id,
+                    dismissed,
+                },
+            );
+        }
+    }
+
+    #[qslot]
     fn new_tab(&mut self, window_id: String, engine: String) {
         if let (Some(controller), Ok(window_id), Some(engine)) = (
             &self.controller,

@@ -1,3 +1,4 @@
+mod context_menu;
 mod cookies;
 mod refcount;
 mod runtime;
@@ -207,7 +208,8 @@ unsafe extern "C" fn host_send_mouse_click(
     let Some(event) = (unsafe { event.as_ref() }) else {
         return;
     };
-    if let Err(error) = state_from(host).send_mouse_click(
+    let state = state_from(host);
+    if let Err(error) = state.send_mouse_click(
         event.x,
         event.y,
         event.modifiers,
@@ -216,6 +218,8 @@ unsafe extern "C" fn host_send_mouse_click(
         click_count,
     ) {
         eprintln!("firefox-cef: mouse click failed: {error}");
+    } else if mouse_up != 0 && button == cef_mouse_button_type_t::MBT_RIGHT {
+        context_menu::show(state, event.x, event.y);
     }
 }
 

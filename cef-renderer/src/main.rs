@@ -107,6 +107,7 @@ enum ControlCommand {
     Focus(bool),
     Reload,
     OpenDevTools,
+    ContextMenu(wire::ContextMenuCommand),
     Close(bool),
     Visibility(bool),
     ReadCookies,
@@ -206,6 +207,12 @@ fn control_command(request: wire::Request) -> Result<ControlCommand, Box<dyn Err
         wire::request::Operation::SetFocus(command) => Ok(ControlCommand::Focus(command.focused)),
         wire::request::Operation::Reload(_) => Ok(ControlCommand::Reload),
         wire::request::Operation::OpenDevTools(_) => Ok(ControlCommand::OpenDevTools),
+        wire::request::Operation::ContextMenuCommand(command) => {
+            if command.menu_id == 0 {
+                return Err("context menu ID must be nonzero".into());
+            }
+            Ok(ControlCommand::ContextMenu(command))
+        }
         wire::request::Operation::Close(command) => Ok(ControlCommand::Close(command.force)),
         wire::request::Operation::SetVisibility(command) => {
             Ok(ControlCommand::Visibility(command.visible))
@@ -404,6 +411,130 @@ impl ProtocolEmitter {
     }
 }
 
+struct PendingContextMenu {
+    browser_id: u64,
+    callback: RunContextMenuCallback,
+}
+
+struct ContextMenuCallbacks {
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, PendingContextMenu>>,
+}
+
+impl ContextMenuCallbacks {
+    fn begin(&self, browser_id: u64, callback: RunContextMenuCallback) -> u64 {
+        let menu_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let replaced = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let previous_id = pending
+                .iter()
+                .find_map(|(id, menu)| (menu.browser_id == browser_id).then_some(*id));
+            let replaced = previous_id.and_then(|id| pending.remove(&id));
+            pending.insert(
+                menu_id,
+                PendingContextMenu {
+                    browser_id,
+                    callback,
+                },
+            );
+            replaced
+        };
+        if let Some(replaced) = replaced {
+            replaced.callback.cancel();
+        }
+        menu_id
+    }
+
+    fn complete(
+        &self,
+        browser_id: u64,
+        command: &wire::ContextMenuCommand,
+        continue_command: bool,
+    ) -> Result<(), Box<dyn Error>> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&command.menu_id)
+            .ok_or("context menu is no longer pending")?;
+        if pending.browser_id != browser_id {
+            pending.callback.cancel();
+            return Err("context menu belongs to another browser".into());
+        }
+        if command.dismissed {
+            pending.callback.cancel();
+        } else if continue_command {
+            pending
+                .callback
+                .cont(command.command_id, EventFlags::default());
+        } else {
+            pending.callback.cancel();
+        }
+        Ok(())
+    }
+
+    fn cancel_browser(&self, browser_id: u64) {
+        let cancelled = {
+            let mut pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let ids = pending
+                .iter()
+                .filter_map(|(id, menu)| (menu.browser_id == browser_id).then_some(*id))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| pending.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for menu in cancelled {
+            menu.callback.cancel();
+        }
+    }
+}
+
+fn context_menu_callbacks() -> &'static ContextMenuCallbacks {
+    static CALLBACKS: OnceLock<ContextMenuCallbacks> = OnceLock::new();
+    CALLBACKS.get_or_init(|| ContextMenuCallbacks {
+        next_id: AtomicU64::new(1),
+        pending: Mutex::new(HashMap::new()),
+    })
+}
+
+fn context_menu_items(model: &MenuModel, depth: usize) -> Vec<wire::ContextMenuItem> {
+    if depth >= 8 {
+        return Vec::new();
+    }
+    (0..model.count())
+        .filter(|index| model.is_visible_at(*index) != 0)
+        .filter_map(|index| {
+            let item_type = match model.type_at(index) {
+                MenuItemType::COMMAND => wire::ContextMenuItemType::Command,
+                MenuItemType::CHECK => wire::ContextMenuItemType::Check,
+                MenuItemType::RADIO => wire::ContextMenuItemType::Radio,
+                MenuItemType::SEPARATOR => wire::ContextMenuItemType::Separator,
+                MenuItemType::SUBMENU => wire::ContextMenuItemType::Submenu,
+                _ => return None,
+            };
+            let submenu = model
+                .sub_menu_at(index)
+                .map(|submenu| context_menu_items(&submenu, depth + 1))
+                .unwrap_or_default();
+            Some(wire::ContextMenuItem {
+                command_id: model.command_id_at(index),
+                label: CefString::from(&model.label_at(index)).to_string(),
+                item_type: item_type as i32,
+                enabled: model.is_enabled_at(index) != 0,
+                checked: model.is_checked_at(index) != 0,
+                submenu,
+            })
+        })
+        .collect()
+}
+
 fn response_packet(request_id: u64, result: wire::response::Result) -> wire::Packet {
     wire::Packet {
         request_id,
@@ -574,6 +705,7 @@ wrap_life_span_handler! {
             if browser.is_some_and(|browser| browser.is_popup() != 0) {
                 return;
             }
+            context_menu_callbacks().cancel_browser(self.browser_id);
             self.registry.remove(self.browser_id);
             self.emitter
                 .event(wire::event::Value::BrowserClosed(wire::BrowserClosed {}));
@@ -941,6 +1073,7 @@ wrap_client! {
         display_handler: DisplayHandler,
         request_handler: RequestHandler,
         render_handler: RenderHandler,
+        context_menu_handler: ContextMenuHandler,
     }
 
     impl Client {
@@ -962,6 +1095,67 @@ wrap_client! {
 
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(self.render_handler.clone())
+        }
+
+        fn context_menu_handler(&self) -> Option<ContextMenuHandler> {
+            Some(self.context_menu_handler.clone())
+        }
+    }
+}
+
+wrap_context_menu_handler! {
+    struct BrowserContextMenuHandler {
+        browser_id: u64,
+        emitter: ProtocolEmitter,
+    }
+
+    impl ContextMenuHandler {
+        fn on_before_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _params: Option<&mut ContextMenuParams>,
+            model: Option<&mut MenuModel>,
+        ) {
+            let Some(model) = model else {
+                return;
+            };
+            if model.index_of(102) < 0 {
+                let label = CefString::from("Reload");
+                if model.insert_item_at(model.count().min(2), 102, Some(&label)) == 0 {
+                    model.add_item(102, Some(&label));
+                }
+            } else {
+                model.set_visible(102, 1);
+                model.set_enabled(102, 1);
+            }
+        }
+
+        fn run_context_menu(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            params: Option<&mut ContextMenuParams>,
+            model: Option<&mut MenuModel>,
+            callback: Option<&mut RunContextMenuCallback>,
+        ) -> i32 {
+            let (Some(params), Some(model), Some(callback)) = (params, model, callback) else {
+                return 0;
+            };
+            let items = context_menu_items(model, 0);
+            if items.is_empty() {
+                return 0;
+            }
+            let menu_id = context_menu_callbacks().begin(self.browser_id, callback.clone());
+            self.emitter.event(wire::event::Value::ContextMenuRequested(
+                wire::ContextMenuRequested {
+                    menu_id,
+                    x: params.xcoord(),
+                    y: params.ycoord(),
+                    items,
+                },
+            ));
+            1
         }
     }
 }
@@ -1186,6 +1380,22 @@ wrap_task! {
                         Err("CEF browser has no host".into())
                     }
                 }
+                ControlCommand::ContextMenu(command) => {
+                    let direct_command = (!command.dismissed
+                        && matches!(command.command_id, 102 | 103))
+                    .then_some(command.command_id);
+                    context_menu_callbacks()
+                        .complete(
+                            self.emitter.browser_id,
+                            command,
+                            direct_command.is_none(),
+                        )
+                        .map(|()| match direct_command {
+                            Some(102) => self.browser.reload(),
+                            Some(103) => self.browser.reload_ignore_cache(),
+                            _ => {}
+                        })
+                }
                 ControlCommand::Close(force) => {
                     if self.request_id != 0 {
                         self.emitter.success(self.request_id);
@@ -1358,7 +1568,7 @@ fn create_browser(
     let render_handler = BrowserRenderHandler::new(
         bounds,
         Arc::new(Mutex::new(Rect::default())),
-        browser_emitter,
+        browser_emitter.clone(),
         Arc::new(AtomicBool::new(false)),
         flip_y,
     );
@@ -1368,6 +1578,7 @@ fn create_browser(
         display_handler,
         request_handler,
         render_handler,
+        BrowserContextMenuHandler::new(browser_config.browser_id, browser_emitter),
     );
     let window_info = WindowInfo {
         runtime_style: RuntimeStyle::ALLOY,
@@ -1425,6 +1636,7 @@ fn advertised_capabilities() -> Vec<i32> {
         Capability::TouchInput,
         Capability::Fullscreen,
         Capability::Devtools,
+        Capability::ContextMenu,
     ]
     .into_iter()
     .map(|capability| capability as i32)
@@ -1947,6 +2159,25 @@ mod tests {
                 )),
             }),
             Ok(ControlCommand::OpenDevTools)
+        ));
+    }
+
+    #[test]
+    fn parses_context_menu_completion() {
+        assert!(matches!(
+            control_command(wire::Request {
+                browser_id: 1,
+                operation: Some(wire::request::Operation::ContextMenuCommand(
+                    wire::ContextMenuCommand {
+                        menu_id: 9,
+                        command_id: 102,
+                        event_flags: 0,
+                        dismissed: false,
+                    }
+                )),
+            }),
+            Ok(ControlCommand::ContextMenu(command))
+                if command.menu_id == 9 && command.command_id == 102 && !command.dismissed
         ));
     }
 

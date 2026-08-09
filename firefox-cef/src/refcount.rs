@@ -1,4 +1,7 @@
-use cef_dll_sys::{_cef_browser_host_t, _cef_browser_t, _cef_frame_t, cef_base_ref_counted_t};
+use cef_dll_sys::{
+    _cef_browser_host_t, _cef_browser_t, _cef_context_menu_params_t, _cef_frame_t,
+    _cef_menu_model_t, _cef_run_context_menu_callback_t, cef_base_ref_counted_t,
+};
 use std::{
     mem::size_of,
     sync::atomic::{AtomicUsize, Ordering, fence},
@@ -21,6 +24,24 @@ impl CefRefCounted for _cef_browser_host_t {
 }
 
 impl CefRefCounted for _cef_frame_t {
+    fn base_mut(&mut self) -> &mut cef_base_ref_counted_t {
+        &mut self.base
+    }
+}
+
+impl CefRefCounted for _cef_context_menu_params_t {
+    fn base_mut(&mut self) -> &mut cef_base_ref_counted_t {
+        &mut self.base
+    }
+}
+
+impl CefRefCounted for _cef_menu_model_t {
+    fn base_mut(&mut self) -> &mut cef_base_ref_counted_t {
+        &mut self.base
+    }
+}
+
+impl CefRefCounted for _cef_run_context_menu_callback_t {
     fn base_mut(&mut self) -> &mut cef_base_ref_counted_t {
         &mut self.base
     }

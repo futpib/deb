@@ -1293,6 +1293,15 @@ Item {
                         )
                     }
 
+                    onContextMenuCommand: function(menuId, commandId, dismissed) {
+                        browserView.backendObject.context_menu_command(
+                            browserView.viewId,
+                            menuId,
+                            commandId,
+                            dismissed
+                        )
+                    }
+
                     onTouchContact: function(
                         contactId,
                         x,

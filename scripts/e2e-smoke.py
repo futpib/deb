@@ -405,6 +405,7 @@ const clickTarget = document.getElementById("click-target");
 const player = document.getElementById("player");
 const fullscreenTarget = document.getElementById("fullscreen-target");
 const clickTitle = {f"deb-e2e {engine} click received {self.token}"!r};
+const contextMenuTitle = {f"deb-e2e {engine} context menu received {self.token}"!r};
 const fullscreenRequestTitle = {f"deb-e2e {engine} fullscreen requested {self.token}"!r};
 const fullscreenTitle = {f"deb-e2e {engine} fullscreen entered {self.token}"!r};
 const touchTitle = {f"deb-e2e {engine} raw gesture received {self.token}"!r};
@@ -429,6 +430,14 @@ clickTarget.addEventListener("click", event => {{
   document.title = clickTitle;
   status.textContent = "The page received a trusted browser click";
   document.body.classList.add("clicked");
+}});
+document.addEventListener("contextmenu", event => {{
+  if (!event.isTrusted) {{
+    document.title = `deb-e2e {engine} rejected untrusted context menu ${{token}}`;
+    return;
+  }}
+  document.title = contextMenuTitle;
+  status.textContent = "The page received a trusted browser context-menu request";
 }});
 fullscreenTarget.addEventListener("click", event => {{
   if (!event.isTrusted) {{
@@ -959,7 +968,7 @@ class Driver:
             f"{left_id} to appear left of {right_id}", probe, timeout
         )
 
-    def click_surface(self, accessible_id, x_fraction, y_fraction):
+    def click_surface_button(self, accessible_id, x_fraction, y_fraction, button):
         if not 0.0 < x_fraction < 1.0 or not 0.0 < y_fraction < 1.0:
             raise SmokeFailure("surface click fractions must be inside the viewport")
         surface = self.wait_for_id(accessible_id)
@@ -968,7 +977,58 @@ class Driver:
         x = rectangle.x + round(rectangle.width * x_fraction)
         y = rectangle.y + round(rectangle.height * y_fraction)
         self.move_pointer_to(x, y)
-        self.xdotool("click", "1")
+        self.xdotool("click", str(button))
+        return x, y
+
+    def click_surface(self, accessible_id, x_fraction, y_fraction):
+        return self.click_surface_button(accessible_id, x_fraction, y_fraction, 1)
+
+    @staticmethod
+    def visible_deb_windows():
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "deb"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode not in (0, 1):
+            raise SmokeFailure(f"could not enumerate deb windows: {result.stderr.strip()}")
+        return {value for value in result.stdout.splitlines() if value}
+
+    def verify_page_context_menu(
+        self, surface_id, tab_id, engine, context_title, restored_title
+    ):
+        before = self.visible_deb_windows()
+        x, y = self.click_surface_button(surface_id, 0.75, 0.55, 3)
+        self.wait_for_name(tab_id, context_title)
+
+        def menu_window():
+            for window in self.visible_deb_windows() - before:
+                geometry = self.window_geometry(window)
+                window_x, window_y, width, height = geometry
+                if (
+                    width < 600
+                    and height < 600
+                    and abs(window_x - x) <= 16
+                    and abs(window_y - y) <= 16
+                ):
+                    return window
+            return None
+
+        window = self.wait_until(f"{engine} native page context menu", menu_window)
+        geometry = self.window_geometry(window)
+        if engine == "Chromium":
+            self.xdotool("key", "Home", "key", "Down", "key", "Return")
+        else:
+            self.xdotool("key", "Home", "key", "Return")
+        self.wait_until(
+            f"{engine} page context menu to execute Reload",
+            lambda: window not in self.visible_deb_windows(),
+        )
+        self.wait_for_name(tab_id, restored_title)
+        self.wait_for_surface(surface_id, f"{engine} after context-menu reload")
+        return geometry
 
     def window_geometry(self, window):
         values = self.shell_values(
@@ -1576,6 +1636,17 @@ def main():
                     f"deb-e2e chromium raw gesture received {site.token}",
                 )
                 time.sleep(0.1)
+            print(
+                "deb-e2e: opening Chromium's native page context menu and executing Reload",
+                flush=True,
+            )
+            chromium_context_menu_geometry = driver.verify_page_context_menu(
+                "browser.surface.1",
+                "browser.tab.default.1",
+                "Chromium",
+                f"deb-e2e chromium context menu received {site.token}",
+                f"deb-e2e chromium set {site.token}",
+            )
             print("deb-e2e: clicking the Chromium page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
@@ -1641,6 +1712,17 @@ def main():
                     f"deb-e2e firefox raw gesture received {site.token}",
                 )
                 time.sleep(0.1)
+            print(
+                "deb-e2e: opening Firefox's native page context menu and executing Reload",
+                flush=True,
+            )
+            firefox_context_menu_geometry = driver.verify_page_context_menu(
+                "browser.surface.1",
+                "browser.tab.default.2",
+                "Firefox",
+                f"deb-e2e firefox context menu received {site.token}",
+                f"deb-e2e firefox synced {site.token}",
+            )
             print("deb-e2e: clicking the Firefox page through XTEST", flush=True)
             driver.click_surface("browser.surface.1", 0.5, 0.8)
             driver.wait_for_name(
@@ -1878,7 +1960,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, trusted page clicks{touch_summary}, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
+                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, trusted page clicks{touch_summary}, native engine-model page context menus with Reload execution, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -1898,6 +1980,7 @@ def main():
                 f"moved/main clicks {moved_firefox_click_pixels}/{main_after_move_click_pixels}, "
                 f"fullscreen markers {chromium_fullscreen_pixels}/{firefox_fullscreen_pixels} at {chromium_fullscreen_geometry}/{firefox_fullscreen_geometry}, "
                 f"developer tools {chromium_devtools_title!r}/{firefox_devtools_title!r}, "
+                f"context menus {chromium_context_menu_geometry}/{firefox_context_menu_geometry}, "
                 f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0

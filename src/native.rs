@@ -53,6 +53,14 @@ unsafe extern "C" {
         hotspot_y: i32,
         image_scale_factor: f32,
     );
+    fn deb_browser_surface_show_context_menu(
+        surface_id: *const libc::c_char,
+        menu_id: u64,
+        x: i32,
+        y: i32,
+        items_json: *const u8,
+        items_json_length: usize,
+    );
 }
 
 struct FrameReleaseTarget {
@@ -206,6 +214,42 @@ fn deliver_cursor(browser_id: u64, cursor: &wire::CursorChanged) -> NativeResult
             cursor.hotspot_x,
             cursor.hotspot_y,
             cursor.image_scale_factor,
+        );
+    }
+    Ok(())
+}
+
+fn context_menu_item_json(item: &wire::ContextMenuItem) -> serde_json::Value {
+    serde_json::json!({
+        "commandId": item.command_id,
+        "label": item.label,
+        "itemType": item.item_type,
+        "enabled": item.enabled,
+        "checked": item.checked,
+        "submenu": item.submenu.iter().map(context_menu_item_json).collect::<Vec<_>>(),
+    })
+}
+
+fn deliver_context_menu(surface_id: &str, menu: &wire::ContextMenuRequested) -> NativeResult<()> {
+    if menu.menu_id == 0 || menu.items.is_empty() {
+        return Err("context menu has no identity or items".into());
+    }
+    let surface_id = CString::new(surface_id)?;
+    let items = serde_json::to_vec(
+        &menu
+            .items
+            .iter()
+            .map(context_menu_item_json)
+            .collect::<Vec<_>>(),
+    )?;
+    unsafe {
+        deb_browser_surface_show_context_menu(
+            surface_id.as_ptr(),
+            menu.menu_id,
+            menu.x,
+            menu.y,
+            items.as_ptr(),
+            items.len(),
         );
     }
     Ok(())
@@ -475,6 +519,25 @@ impl CefInstance {
             browser_id,
             wire::request::Operation::OpenDevTools(wire::OpenDevTools {}),
             "developer tools",
+        )
+    }
+
+    pub(crate) fn complete_context_menu(
+        &mut self,
+        browser_id: u64,
+        menu_id: u64,
+        command_id: i32,
+        dismissed: bool,
+    ) -> NativeResult<()> {
+        self.send_browser_request(
+            browser_id,
+            wire::request::Operation::ContextMenuCommand(wire::ContextMenuCommand {
+                menu_id,
+                command_id,
+                event_flags: 0,
+                dismissed,
+            }),
+            "context menu command",
         )
     }
 
@@ -841,6 +904,19 @@ impl CefInstance {
                     }
                     Some(wire::event::Value::FullscreenChanged(change)) => {
                         Some(ProtocolNotice::FullscreenChanged(change.fullscreen))
+                    }
+                    Some(wire::event::Value::ContextMenuRequested(menu)) => {
+                        match self.surfaces.get(&browser_id) {
+                            Some(surface_id) => match deliver_context_menu(surface_id, &menu) {
+                                Ok(()) => None,
+                                Err(error) => {
+                                    Some(ProtocolNotice::ProtocolFailed(error.to_string()))
+                                }
+                            },
+                            None => Some(ProtocolNotice::ProtocolFailed(
+                                "context menu targets an unbound browser surface".to_owned(),
+                            )),
+                        }
                     }
                     None => None,
                 };
@@ -1321,6 +1397,7 @@ fn required_capabilities() -> Vec<i32> {
         Capability::TouchInput,
         Capability::Fullscreen,
         Capability::Devtools,
+        Capability::ContextMenu,
     ]
     .into_iter()
     .map(|capability| capability as i32)

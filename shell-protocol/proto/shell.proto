@@ -26,6 +26,7 @@ enum Capability {
   CAPABILITY_TOUCH_INPUT = 14;
   CAPABILITY_FULLSCREEN = 15;
   CAPABILITY_DEVTOOLS = 16;
+  CAPABILITY_CONTEXT_MENU = 17;
 }
 
 enum MouseButton {
@@ -104,6 +105,7 @@ message Request {
     KeyEvent key_event = 24;
     TouchEvent touch_event = 25;
     OpenDevTools open_dev_tools = 26;
+    ContextMenuCommand context_menu_command = 27;
   }
 }
 
@@ -148,6 +150,13 @@ message SetFocus {
 message Reload {}
 
 message OpenDevTools {}
+
+message ContextMenuCommand {
+  uint64 menu_id = 1;
+  int32 command_id = 2;
+  uint32 event_flags = 3;
+  bool dismissed = 4;
+}
 
 message Close {
   bool force = 1;
@@ -251,6 +260,7 @@ message Event {
     SurfaceCleared surface_cleared = 21;
     CursorChanged cursor_changed = 22;
     FullscreenChanged fullscreen_changed = 23;
+    ContextMenuRequested context_menu_requested = 24;
   }
 }
 
@@ -268,6 +278,31 @@ message CursorChanged {
 
 message FullscreenChanged {
   bool fullscreen = 1;
+}
+
+enum ContextMenuItemType {
+  CONTEXT_MENU_ITEM_TYPE_UNSPECIFIED = 0;
+  CONTEXT_MENU_ITEM_TYPE_COMMAND = 1;
+  CONTEXT_MENU_ITEM_TYPE_CHECK = 2;
+  CONTEXT_MENU_ITEM_TYPE_RADIO = 3;
+  CONTEXT_MENU_ITEM_TYPE_SEPARATOR = 4;
+  CONTEXT_MENU_ITEM_TYPE_SUBMENU = 5;
+}
+
+message ContextMenuItem {
+  int32 command_id = 1;
+  string label = 2;
+  ContextMenuItemType item_type = 3;
+  bool enabled = 4;
+  bool checked = 5;
+  repeated ContextMenuItem submenu = 6;
+}
+
+message ContextMenuRequested {
+  uint64 menu_id = 1;
+  int32 x = 2;
+  int32 y = 3;
+  repeated ContextMenuItem items = 4;
 }
 
 enum SurfaceLayer {

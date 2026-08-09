@@ -79,6 +79,12 @@ pub enum TabCommand {
     Navigate(u64, String),
     Reload(u64),
     OpenDevTools(u64),
+    ContextMenu {
+        window_id: u64,
+        menu_id: u64,
+        command_id: i32,
+        dismissed: bool,
+    },
     NewTab(u64, TabEngine),
     Select(u64, u64),
     Close(u64),
@@ -133,6 +139,7 @@ impl TabCommand {
             Self::Navigate(_, _) => "navigate",
             Self::Reload(_) => "reload",
             Self::OpenDevTools(_) => "developer-tools",
+            Self::ContextMenu { .. } => "context-menu",
             Self::NewTab(_, _) => "new-tab",
             Self::Select(_, _) => "select-tab",
             Self::Close(_) => "close-tab",
@@ -787,6 +794,14 @@ impl Runtime {
             TabCommand::Navigate(id, url) => self.navigate(id, &url),
             TabCommand::Reload(id) => self.reload(id),
             TabCommand::OpenDevTools(id) => self.open_dev_tools(id),
+            TabCommand::ContextMenu {
+                window_id,
+                menu_id,
+                command_id,
+                dismissed,
+            } => self.with_active_process(window_id, |process, browser| {
+                process.complete_context_menu(browser, menu_id, command_id, dismissed)
+            }),
             TabCommand::NewTab(id, engine) => self.new_tab(id, engine),
             TabCommand::Select(id, tab) => self.select(id, tab),
             TabCommand::Close(tab) => self.close_tab(tab),

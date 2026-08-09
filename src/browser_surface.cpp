@@ -1,5 +1,6 @@
 #include "browser_surface.h"
 
+#include <QApplication>
 #include <QCoreApplication>
 #include <QCursor>
 #include <QGuiApplication>
@@ -7,7 +8,11 @@
 #include <QHoverEvent>
 #include <QImage>
 #include <QInputMethodEvent>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
+#include <QMenu>
 #include <QMetaObject>
 #include <QMouseEvent>
 #include <QMutex>
@@ -21,6 +26,7 @@
 #include <QSGSimpleTextureNode>
 #include <QSGTexture>
 #include <QTouchEvent>
+#include <QTimer>
 #include <QWheelEvent>
 #include <QtMath>
 
@@ -610,6 +616,50 @@ struct PendingLayer {
     std::shared_ptr<DmabufFrame> frame;
 };
 
+void populateContextMenu(QMenu *menu, const QJsonArray &items,
+                         BrowserSurface *surface, const QString &menuId,
+                         const std::shared_ptr<bool> &selected) {
+    for (const QJsonValue &value : items) {
+        const QJsonObject item = value.toObject();
+        const int type = item.value(QStringLiteral("itemType")).toInt();
+        if (type == 4) {
+            menu->addSeparator();
+            continue;
+        }
+        const QString label = item.value(QStringLiteral("label")).toString();
+        if (label.isEmpty()) {
+            continue;
+        }
+        if (type == 5) {
+            QMenu *submenu = menu->addMenu(label);
+            submenu->menuAction()->setEnabled(
+                item.value(QStringLiteral("enabled")).toBool());
+            populateContextMenu(
+                submenu, item.value(QStringLiteral("submenu")).toArray(),
+                surface, menuId, selected);
+            continue;
+        }
+        QAction *action = menu->addAction(label);
+        const int commandId =
+            item.value(QStringLiteral("commandId")).toInt();
+        action->setObjectName(QStringLiteral("browser.context-command.%1.%2")
+                                  .arg(menuId)
+                                  .arg(commandId));
+        action->setEnabled(item.value(QStringLiteral("enabled")).toBool());
+        if (type == 2 || type == 3) {
+            action->setCheckable(true);
+            action->setChecked(
+                item.value(QStringLiteral("checked")).toBool());
+        }
+        QObject::connect(action, &QAction::triggered, surface,
+                         [surface, menuId, commandId, selected] {
+                             *selected = true;
+                             emit surface->contextMenuCommand(menuId, commandId,
+                                                              false);
+                         });
+    }
+}
+
 } // namespace
 
 class BrowserSurfacePrivate {
@@ -1024,6 +1074,62 @@ extern "C" void deb_browser_surface_set_cursor(
                     surface->setBrowserCursor(browserId, cursor);
                 }
             }
+        },
+        Qt::QueuedConnection);
+}
+
+extern "C" void deb_browser_surface_show_context_menu(
+    const char *surfaceId, unsigned long long menuId, int x, int y,
+    const unsigned char *itemsJson, std::size_t itemsJsonLength) {
+    const QString id = QString::fromUtf8(surfaceId == nullptr ? "" : surfaceId);
+    const QString stringMenuId = QString::number(menuId);
+    const QByteArray json(reinterpret_cast<const char *>(itemsJson),
+                          itemsJson == nullptr
+                              ? 0
+                              : static_cast<qsizetype>(itemsJsonLength));
+    QMetaObject::invokeMethod(
+        qApp,
+        [id, stringMenuId, x, y, json] {
+            BrowserSurface *surface = surfaceRegistry().value(id);
+            if (surface == nullptr) {
+                return;
+            }
+            QJsonParseError parseError;
+            const QJsonDocument document =
+                QJsonDocument::fromJson(json, &parseError);
+            if (parseError.error != QJsonParseError::NoError ||
+                !document.isArray()) {
+                emit surface->contextMenuCommand(stringMenuId, 0, true);
+                return;
+            }
+            auto *menu = new QMenu(QApplication::activeWindow());
+            menu->setObjectName(
+                QStringLiteral("browser.context-menu.%1").arg(id));
+            menu->setAccessibleIdentifier(menu->objectName());
+            menu->setAccessibleName(QStringLiteral("Page context menu"));
+            const auto selected = std::make_shared<bool>(false);
+            populateContextMenu(menu, document.array(), surface, stringMenuId,
+                                selected);
+            if (menu->actions().isEmpty()) {
+                emit surface->contextMenuCommand(stringMenuId, 0, true);
+                menu->deleteLater();
+                return;
+            }
+            QObject::connect(menu, &QMenu::aboutToHide, surface,
+                             [surface, menu, stringMenuId, selected] {
+                                 QTimer::singleShot(
+                                     0, surface,
+                                     [surface, menu, stringMenuId, selected] {
+                                         if (!*selected) {
+                                             emit surface->contextMenuCommand(
+                                                 stringMenuId, 0, true);
+                                         }
+                                         menu->deleteLater();
+                                     });
+                             });
+            const QPoint scenePoint =
+                surface->mapToScene(QPointF(x, y)).toPoint();
+            menu->popup(surface->window()->mapToGlobal(scenePoint));
         },
         Qt::QueuedConnection);
 }

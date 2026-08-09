@@ -425,6 +425,17 @@ void DispatchMouseClick(uint32_t aBrowserId, int32_t aX, int32_t aY,
   event.mModifiers = GeckoModifiers(aModifiers);
   event.mInputSource = mozilla::dom::MouseEvent_Binding::MOZ_SOURCE_MOUSE;
   widget->DispatchInputEvent(&event);
+  if (aMouseUp && button == mozilla::MouseButton::eSecondary) {
+    mozilla::WidgetPointerEvent contextMenuEvent(true, mozilla::eContextMenu,
+                                                  widget);
+    contextMenuEvent.mRefPoint = event.mRefPoint;
+    contextMenuEvent.mButton = button;
+    contextMenuEvent.mButtons = event.mButtons;
+    contextMenuEvent.mClickCount = event.mClickCount;
+    contextMenuEvent.mModifiers = event.mModifiers;
+    contextMenuEvent.mInputSource = event.mInputSource;
+    widget->DispatchInputEvent(&contextMenuEvent);
+  }
 }
 
 void DispatchMouseWheel(uint32_t aBrowserId, int32_t aX, int32_t aY,

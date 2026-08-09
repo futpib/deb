@@ -48,6 +48,8 @@ signals:
     void browserKey(int eventType, int modifiers, int windowsKeyCode,
                     int nativeKeyCode, bool systemKey, int character,
                     int unmodifiedCharacter);
+    void contextMenuCommand(const QString &menuId, int commandId,
+                            bool dismissed);
 
 protected:
     QSGNode *updatePaintNode(QSGNode *oldNode,
@@ -95,3 +97,6 @@ extern "C" void deb_browser_surface_set_cursor(
     unsigned long long browserId, int cefType, const unsigned char *customBgra,
     std::size_t customBgraLength, unsigned int width, unsigned int height,
     int hotspotX, int hotspotY, float imageScaleFactor);
+extern "C" void deb_browser_surface_show_context_menu(
+    const char *surfaceId, unsigned long long menuId, int x, int y,
+    const unsigned char *itemsJson, std::size_t itemsJsonLength);
