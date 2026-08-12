@@ -10,9 +10,14 @@ popd >/dev/null
 cef_source="$project_root/cef"
 build_root="$project_root/target/cef-build"
 automation_checkout="$build_root/cef"
+chromium_source="$build_root/chromium/src"
 chromium_cef_source="$build_root/chromium/src/cef"
 patch_file="$project_root/cef-patches/0001-partitioned-cookie-observer.patch"
+extension_patch_file="$project_root/cef-patches/0002-windowless-extension-tabs.patch"
+chromium_extension_patch_file="$project_root/cef-patches/chromium-windowless-extension-tabs.patch"
 applied_patch="$build_root/applied-cookie-observer.patch"
+applied_extension_patch="$build_root/applied-windowless-extension-tabs.patch"
+applied_chromium_extension_patch="$build_root/applied-chromium-windowless-extension-tabs.patch"
 runtime_directory="$project_root/cef-runtime"
 force_build=0
 run_smoke=1
@@ -33,8 +38,10 @@ pinned_commit=$(git rev-parse HEAD)
 popd >/dev/null
 gn_defines="is_official_build=true use_sysroot=true symbol_level=1 is_cfi=false use_thin_lto=false ozone_platform_x11=true ozone_platform_wayland=false"
 patch_hash=$(git hash-object "$patch_file")
+extension_patch_hash=$(git hash-object "$extension_patch_file")
+chromium_extension_patch_hash=$(git hash-object "$chromium_extension_patch_file")
 script_hash=$(git hash-object "$project_root/scripts/build-cef.sh")
-input_manifest="cef=$pinned_commit"$'\n'"patch=$patch_hash"$'\n'"script=$script_hash"$'\n'"gn=$gn_defines"
+input_manifest="cef=$pinned_commit"$'\n'"patch=$patch_hash"$'\n'"extension_patch=$extension_patch_hash"$'\n'"chromium_extension_patch=$chromium_extension_patch_hash"$'\n'"script=$script_hash"$'\n'"gn=$gn_defines"
 input_stamp="$build_root/inputs"
 
 needs_build=$force_build
@@ -81,6 +88,19 @@ if [[ ! -e "$chromium_cef_source/.git" ]]; then
 fi
 
 if ((needs_build)); then
+  previous_chromium_extension_patch="$applied_chromium_extension_patch"
+  if [[ ! -f "$previous_chromium_extension_patch" ]]; then
+    previous_chromium_extension_patch="$chromium_extension_patch_file"
+  fi
+  pushd "$chromium_source" >/dev/null
+  if git apply -p0 --reverse --check "$previous_chromium_extension_patch"; then
+    git apply -p0 --reverse "$previous_chromium_extension_patch"
+  elif ! git apply -p0 --check "$previous_chromium_extension_patch"; then
+    echo "Cannot determine the previously applied Chromium extension patch state" >&2
+    exit 1
+  fi
+  popd >/dev/null
+
   pushd "$chromium_cef_source" >/dev/null
   source_commit=$(git rev-parse HEAD)
   if [[ "$source_commit" != "$pinned_commit" ]]; then
@@ -88,6 +108,13 @@ if ((needs_build)); then
     exit 1
   fi
 
+  if [[ -f "$applied_extension_patch" ]]; then
+    if ! git apply --reverse --check "$applied_extension_patch"; then
+      echo "Cannot reverse the previously applied CEF extension patch" >&2
+      exit 1
+    fi
+    git apply --reverse "$applied_extension_patch"
+  fi
   if [[ -f "$applied_patch" ]]; then
     if ! git apply --reverse --check "$applied_patch"; then
       echo "Cannot reverse the previously applied CEF patch" >&2
@@ -101,7 +128,13 @@ if ((needs_build)); then
   fi
   git apply --check "$patch_file"
   git apply "$patch_file"
+  git apply --check "$extension_patch_file"
+  git apply "$extension_patch_file"
   cp "$patch_file" "$applied_patch"
+  cp "$extension_patch_file" "$applied_extension_patch"
+  cp "$chromium_extension_patch_file" "$applied_chromium_extension_patch"
+  cp "$chromium_extension_patch_file" \
+    "$chromium_cef_source/patch/patches/deb_windowless_extension_tabs.patch"
   python3 tools/translator.py --root-dir .
   popd >/dev/null
 

@@ -3,7 +3,7 @@ pref("toolkit.defaultChromeFeatures", "chrome,dialog=no,all");
 pref("toolkit.singletonWindowType", "firefox-cef:main");
 pref("browser.shell.checkDefaultBrowser", false);
 pref("browser.startup.blankWindow", false);
-pref("extensions.enabledScopes", 0);
+pref("extensions.enabledScopes", 1);
 pref("browser.aboutwelcome.enabled", false);
 pref("browser.startup.firstrunSkipsHomepage", true);
 pref("browser.sessionstore.resume_from_crash", false);

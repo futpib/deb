@@ -1,0 +1,85 @@
+diff --git chrome/browser/extensions/api/tabs/tabs_api.cc chrome/browser/extensions/api/tabs/tabs_api.cc
+--- chrome/browser/extensions/api/tabs/tabs_api.cc
++++ chrome/browser/extensions/api/tabs/tabs_api.cc
+@@ -70,5 +70,10 @@
+ #include "ui/display/screen.h"
+ 
++#include "cef/libcef/features/features.h"
++#if BUILDFLAG(ENABLE_CEF)
++#include "cef/libcef/browser/chrome/extensions/chrome_extension_util.h"
++#endif
++
+ #if BUILDFLAG(ENABLE_EXTENSIONS)
+ #include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
+ #endif
+@@ -1887,6 +1892,70 @@ base::ListValue TabsQueryFunction::BuildTabList(
+                         .ToValue());
+     }
+   }
++#if BUILDFLAG(ENABLE_CEF)
++  const bool has_window_filter =
++      window_id != extension_misc::kUnknownWindowId ||
++      !window_type.empty() || query_info_.current_window.has_value() ||
++      query_info_.last_focused_window.has_value();
++  if (!has_window_filter) {
++    auto* profile = Profile::FromBrowserContext(browser_context());
++    const auto alloy_tabs =
++        cef::GetAlloyTabs(profile, include_incognito_information());
++    for (size_t index = 0; index < alloy_tabs.size(); ++index) {
++      auto* contents = alloy_tabs[index];
++      const bool active =
++          contents->GetVisibility() == content::Visibility::VISIBLE;
++      if ((tab_index >= 0 && static_cast<size_t>(tab_index) != index) ||
++          !MatchesBool(query_info_.active, active) ||
++          !MatchesBool(query_info_.highlighted, active) ||
++          !MatchesBool(query_info_.pinned, false) ||
++          !MatchesBool(query_info_.frozen, false) ||
++          !MatchesBool(query_info_.discarded, false) ||
++          !MatchesBool(query_info_.auto_discardable, true) ||
++          !MatchesBool(query_info_.muted, contents->IsAudioMuted())) {
++        continue;
++      }
++      if ((query_info_.group_id.has_value() &&
++           query_info_.group_id.value() != -1) ||
++          (query_info_.split_view_id.has_value() &&
++           query_info_.split_view_id.value() != -1)) {
++        continue;
++      }
++      auto* audible_helper = RecentlyAudibleHelper::FromWebContents(contents);
++      if (!MatchesBool(query_info_.audible,
++                       audible_helper->WasRecentlyAudible())) {
++        continue;
++      }
++      const bool check_title = query_info_.title && !query_info_.title->empty();
++      if (check_title || !url_patterns.is_empty()) {
++        if (!extension_->permissions_data()->HasAPIPermissionForTab(
++                ExtensionTabUtil::GetTabId(contents),
++                mojom::APIPermissionID::kTab) &&
++            !extension_->permissions_data()->HasHostPermission(
++                contents->GetURL())) {
++          continue;
++        }
++        if (check_title &&
++            !base::MatchPattern(contents->GetTitle(),
++                                base::UTF8ToUTF16(*query_info_.title))) {
++          continue;
++        }
++        if (!url_patterns.is_empty() &&
++            !url_patterns.MatchesURL(contents->GetURL())) {
++          continue;
++        }
++      }
++      if (query_info_.status != tabs::TabStatus::kNone &&
++          query_info_.status != ExtensionTabUtil::GetLoadingStatus(contents)) {
++        continue;
++      }
++      result.Append(tabs_internal::CreateTabObjectHelper(
++                        contents, extension(), source_context_type(), nullptr,
++                        static_cast<int>(index))
++                        .ToValue());
++    }
++  }
++#endif
+   return result;
+ }
+ 

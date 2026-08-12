@@ -5,8 +5,15 @@
 const bridge = Cc[
   "@deb.local/firefox-cef-bridge;1"
 ].getService(Ci.nsIFirefoxCefBridge);
+ChromeUtils.importESModule(
+  "resource://gre/modules/ActorManagerParent.sys.mjs"
+);
+const { AddonManager } = ChromeUtils.importESModule(
+  "resource://gre/modules/AddonManager.sys.mjs"
+);
 
 const browsers = new Map();
+const tabsProgressListeners = new Set();
 const devtoolsCommands = new Map();
 const devtoolsOpenings = new Map();
 const windowParameters = new URLSearchParams(window.location.search);
@@ -17,6 +24,68 @@ const ownedBrowserId = coordinator ? bridge.browserId : childBrowserId;
 const ownedInitialUrl = coordinator
   ? bridge.initialUrl
   : windowParameters.get("url") ?? "about:blank";
+
+window.gBrowserInit = {
+  isAdoptingTab() {
+    return false;
+  },
+};
+window.gBrowser = {
+  get tabs() {
+    return [...browsers.values()].map(entry => entry.nativeTab);
+  },
+  get selectedTab() {
+    return [...browsers.values()].find(entry => entry.active)?.nativeTab ?? null;
+  },
+  get selectedTabs() {
+    const selectedTab = this.selectedTab;
+    return selectedTab ? [selectedTab] : [];
+  },
+  get selectedBrowser() {
+    return [...browsers.values()].find(entry => entry.active)?.browser ?? null;
+  },
+  addTabsProgressListener(listener) {
+    tabsProgressListeners.add(listener);
+  },
+  removeTabsProgressListener(listener) {
+    tabsProgressListeners.delete(listener);
+  },
+  getBrowserForTab(tab) {
+    return tab?.linkedBrowser ?? null;
+  },
+  getIcon() {
+    return "";
+  },
+  getTabForBrowser(browser) {
+    return [...browsers.values()].find(entry => entry.browser == browser)
+      ?.nativeTab ?? null;
+  },
+  getTabSharingState() {
+    return {};
+  },
+};
+
+async function loadDebExtensions() {
+  const environment = Cc["@mozilla.org/process/environment;1"].getService(
+    Ci.nsIEnvironment
+  );
+  const encodedPaths = environment.get("DEB_FIREFOX_EXTENSIONS");
+  if (!encodedPaths) {
+    return;
+  }
+
+  for (const path of JSON.parse(encodedPaths)) {
+    const file = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
+    file.initWithPath(path);
+    try {
+      await AddonManager.installTemporaryAddon(file);
+      console.info(`firefox-cef: loaded extension ${path}`);
+    } catch (error) {
+      console.error(`firefox-cef: failed to load extension ${path}`, error);
+    }
+  }
+}
+
 if (startsRuntime) {
   ChromeUtils.registerWindowActor("FirefoxCefDOMFullscreen", {
     parent: {
@@ -130,6 +199,7 @@ function createBrowserElement(browserId) {
   browser.setAttribute("primary", "true");
   browser.setAttribute("remote", "true");
   browser.setAttribute("remoteType", "web");
+  browser.setAttribute("messagemanagergroup", "browsers");
   browser.setAttribute("maychangeremoteness", "true");
   browser.setAttribute("flex", "1");
   return browser;
@@ -162,9 +232,11 @@ function finishActivation(entry) {
 }
 
 function activateBrowser(browser) {
+  const previousTab = window.gBrowser.selectedTab;
   let selectedBrowser = browser;
   for (const entry of browsers.values()) {
     entry.active = entry.browser == browser;
+    entry.nativeTab.selected = entry.active;
     if (entry.active) {
       finishActivation(entry);
       selectedBrowser = entry.browser;
@@ -176,9 +248,39 @@ function activateBrowser(browser) {
     }
   }
   document.getElementById("browsers").selectedPanel = selectedBrowser;
+  const selectedTab = window.gBrowser.selectedTab;
+  if (selectedTab && selectedTab != previousTab) {
+    selectedTab.dispatchEvent(new CustomEvent("TabSelect", { bubbles: true }));
+  }
 }
 
 function registerBrowser(browserId, browser, initialUrl) {
+  const nativeTab = document.createXULElement("box");
+  nativeTab.id = `tab-${browserId}`;
+  nativeTab.setAttribute("label", initialUrl);
+  Object.defineProperties(nativeTab, {
+    documentGlobal: { get: () => window },
+    linkedBrowser: { value: browser },
+    linkedPanel: { value: browser.id },
+  });
+  Object.assign(nativeTab, {
+    _tPos: browsers.size,
+    group: null,
+    hidden: false,
+    lastAccessed: Date.now(),
+    multiselected: false,
+    muteReason: null,
+    muted: false,
+    openerTab: null,
+    pinned: false,
+    selected: false,
+    soundPlaying: false,
+    splitview: null,
+    successor: null,
+    undiscardable: false,
+    userContextId: 0,
+  });
+  document.getElementById("extension-tabs").appendChild(nativeTab);
   const progressListener = {
     QueryInterface: ChromeUtils.generateQI([
       "nsIWebProgressListener",
@@ -190,6 +292,7 @@ function registerBrowser(browserId, browser, initialUrl) {
         const entry = browsers.get(browserId);
         if (entry) {
           entry.currentUrl = location.spec;
+          entry.nativeTab.setAttribute("label", entry.browser.contentTitle || location.spec);
         }
         bridge.addressChanged(browserId, location.spec);
       }
@@ -203,9 +306,11 @@ function registerBrowser(browserId, browser, initialUrl) {
         return;
       }
       if (stateFlags & Ci.nsIWebProgressListener.STATE_START) {
+        nativeTab.setAttribute("busy", "true");
         bridge.loadingStateChanged(browserId, true);
       }
       if (stateFlags & Ci.nsIWebProgressListener.STATE_STOP) {
+        nativeTab.removeAttribute("busy");
         bridge.loadingStateChanged(browserId, false);
         titleListener();
         if (!Components.isSuccessCode(status) && status != Cr.NS_BINDING_ABORTED) {
@@ -249,10 +354,12 @@ function registerBrowser(browserId, browser, initialUrl) {
     crashListener,
     crashed: false,
     currentUrl: initialUrl,
+    nativeTab,
     progressListener,
     titleListener,
   };
   browsers.set(browserId, entry);
+  nativeTab.dispatchEvent(new CustomEvent("TabOpen", { bubbles: true }));
   return entry;
 }
 
@@ -281,7 +388,13 @@ function removeBrowser(browserId, notifyClose) {
   entry.browser.removeEventListener("pagetitlechanged", entry.titleListener);
   entry.browser.removeEventListener("oop-browser-crashed", entry.crashListener);
   entry.browser.remove();
+  entry.nativeTab.dispatchEvent(new CustomEvent("TabClose", { bubbles: true }));
+  entry.nativeTab.remove();
   browsers.delete(browserId);
+  let position = 0;
+  for (const remaining of browsers.values()) {
+    remaining.nativeTab._tPos = position++;
+  }
   if (notifyClose) {
     bridge.beforeClose(browserId);
   }
@@ -399,7 +512,7 @@ const commandObserver = (subject, topic, command) => {
   }
 };
 
-window.addEventListener("load", () => {
+window.addEventListener("load", async () => {
   Services.obs.addObserver(commandObserver, "firefox-cef-command");
 
   const baseWindow = window.docShell.treeOwner.QueryInterface(Ci.nsIBaseWindow);
@@ -408,6 +521,9 @@ window.addEventListener("load", () => {
     bridge.runtimeReady();
   }
   createBrowser(ownedBrowserId, ownedInitialUrl);
+  if (startsRuntime) {
+    await loadDebExtensions();
+  }
 }, { once: true });
 
 window.addEventListener("unload", () => {

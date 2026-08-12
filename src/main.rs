@@ -1,4 +1,5 @@
 mod cookie_store;
+mod extensions;
 mod native;
 mod profile;
 mod tab_controller;
@@ -832,6 +833,17 @@ fn normalize_url(value: &str) -> String {
 }
 
 fn main() {
+    let extension_launch = match extensions::ExtensionLaunch::parse(std::env::args_os()) {
+        Ok(launch) => launch,
+        Err(error) => {
+            eprintln!("deb: failure: extension arguments: {error}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = extension_launch.configure_environment() {
+        eprintln!("deb: failure: extension loading: {error}");
+        std::process::exit(2);
+    }
     if std::env::var_os("DISPLAY").is_some() && std::env::var_os("QT_QPA_PLATFORM").is_none() {
         unsafe {
             std::env::set_var("QT_QPA_PLATFORM", "xcb");
@@ -852,7 +864,9 @@ fn main() {
             std::env::set_var("QT_QUICK_CONTROLS_STYLE", "org.kde.desktop");
         }
     }
-    let mut arguments = std::env::args_os()
+    let mut arguments = extension_launch
+        .application_arguments
+        .into_iter()
         .map(|argument| {
             CString::new(argument.as_os_str().as_bytes())
                 .expect("process argument contains an interior NUL byte")

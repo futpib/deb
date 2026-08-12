@@ -1277,7 +1277,7 @@ wrap_app! {
     impl App {
         fn on_before_command_line_processing(
             &self,
-            _process_type: Option<&CefString>,
+            process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
             let Some(command_line) = command_line else {
@@ -1295,6 +1295,15 @@ wrap_app! {
                 command_line.append_switch_with_value(
                     Some(&"disk-cache-dir".into()),
                     Some(&CefString::from(cache_path.to_string_lossy().as_ref())),
+                );
+            }
+            if process_type.is_none_or(|process_type| process_type.to_string().is_empty())
+                && let Some(extension_paths) = std::env::var_os("DEB_CHROMIUM_EXTENSIONS")
+                && !extension_paths.is_empty()
+            {
+                command_line.append_switch_with_value(
+                    Some(&"load-extension".into()),
+                    Some(&CefString::from(extension_paths.to_string_lossy().as_ref())),
                 );
             }
         }

@@ -365,7 +365,7 @@ pub fn initialize(root_cache_path: &str) -> RuntimeResult<()> {
         format!(
             concat!(
                 "user_pref(\"browser.startup.blankWindow\", false);\n",
-                "user_pref(\"extensions.enabledScopes\", 0);\n",
+                "user_pref(\"extensions.enabledScopes\", 1);\n",
                 "user_pref(\"gfx.x11-egl.force-enabled\", true);\n",
                 "user_pref(\"gfx.webrender.all\", true);\n",
                 "user_pref(\"layers.acceleration.force-enabled\", true);\n",

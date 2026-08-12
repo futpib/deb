@@ -1,0 +1,107 @@
+diff --git a/libcef/browser/chrome/extensions/chrome_extension_util.cc b/libcef/browser/chrome/extensions/chrome_extension_util.cc
+index ae13b2262..a327d074e 100644
+--- a/libcef/browser/chrome/extensions/chrome_extension_util.cc
++++ b/libcef/browser/chrome/extensions/chrome_extension_util.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "cef/libcef/browser/chrome/extensions/chrome_extension_util.h"
+ 
++#include <algorithm>
++
+ #include "cef/libcef/browser/browser_host_base.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/sessions/content/session_tab_helper.h"
+@@ -12,6 +14,25 @@
+ 
+ namespace cef {
+ 
++namespace {
++
++bool IsMatchingAlloyTab(content::WebContents* contents,
++                        Profile* profile,
++                        bool include_incognito) {
++  auto* process_profile =
++      Profile::FromBrowserContext(contents->GetBrowserContext());
++  if (process_profile != profile &&
++      !(include_incognito && profile->IsSameOrParent(process_profile))) {
++    return false;
++  }
++
++  auto browser = CefBrowserHostBase::GetBrowserForContents(contents);
++  return browser && browser->IsAlloyStyle() &&
++         browser->GetWebContents() == contents;
++}
++
++}  // namespace
++
+ bool GetAlloyTabById(int tab_id,
+                      Profile* profile,
+                      bool include_incognito,
+@@ -63,6 +84,28 @@ bool GetAlloyTabById(int tab_id,
+   return false;
+ }
+ 
++std::vector<content::WebContents*> GetAlloyTabs(Profile* profile,
++                                                bool include_incognito) {
++  std::vector<content::WebContents*> result;
++  for (auto rph_iterator = content::RenderProcessHost::AllHostsIterator();
++       !rph_iterator.IsAtEnd(); rph_iterator.Advance()) {
++    auto* rph = rph_iterator.GetCurrentValue();
++    if (!rph->IsInitializedAndNotDead()) {
++      continue;
++    }
++    rph->ForEachRenderFrameHost([&](content::RenderFrameHost* rfh) {
++      auto* contents = content::WebContents::FromRenderFrameHost(rfh);
++      if (!contents ||
++          std::ranges::find(result, contents) != result.end() ||
++          !IsMatchingAlloyTab(contents, profile, include_incognito)) {
++        return;
++      }
++      result.push_back(contents);
++    });
++  }
++  return result;
++}
++
+ bool IsAlloyContents(content::WebContents* contents, bool primary_only) {
+   auto browser = CefBrowserHostBase::GetBrowserForContents(contents);
+   if (browser && browser->IsAlloyStyle()) {
+diff --git a/libcef/browser/chrome/extensions/chrome_extension_util.h b/libcef/browser/chrome/extensions/chrome_extension_util.h
+index 74a22cd5f..dd70e5e19 100644
+--- a/libcef/browser/chrome/extensions/chrome_extension_util.h
++++ b/libcef/browser/chrome/extensions/chrome_extension_util.h
+@@ -6,6 +6,8 @@
+ #define CEF_LIBCEF_BROWSER_CHROME_EXTENSIONS_CHROME_EXTENSION_UTIL_H_
+ #pragma once
+ 
++#include <vector>
++
+ namespace content {
+ class WebContents;
+ }  // namespace content
+@@ -21,6 +23,10 @@ bool GetAlloyTabById(int tab_id,
+                      bool include_incognito,
+                      content::WebContents** contents);
+ 
++// Returns all primary Alloy style CefBrowserHosts for |profile|.
++std::vector<content::WebContents*> GetAlloyTabs(Profile* profile,
++                                                bool include_incognito);
++
+ // Returns true if |contents| is owned by an Alloy style CefBrowserHost.
+ // If |primary_only| is false then guest contents will also be matched.
+ bool IsAlloyContents(content::WebContents* contents, bool primary_only);
+diff --git a/patch/patch.cfg b/patch/patch.cfg
+--- a/patch/patch.cfg
++++ b/patch/patch.cfg
+@@ -357,6 +357,11 @@ patches = [
+     # https://github.com/chromiumembedded/cef/issues/3681
+     'name': 'chrome_browser_extensions',
+   },
++  {
++    # chrome: Enumerate windowless Alloy browsers in extensions.tabs.query.
++    # This extends CEF's existing minimal Alloy tabs API integration.
++    'name': 'deb_windowless_extension_tabs',
++  },
+   {
+     # chrome: Expose static access to BrowserFrameMac methods.
+     # https://github.com/chromiumembedded/cef/issues/3462

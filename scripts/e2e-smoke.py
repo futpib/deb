@@ -7,6 +7,7 @@ import ctypes.util
 import fcntl
 import hashlib
 import http.server
+import json
 import os
 import secrets
 import signal
@@ -15,6 +16,7 @@ import struct
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 import gi
@@ -258,11 +260,45 @@ class E2ESite:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
-                route = self.path.split("?", 1)[0]
+                parsed = urllib.parse.urlsplit(self.path)
+                route = parsed.path
                 if route == f"/set/{site.token}":
                     mode = "set"
                 elif route == f"/observe/{site.token}":
                     mode = "observe"
+                elif route == f"/blocked/{site.token}":
+                    site.blocked_requests += 1
+                    body = b"network request was not blocked"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                elif route == f"/extension-report/{site.token}":
+                    site.extension_reports.append(
+                        {
+                            key: values[-1]
+                            for key, values in urllib.parse.parse_qs(
+                                parsed.query
+                            ).items()
+                        }
+                    )
+                    self.send_response(204)
+                    self.end_headers()
+                    return
+                elif route == f"/extension-phase/{site.token}":
+                    site.extension_phases.append(
+                        {
+                            key: values[-1]
+                            for key, values in urllib.parse.parse_qs(
+                                parsed.query
+                            ).items()
+                        }
+                    )
+                    self.send_response(204)
+                    self.end_headers()
+                    return
                 else:
                     self.send_error(404)
                     return
@@ -279,6 +315,9 @@ class E2ESite:
 
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.blocked_requests = 0
+        self.extension_reports = []
+        self.extension_phases = []
 
     def page(self, mode):
         engine = "chromium" if mode == "set" else "firefox"
@@ -484,6 +523,179 @@ document.addEventListener("touchend", event => {{
 </body>
 </html>
 """
+
+    def write_extensions(self, root):
+        chromium = root / "chromium"
+        firefox = root / "firefox"
+        chromium.mkdir(parents=True)
+        firefox.mkdir(parents=True)
+        manifest = {
+            "manifest_version": 3,
+            "name": "deb native extension E2E",
+            "version": "1.0",
+            "permissions": ["storage", "tabs", "declarativeNetRequest"],
+            "host_permissions": [f"{self.origin}/*"],
+            "background": {"service_worker": "background.js"},
+            "content_scripts": [
+                {
+                    "matches": [f"{self.origin}/*"],
+                    "js": ["content.js"],
+                    "run_at": "document_end",
+                }
+            ],
+            "declarative_net_request": {
+                "rule_resources": [
+                    {
+                        "id": "rules",
+                        "enabled": True,
+                        "path": "rules.json",
+                    }
+                ]
+            },
+        }
+        firefox_manifest = dict(manifest)
+        firefox_manifest["host_permissions"] = ["<all_urls>"]
+        firefox_manifest["content_scripts"] = [
+            {
+                "matches": ["<all_urls>"],
+                "js": ["content.js"],
+                "run_at": "document_end",
+            }
+        ]
+        firefox_manifest["background"] = {
+            "service_worker": "background.js",
+            "scripts": ["background.js"],
+            "preferred_environment": ["service_worker", "document"],
+        }
+        firefox_manifest["browser_specific_settings"] = {
+            "gecko": {"id": "deb-native-extension-e2e@deb.local"}
+        }
+        background = f"""
+const debEngine = "__ENGINE__";
+fetch({f'{self.origin}/extension-phase/{self.token}?context=background&engine='!r} + debEngine);
+chrome.runtime.onInstalled.addListener(() => {{
+  chrome.storage.local.set({{ installed: {self.token!r} }});
+}});
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {{
+  if (message !== "deb-e2e-probe") return;
+  fetch({f'{self.origin}/extension-phase/{self.token}?context=message&engine='!r} + debEngine);
+  Promise.all([
+    chrome.storage.local.get("installed"),
+    chrome.tabs.query({{}}),
+    chrome.tabs.query({{ active: true }}),
+    chrome.tabs.query({{ url: "http://127.0.0.1/*" }}),
+    chrome.tabs.query({{ active: true, url: "http://127.0.0.1/*" }}),
+  ]).then(([stored, allTabs, activeTabs, urlTabs, tabs]) => sendResponse({{
+    stored: stored.installed,
+    allTabCount: allTabs.length,
+    activeTabCount: activeTabs.length,
+    urlTabCount: urlTabs.length,
+    tabCount: tabs.length,
+  }})).catch(error => {{
+    const detail = encodeURIComponent(String(error));
+    fetch({f'{self.origin}/extension-phase/{self.token}?context=message-error&detail='!r} + detail);
+    sendResponse({{ error: String(error), tabCount: -1 }});
+  }});
+  return true;
+}});
+"""
+        content = f"""
+const debEngine = "__ENGINE__";
+fetch({f'{self.origin}/extension-phase/{self.token}?context=content&engine='!r} + debEngine);
+fetch({f'{self.origin}/blocked/{self.token}'!r}).then(
+  () => document.documentElement.dataset.debBlocked = "false",
+  () => document.documentElement.dataset.debBlocked = "true"
+).finally(() => {{
+  chrome.runtime.sendMessage("deb-e2e-probe", response => {{
+    const detail = encodeURIComponent(JSON.stringify(response ?? {{}}));
+    fetch({f'{self.origin}/extension-phase/{self.token}?context=response&detail='!r} + detail);
+    try {{
+      const marker = document.createElement("div");
+      marker.id = "deb-native-extension-marker";
+      marker.style.cssText = "position:fixed;right:12px;top:12px;width:80px;height:80px;z-index:2147483647;background:#ffea00";
+      marker.dataset.stored = response?.stored ?? "";
+      marker.dataset.tabs = String(response?.tabCount ?? 0);
+      document.documentElement.appendChild(marker);
+      const engine = debEngine;
+      const report = new URLSearchParams({{
+        engine,
+        stored: marker.dataset.stored,
+        tabs: marker.dataset.tabs,
+        allTabs: String(response?.allTabCount ?? 0),
+        activeTabs: String(response?.activeTabCount ?? 0),
+        urlTabs: String(response?.urlTabCount ?? 0),
+        blocked: document.documentElement.dataset.debBlocked,
+      }});
+      fetch({f'{self.origin}/extension-phase/{self.token}?context=report'!r});
+      fetch({f'{self.origin}/extension-report/{self.token}'!r} + `?${{report}}`).then(
+        () => fetch({f'{self.origin}/extension-phase/{self.token}?context=report-ok'!r}),
+        error => {{
+          const failure = encodeURIComponent(String(error));
+          fetch({f'{self.origin}/extension-phase/{self.token}?context=report-error&detail='!r} + failure);
+        }}
+      );
+    }} catch (error) {{
+      const failure = encodeURIComponent(String(error));
+      fetch({f'{self.origin}/extension-phase/{self.token}?context=content-error&detail='!r} + failure);
+    }}
+  }});
+}});
+"""
+        rules = f"""[{{
+  "id": 1,
+  "priority": 1,
+  "action": {{"type": "block"}},
+  "condition": {{"urlFilter": "|{self.origin}/blocked/{self.token}|", "resourceTypes": ["xmlhttprequest"]}}
+}}]
+"""
+        for engine, directory, encoded_manifest in (
+            ("chromium", chromium, manifest),
+            ("firefox", firefox, firefox_manifest),
+        ):
+            (directory / "manifest.json").write_text(
+                json.dumps(encoded_manifest, indent=2), encoding="utf-8"
+            )
+            (directory / "background.js").write_text(
+                background.replace("__ENGINE__", engine), encoding="utf-8"
+            )
+            (directory / "content.js").write_text(
+                content.replace("__ENGINE__", engine), encoding="utf-8"
+            )
+            (directory / "rules.json").write_text(rules, encoding="utf-8")
+        return chromium, firefox
+
+    def wait_for_extension(self, engine, timeout=45.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            report = next(
+                (
+                    report
+                    for report in reversed(self.extension_reports)
+                    if report.get("engine") == engine
+                ),
+                None,
+            )
+            if report is not None:
+                if report.get("stored") != self.token:
+                    raise SmokeFailure(
+                        f"{engine} extension storage returned {report.get('stored')!r}"
+                    )
+                if int(report.get("tabs", "0")) < 1:
+                    raise SmokeFailure(
+                        f"{engine} extension could not observe its windowless tab: "
+                        f"{report!r}"
+                    )
+                if report.get("blocked") != "true":
+                    raise SmokeFailure(
+                        f"{engine} extension did not block its declared request"
+                    )
+                return report
+            time.sleep(0.1)
+        raise SmokeFailure(
+            f"timed out waiting for the {engine} native extension; "
+            f"runtime phases={self.extension_phases!r}; "
+            f"reports={self.extension_reports!r}"
+        )
 
     @property
     def origin(self):
@@ -1556,12 +1768,22 @@ def main():
         )
     site = E2ESite()
     site.start()
+    chromium_extension, firefox_extension = site.write_extensions(
+        arguments.artifacts / "extensions"
+    )
     with arguments.log.open("wb") as log:
         process = subprocess.Popen(
-            [str(arguments.binary)],
+            [
+                str(arguments.binary),
+                "--load-chromium-extension",
+                str(chromium_extension),
+                "--load-firefox-extension",
+                str(firefox_extension),
+            ],
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=os.environ.copy(),
         )
         driver = Driver(process, arguments.artifacts, arguments.log)
 
@@ -1618,6 +1840,11 @@ def main():
             driver.wait_for_name(
                 "browser.tab.default.1", f"deb-e2e chromium set {site.token}"
             )
+            print(
+                "deb-e2e: verifying Chromium's native MV3 extension in windowless Alloy",
+                flush=True,
+            )
+            chromium_extension_report = site.wait_for_extension("chromium")
             chromium_marker, chromium_variants = driver.wait_for_surface(
                 "browser.surface.1", "Chromium"
             )
@@ -1694,6 +1921,15 @@ def main():
                 f"deb-e2e firefox synced {site.token}",
                 timeout=45.0,
             )
+            print(
+                "deb-e2e: verifying Firefox's native MV3 extension in the Gecko adapter",
+                flush=True,
+            )
+            firefox_extension_report = site.wait_for_extension("firefox")
+            if site.blocked_requests:
+                raise SmokeFailure(
+                    f"native extensions leaked {site.blocked_requests} blocked requests"
+                )
             firefox_marker, firefox_variants = driver.wait_for_surface(
                 "browser.surface.1", "Firefox after cookie synchronization"
             )
@@ -1960,7 +2196,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, trusted page clicks{touch_summary}, native engine-model page context menus with Reload execution, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
+                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, native MV3/WebExtension content scripts, background contexts, messaging, storage, request blocking, and tab enumeration, trusted page clicks{touch_summary}, native engine-model page context menus with Reload execution, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "
@@ -1981,6 +2217,7 @@ def main():
                 f"fullscreen markers {chromium_fullscreen_pixels}/{firefox_fullscreen_pixels} at {chromium_fullscreen_geometry}/{firefox_fullscreen_geometry}, "
                 f"developer tools {chromium_devtools_title!r}/{firefox_devtools_title!r}, "
                 f"context menus {chromium_context_menu_geometry}/{firefox_context_menu_geometry}, "
+                f"extensions {chromium_extension_report}/{firefox_extension_report}, "
                 f"tooltips {chromium_tooltip_pixels}/{firefox_tooltip_pixels}/{moved_tooltip_pixels} pixels)"
             )
             return 0
