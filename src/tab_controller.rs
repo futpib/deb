@@ -958,7 +958,8 @@ impl Runtime {
             (window.parent, window.bounds)
         };
         let profile_id = self.profile_id.clone();
-        let directories = backend.directories(&self.directories).clone();
+        let profile_directories = self.directories.clone();
+        let engine_directories = backend.directories(&self.directories).clone();
         let surface_id = window_id.to_string();
         if self.engine(backend).is_none() {
             match spawn_cef_browser(
@@ -967,7 +968,7 @@ impl Runtime {
                 bounds,
                 &url,
                 &profile_id,
-                &directories,
+                &profile_directories,
                 backend,
                 browser_id,
                 surface_id,
@@ -1004,7 +1005,7 @@ impl Runtime {
                     bounds,
                     &url,
                     &profile_id,
-                    &directories,
+                    &engine_directories,
                     surface_id,
                 )
             };

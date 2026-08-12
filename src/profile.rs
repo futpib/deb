@@ -27,6 +27,7 @@ pub struct EngineDirectories {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileDirectories {
+    pub app_data: PathBuf,
     pub shared_data: PathBuf,
     pub chromium: EngineDirectories,
     pub firefox: EngineDirectories,
@@ -128,6 +129,9 @@ pub fn profile_directories(profile_id: &str) -> ProfileResult<ProfileDirectories
     }
     let directories =
         BaseDirectories::with_profile(APP_DIRECTORY, Path::new("profiles").join(profile_id));
+    let app_data = BaseDirectories::with_prefix(APP_DIRECTORY)
+        .get_data_home()
+        .ok_or("XDG application data home is unavailable")?;
     let profile_data = directories
         .get_data_home()
         .ok_or("XDG data home is unavailable")?;
@@ -135,6 +139,7 @@ pub fn profile_directories(profile_id: &str) -> ProfileResult<ProfileDirectories
         .get_cache_home()
         .ok_or("XDG cache home is unavailable")?;
     let directories = ProfileDirectories {
+        app_data,
         shared_data: profile_data.clone(),
         chromium: EngineDirectories {
             data: profile_data.join("chromium"),
@@ -151,6 +156,10 @@ pub fn profile_directories(profile_id: &str) -> ProfileResult<ProfileDirectories
         &directories.chromium.cache,
         &directories.firefox.data,
         &directories.firefox.cache,
+        &directories.app_data.join("extensions/all/chromium"),
+        &directories.app_data.join("extensions/all/firefox"),
+        &directories.shared_data.join("extensions/chromium"),
+        &directories.shared_data.join("extensions/firefox"),
     ] {
         fs::create_dir_all(directory)?;
     }

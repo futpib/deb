@@ -524,9 +524,7 @@ document.addEventListener("touchend", event => {{
 </html>
 """
 
-    def write_extensions(self, root):
-        chromium = root / "chromium"
-        firefox = root / "firefox"
+    def write_extensions(self, chromium, firefox):
         chromium.mkdir(parents=True)
         firefox.mkdir(parents=True)
         manifest = {
@@ -662,7 +660,10 @@ fetch({f'{self.origin}/blocked/{self.token}'!r}).then(
                 content.replace("__ENGINE__", engine), encoding="utf-8"
             )
             (directory / "rules.json").write_text(rules, encoding="utf-8")
-        return chromium, firefox
+
+        disabled = chromium.parent / "disabled" / "ignored-invalid-extension"
+        disabled.mkdir(parents=True)
+        (disabled / "manifest.json").write_text("not json", encoding="utf-8")
 
     def wait_for_extension(self, engine, timeout=45.0):
         deadline = time.monotonic() + timeout
@@ -1768,18 +1769,16 @@ def main():
         )
     site = E2ESite()
     site.start()
-    chromium_extension, firefox_extension = site.write_extensions(
-        arguments.artifacts / "extensions"
+    xdg_data_home = Path(os.environ["XDG_DATA_HOME"])
+    site.write_extensions(
+        xdg_data_home
+        / "deb/extensions/all/chromium/deb-native-extension-e2e",
+        xdg_data_home
+        / "deb/profiles/default/extensions/firefox/deb-native-extension-e2e",
     )
     with arguments.log.open("wb") as log:
         process = subprocess.Popen(
-            [
-                str(arguments.binary),
-                "--load-chromium-extension",
-                str(chromium_extension),
-                "--load-firefox-extension",
-                str(firefox_extension),
-            ],
+            [str(arguments.binary)],
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -2196,7 +2195,7 @@ def main():
             )
             print(
                 "deb-smoke: PASS: external AT-SPI selectors and XTEST input drove "
-                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, native MV3/WebExtension content scripts, background contexts, messaging, storage, request blocking, and tab enumeration, trusted page clicks{touch_summary}, native engine-model page context menus with Reload execution, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
+                f"native KXMLGUI toolbar configuration, detached QML toolbar navigation/reload/window creation, both engines and their native developer tools, XDG-scoped native MV3/WebExtension content scripts, background contexts, messaging, storage, request blocking, and tab enumeration, ignored disabled extensions, trusted page clicks{touch_summary}, native engine-model page context menus with Reload execution, page-player fullscreen with Escape restoration, tab buttons, drag reordering, cross-window dragging, middle-click closing, menu detaching, shortcuts, cookie sync, retained frames, four windows, and a four-tab dual-engine switch stress without process failures "
                 f"(Chromium {chromium_variants} colors/{chromium_marker} marker pixels, "
                 f"Firefox {firefox_variants} colors/{firefox_marker} marker pixels, "
                 f"initial Chromium {chromium_initial_variants}/{chromium_initial_marker}, "

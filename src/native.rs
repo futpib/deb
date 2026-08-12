@@ -1,4 +1,7 @@
-use crate::profile::{EngineDirectories, ProfileDirectories};
+use crate::{
+    extensions::{self, ExtensionEngine},
+    profile::{EngineDirectories, ProfileDirectories},
+};
 use shell_protocol::{
     MAX_PACKET_BYTES, ProtocolError, Transport, configure_child_command,
     wire::{self, Capability, Engine},
@@ -1093,11 +1096,12 @@ pub(crate) fn spawn_cef_browser(
     bounds: NativeRect,
     url: &str,
     profile_id: &str,
-    directories: &EngineDirectories,
+    profile_directories: &ProfileDirectories,
     backend: CefBackend,
     browser_id: u64,
     surface_id: String,
 ) -> NativeResult<CefInstance> {
+    let directories = backend.directories(profile_directories);
     let executable = std::env::current_exe()?;
     let executable_directory = executable
         .parent()
@@ -1111,6 +1115,14 @@ pub(crate) fn spawn_cef_browser(
             .join("cef-renderer"),
     };
     let mut command = Command::new(helper);
+    extensions::configure_child_environment(
+        &mut command,
+        profile_directories,
+        match backend {
+            CefBackend::Chromium => ExtensionEngine::Chromium,
+            CefBackend::Firefox => ExtensionEngine::Firefox,
+        },
+    )?;
     if let Some(directory) = &loader_directory {
         command.env("LD_LIBRARY_PATH", directory);
         let mut preload = vec![directory.join("libmozglue-cef.so")];

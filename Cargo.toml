@@ -8,11 +8,13 @@ members = ["cef-cookie", "cef-renderer", "firefox-cef", "shell-protocol"]
 resolver = "3"
 
 [dependencies]
+base64 = "0.23.1"
 libc = "0.2.189"
 qtbridge = "0.2.0"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+sha2 = "0.11.0"
 shell-protocol = { version = "0.1.0", path = "shell-protocol" }
 x11rb = "0.14.0"
 xdg = "3.0.0"
